@@ -1,0 +1,162 @@
+services:
+  postgres:
+    image: postgres:16.3-alpine
+    restart: unless-stopped
+    network_mode: bridge
+    environment:
+      POSTGRES_DB: web_terminal_acp
+      POSTGRES_USER: web_terminal
+      POSTGRES_PASSWORD: dev_password
+    ports:
+      - "15436:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U web_terminal -d web_terminal_acp"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    restart: unless-stopped
+    network_mode: bridge
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "19201:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backend-base:
+    image: ${BACKEND_BASE_IMAGE:-localhost/web_terminal_acp-backend-base:local}
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.base
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
+        NODE_VERSION: ${NODE_VERSION:-22.22.3}
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-2.1.146}
+        OPENAI_CODEX_VERSION: ${OPENAI_CODEX_VERSION:-0.132.0}
+        ACPX_VERSION: ${ACPX_VERSION:-0.8.0}
+        CLAUDE_AGENT_ACP_VERSION: ${CLAUDE_AGENT_ACP_VERSION:-0.23.1}
+        CODEX_ACP_VERSION: ${CODEX_ACP_VERSION:-0.14.0}
+        AGENT_BROWSER_VERSION: ${AGENT_BROWSER_VERSION:-0.27.0}
+    profiles:
+      - build-base
+    command: ["true"]
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      additional_contexts:
+        backend-base: docker-image://${BACKEND_BASE_IMAGE:-localhost/web_terminal_acp-backend-base:local}
+      args:
+        BACKEND_BASE_IMAGE: backend-base
+    restart: unless-stopped
+    network_mode: bridge
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      DATABASE_URL: postgresql+asyncpg://web_terminal:dev_password@postgres:5432/web_terminal_acp
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      TMUX_POOL_SESSION: web_terminal_acp_pool
+      DEFAULT_SHELL: /bin/bash
+      CLAUDE_PROJECTS_DIR: /claude-projects
+      OPENAI_COMPAT_BASE_URL: ${OPENAI_COMPAT_BASE_URL:-http://host.docker.internal:11434/v1}
+      OPENAI_COMPAT_API_KEY: ${OPENAI_COMPAT_API_KEY:-dev-local-key}
+      OPENAI_COMPAT_MODEL: ${OPENAI_COMPAT_MODEL:-local-summarizer}
+      HOME: /home/appuser
+      CHROME_PATH: /usr/bin/chromium
+      BROWSER: /usr/bin/chromium
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${BACKEND_PUBLISHED_PORT:-8001}:8000"
+    volumes:
+      - ${CLAUDE_PROJECTS_DIR:-~/.claude/projects}:/claude-projects:ro
+      - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/appuser/.claude
+      - ${CODEX_CONFIG_DIR:-~/.codex}:/home/appuser/.codex
+      - ${AGENTS_CONFIG_DIR:-~/.agents}:/home/appuser/.agents
+      - ${ACPX_CONFIG_DIR:-~/.acpx}:/home/appuser/.acpx
+      - ${WORKSPACE_DIR:-~/workspace}:/workspace
+    links:
+      - postgres
+      - elasticsearch
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/healthz >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-}
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
+    restart: unless-stopped
+    network_mode: bridge
+    ports:
+      - "5173:80"
+    links:
+      - backend
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

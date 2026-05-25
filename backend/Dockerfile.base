@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1.7
+FROM python:3.11.9-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TERM=xterm-256color \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    HOME=/home/appuser \
+    CHROME_PATH=/usr/bin/chromium \
+    BROWSER=/usr/bin/chromium \
+    PATH="/opt/node/bin:/app/.venv/bin:$PATH"
+
+ARG DEBIAN_MIRROR=http://mirrors.aliyun.com
+ARG NODE_VERSION=22.22.3
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG CLAUDE_CODE_VERSION=2.1.146
+ARG OPENAI_CODEX_VERSION=0.132.0
+ARG ACPX_VERSION=0.8.0
+ARG CLAUDE_AGENT_ACP_VERSION=0.23.1
+ARG CODEX_ACP_VERSION=0.14.0
+ARG AGENT_BROWSER_VERSION=0.27.0
+
+WORKDIR /app
+
+RUN sed -i \
+        -e "s|http://deb.debian.org/debian-security|${DEBIAN_MIRROR}/debian-security|g" \
+        -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}/debian|g" \
+        /etc/apt/sources.list.d/debian.sources && \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    printf '%s\n' 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+
+RUN --mount=type=cache,id=web-terminal-acp-apt,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=web-terminal-acp-apt-lists,target=/var/lib/apt/lists,sharing=locked \
+    DEBIAN_FRONTEND=noninteractive apt-get update && \
+    DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        chromium \
+        curl \
+        git \
+        jq \
+        ripgrep \
+        tmux \
+        unzip \
+        xz-utils && \
+    useradd --create-home --uid 1000 --shell /bin/bash appuser && \
+    mkdir -p /home/appuser/.claude /home/appuser/.codex /home/appuser/.agents /home/appuser/.acpx /workspace && \
+    chown -R appuser:appuser /home/appuser /workspace
+
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz && \
+    mkdir -p /opt/node && \
+    tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1 && \
+    ln -sf /opt/node/bin/node /usr/local/bin/node && \
+    ln -sf /opt/node/bin/npm /usr/local/bin/npm && \
+    ln -sf /opt/node/bin/npx /usr/local/bin/npx && \
+    ln -sf /opt/node/bin/corepack /usr/local/bin/corepack && \
+    rm -f /tmp/node.tar.xz
+
+RUN --mount=type=cache,id=web-terminal-acp-backend-base-npm,target=/root/.npm \
+    npm config set registry "${NPM_REGISTRY}" && \
+    npm install -g \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+        "@openai/codex@${OPENAI_CODEX_VERSION}" \
+        "acpx@${ACPX_VERSION}" \
+        "@zed-industries/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION}" \
+        "@zed-industries/codex-acp@${CODEX_ACP_VERSION}" \
+        "@zed-industries/codex-acp-linux-x64@${CODEX_ACP_VERSION}" \
+        "agent-browser@${AGENT_BROWSER_VERSION}" && \
+    for binary in acpx agent-browser claude claude-agent-acp codex codex-acp codex-acp-linux-x64; do \
+        ln -sf "/opt/node/bin/${binary}" "/usr/local/bin/${binary}"; \
+    done
+
+RUN --mount=type=cache,id=web-terminal-acp-pip,target=/root/.cache/pip \
+    HOME=/root pip install --no-compile uv==0.8.13

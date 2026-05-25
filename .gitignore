@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+backend/.coverage
+backend/htmlcov/
+frontend/node_modules/
+frontend/dist/
+.superpowers/
+.claude/
+.learnings/
+# Cursor IDE local state (project skills under .cursor/skills/ are tracked)
+.cursor/*
+!.cursor/skills/
+!.cursor/skills/**
