@@ -1510,8 +1510,41 @@ h2 {
 .agent-record-actions {
   flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
+}
+
+.agent-record-terminal-status {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  border: 1px solid #334155;
+  border-radius: 999px;
+  background: #020617;
+  color: #cbd5e1;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.agent-record-terminal-status.connected {
+  border-color: #15803d;
+  color: #86efac;
+}
+
+.agent-record-terminal-status.connecting,
+.agent-record-terminal-status.reconnecting {
+  border-color: #0369a1;
+  color: #7dd3fc;
+}
+
+.agent-record-terminal-status.unavailable,
+.agent-record-terminal-status.error {
+  border-color: #b91c1c;
+  color: #fca5a5;
 }
 
 .agent-record-mode-toggle,
@@ -1655,9 +1688,8 @@ h2 {
   position: fixed;
   inset: 0;
   z-index: 60;
-  display: grid;
-  place-items: center;
-  padding: 24px;
+  display: flex;
+  padding: 0;
 }
 
 .agent-record-modal-backdrop {
@@ -1673,16 +1705,32 @@ h2 {
 .agent-record-modal-panel {
   position: relative;
   z-index: 1;
-  width: min(1180px, 100%);
-  max-height: min(860px, calc(100vh - 48px));
+  width: 100%;
+  height: var(--web-terminal-viewport-height, 100dvh);
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 12px;
-  overflow: auto;
-  border: 1px solid #334155;
-  border-radius: 8px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
   background: #111827;
   box-shadow: 0 24px 80px rgb(0 0 0 / 55%);
   padding: 16px;
+}
+
+.agent-record-modal-scroll {
+  display: grid;
+  min-height: 0;
+  align-content: start;
+  gap: 12px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.terminal-quick-input-panel.agent-record-quick-input {
+  position: static;
+  width: 100%;
+  transform: none;
 }
 
 .agent-tree {
@@ -2169,6 +2217,10 @@ h2 {
   backdrop-filter: blur(10px);
 }
 
+.terminal-quick-input-panel-expanded {
+  align-items: stretch;
+}
+
 .terminal-quick-input-panel textarea {
   min-height: 40px;
   max-height: min(42vh, 340px);
@@ -2201,6 +2253,61 @@ h2 {
 .terminal-quick-input-actions button[type="submit"] {
   border-color: #38bdf8;
   background: #075985;
+}
+
+.terminal-quick-key-drawer {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid #334155;
+  padding-top: 8px;
+}
+
+.terminal-quick-key-drawer input {
+  min-height: 36px;
+  border-color: #475569;
+  background: #020617;
+}
+
+.terminal-quick-key-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px;
+  max-height: min(32vh, 220px);
+  overflow-y: auto;
+}
+
+.terminal-quick-key-chip {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  border-color: #334155;
+  background: #111827;
+  padding: 8px;
+  text-align: left;
+}
+
+.terminal-quick-key-chip span,
+.terminal-quick-key-chip code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-quick-key-chip span {
+  color: #e2e8f0;
+  font-weight: 600;
+}
+
+.terminal-quick-key-chip code {
+  color: #94a3b8;
+  font-size: 11px;
+}
+
+.terminal-quick-key-empty {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 12px;
 }
 
 .terminal-connection-status {
@@ -2430,7 +2537,9 @@ html.electron-app .terminal-immersive .workspace {
 }
 
 .settings-modal {
-  width: min(420px, 100%);
+  width: min(560px, 100%);
+  max-height: calc(100dvh - 48px);
+  overflow-y: auto;
   display: grid;
   gap: 14px;
   padding: 18px;
@@ -2439,11 +2548,22 @@ html.electron-app .terminal-immersive .workspace {
   background: #0f172a;
 }
 
+.settings-modal-wide {
+  width: min(820px, 100%);
+}
+
 .settings-modal-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.settings-modal-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .settings-modal-header h2 {
@@ -2470,14 +2590,127 @@ html.electron-app .terminal-immersive .workspace {
 }
 
 .settings-field select,
-.settings-field input {
+.settings-field input,
+.settings-field textarea {
   width: 100%;
+}
+
+.settings-field textarea {
+  min-height: 72px;
+  resize: vertical;
 }
 
 .settings-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.settings-nav-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-color: #334155;
+  background: #111827;
+  padding: 12px;
+  text-align: left;
+}
+
+.settings-nav-row strong {
+  min-width: 28px;
+  border-radius: 999px;
+  background: #1e40af;
+  color: #dbeafe;
+  padding: 2px 8px;
+  font-size: 12px;
+  text-align: center;
+}
+
+.quick-key-page {
+  display: grid;
+  gap: 14px;
+}
+
+.quick-key-editor {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #111827;
+  padding: 12px;
+}
+
+.quick-key-editor-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(0, 1.4fr);
+  gap: 10px;
+}
+
+.quick-key-input-field textarea {
+  min-height: 92px;
+}
+
+.quick-key-special-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.quick-key-special-picker button {
+  min-height: 32px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.quick-key-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.quick-key-list-header h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.quick-key-list-header span {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.quick-key-settings-list {
+  display: grid;
+  gap: 10px;
+  max-height: 38vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.quick-key-settings-item {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.8fr) minmax(0, 1.3fr) auto;
+  align-items: start;
+  gap: 10px;
+  border: 1px solid #1f2937;
+  border-radius: 8px;
+  background: #111827;
+  padding: 10px;
+}
+
+.quick-key-settings-item > button {
+  align-self: end;
+  white-space: nowrap;
+}
+
+.quick-key-empty-state {
+  margin: 0;
+  border: 1px dashed #334155;
+  border-radius: 8px;
+  padding: 18px;
+  text-align: center;
 }
 
 .settings-error {
@@ -3107,6 +3340,60 @@ html.electron-app .terminal-immersive .workspace {
 
   .terminal-quick-input-actions {
     justify-content: flex-end;
+  }
+
+  .terminal-quick-key-list {
+    grid-template-columns: minmax(0, 1fr);
+    max-height: min(34dvh, 220px);
+  }
+
+  .settings-modal-backdrop {
+    padding: 10px;
+  }
+
+  .settings-modal,
+  .settings-modal-wide {
+    width: 100%;
+    max-height: calc(100dvh - 20px);
+    padding: 14px;
+  }
+
+  .settings-modal-header,
+  .settings-modal-title {
+    align-items: stretch;
+  }
+
+  .quick-key-editor-grid,
+  .quick-key-settings-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .quick-key-settings-list {
+    max-height: 42dvh;
+  }
+
+  .agent-record-modal-panel {
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .agent-record-header {
+    align-items: stretch;
+    display: grid;
+  }
+
+  .agent-record-actions {
+    justify-content: flex-start;
+    gap: 6px;
+  }
+
+  .agent-record-terminal-status {
+    min-height: 28px;
+    padding: 3px 8px;
+  }
+
+  .agent-record-modal-scroll {
+    padding-right: 0;
   }
 
   .detail-panel {

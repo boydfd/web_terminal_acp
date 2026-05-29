@@ -21,7 +21,7 @@ import { ProjectTerminalPicker } from "./components/ProjectTerminalPicker";
 import { SearchPanel } from "./components/SearchPanel";
 import { MobileShortcutFab } from "./components/MobileShortcutFab";
 import { NotificationBellButton, NotificationCenter } from "./components/NotificationCenter";
-import { TerminalPane, type TerminalPaneHandle } from "./components/TerminalPane";
+import { TerminalPane, type TerminalConnectionStatus, type TerminalPaneHandle } from "./components/TerminalPane";
 import { useAgentRecordData } from "./hooks/useAgentRecordData";
 import { readMobileLayout, useMobileLayout } from "./hooks/useMobileLayout";
 import { readInitialSettings, SettingsModal } from "./components/SettingsModal";
@@ -32,6 +32,12 @@ import {
   type SummaryOutputLanguage,
   type TerminalGroupingMode
 } from "./userPreferences";
+import {
+  decodeQuickKeyInput,
+  readCustomQuickKeys,
+  writeCustomQuickKeys,
+  type CustomQuickKey
+} from "./terminalQuickKeys";
 import { ensureDesktopNotificationPermission, showAgentTaskDesktopNotification } from "./desktopNotifications";
 import {
   clearTerminalNotifications,
@@ -57,6 +63,7 @@ import type { BootstrapClientInput, Client, TreeFolder } from "./types";
 type TerminalViewportMode = "desktop" | "phone" | "fixed";
 
 const TERMINAL_VIEWPORT_STORAGE_KEY = "web-terminal-acp:terminal-viewport-mode";
+const TERMINAL_ENTER_INPUT = "\r";
 
 type TerminalRouteSelection = {
   clientId: string | null;
@@ -74,6 +81,21 @@ type CreateWindowVariables = {
   cwd?: string | null;
   folder_path?: string | null;
 };
+
+function terminalStatusLabel(status: TerminalConnectionStatus): string {
+  switch (status) {
+    case "connected":
+      return "Terminal connected";
+    case "connecting":
+      return "Terminal connecting...";
+    case "reconnecting":
+      return "Terminal reconnecting...";
+    case "unavailable":
+      return "Client offline";
+    case "error":
+      return "Terminal error";
+  }
+}
 
 function isTerminalViewportMode(value: string | null): value is TerminalViewportMode {
   return value === "desktop" || value === "phone" || value === "fixed";
@@ -332,11 +354,14 @@ export default function App() {
   const [desktopNotificationsEnabled, setDesktopNotificationsEnabled] = useState(
     () => readInitialSettings().desktopNotificationsEnabled
   );
+  const [customQuickKeys, setCustomQuickKeys] = useState<CustomQuickKey[]>(readCustomQuickKeys);
   const [terminalControlsOpen, setTerminalControlsOpen] = useState(false);
   const [virtualKeysVisible, setVirtualKeysVisible] = useState(
     () => readMobileLayout() || terminalViewportMode === "phone"
   );
   const [terminalQuickInputOpen, setTerminalQuickInputOpen] = useState(false);
+  const [terminalQuickInputDraft, setTerminalQuickInputDraft] = useState("");
+  const [terminalConnectionStatus, setTerminalConnectionStatus] = useState<TerminalConnectionStatus>("connecting");
   const [terminalImmersive, setTerminalImmersive] = useState(false);
   const [notificationCenterOpen, setNotificationCenterOpen] = useState(false);
   const [gitDiffBrowserOpen, setGitDiffBrowserOpen] = useState(false);
@@ -367,6 +392,23 @@ export default function App() {
       terminalPaneRef.current?.refit();
       terminalPaneRef.current?.focus();
     });
+  }, []);
+
+  const submitAgentPreviewQuickInput = useCallback((draft: string) => {
+    if (draft.length === 0) {
+      return false;
+    }
+
+    return terminalPaneRef.current?.submitQuickInput(`${draft}${TERMINAL_ENTER_INPUT}`) ?? false;
+  }, []);
+
+  const handleCustomQuickKeysChange = useCallback((quickKeys: CustomQuickKey[]) => {
+    writeCustomQuickKeys(quickKeys);
+    setCustomQuickKeys(quickKeys);
+  }, []);
+
+  const submitCustomQuickKey = useCallback((quickKey: CustomQuickKey) => {
+    return terminalPaneRef.current?.submitQuickInput(decodeQuickKeyInput(quickKey.input)) ?? false;
   }, []);
 
   const closeTerminalSwitcher = useCallback(() => {
@@ -1020,6 +1062,7 @@ export default function App() {
     terminalNotifications.some((notification) => notification.windowId === windowId && !notification.read);
   const selectedClient = clientsQuery.data?.find((client) => client.id === selectedClientId) ?? null;
   const selectedClientOffline = isRemoteClientOffline(selectedClient);
+  const agentPreviewCanSendQuickInput = terminalConnectionStatus === "connected";
   const createErrorMessage = createMutation.error instanceof Error
     ? createMutation.error.message
     : "Failed to create terminal.";
@@ -1405,6 +1448,10 @@ export default function App() {
           onTerminalSelection={handleTerminalPaneSelection}
           viewportMode={terminalViewportMode}
           onQuickInputOpenChange={setTerminalQuickInputOpen}
+          onQuickInputDraftChange={setTerminalQuickInputDraft}
+          onTerminalConnectionStatusChange={setTerminalConnectionStatus}
+          customQuickKeys={customQuickKeys}
+          onCustomQuickKeySubmit={submitCustomQuickKey}
           layoutVersion={
             (mobileTerminalActive ? 1 : 0)
             + (terminalImmersive ? 2 : 0)
@@ -1424,6 +1471,12 @@ export default function App() {
           clientId={selectedClientId}
           windowId={selectedWindowId}
           gitWorktree={selectedTreeWindow?.git_worktree ?? null}
+          terminalStatusLabel={terminalStatusLabel(terminalConnectionStatus)}
+          terminalStatusTone={terminalConnectionStatus}
+          quickInputDraft={terminalQuickInputDraft}
+          canSendQuickInput={agentPreviewCanSendQuickInput}
+          onQuickInputDraftChange={(draft) => terminalPaneRef.current?.setQuickInputDraft(draft)}
+          onQuickInputSubmit={submitAgentPreviewQuickInput}
         />
         <SearchPanel clientId={selectedClientId} onSelectWindowId={selectWindow} />
       </aside>
@@ -1437,6 +1490,12 @@ export default function App() {
         isLoading={agentRecordModal.isLoading}
         isError={agentRecordModal.isError}
         isFetching={agentRecordModal.isFetching}
+        terminalStatusLabel={terminalStatusLabel(terminalConnectionStatus)}
+        terminalStatusTone={terminalConnectionStatus}
+        quickInputDraft={terminalQuickInputDraft}
+        canSendQuickInput={agentPreviewCanSendQuickInput}
+        onQuickInputDraftChange={(draft) => terminalPaneRef.current?.setQuickInputDraft(draft)}
+        onQuickInputSubmit={submitAgentPreviewQuickInput}
         onModeChange={agentRecordModal.setMode}
         onChatRoleFilterChange={agentRecordModal.setChatRoleFilter}
         onClose={() => {
@@ -1491,9 +1550,11 @@ export default function App() {
         summaryOutputLanguage={summaryOutputLanguage}
         terminalGroupingMode={terminalGroupingMode}
         desktopNotificationsEnabled={desktopNotificationsEnabled}
+        customQuickKeys={customQuickKeys}
         onSummaryOutputLanguageChange={setSummaryOutputLanguage}
         onTerminalGroupingModeChange={setTerminalGroupingMode}
         onDesktopNotificationsEnabledChange={setDesktopNotificationsEnabled}
+        onCustomQuickKeysChange={handleCustomQuickKeysChange}
       />
       <NotificationCenter
         isOpen={notificationCenterOpen}

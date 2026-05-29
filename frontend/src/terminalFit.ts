@@ -11,6 +11,17 @@ type TerminalCore = {
   viewport?: { scrollBarWidth: number };
 };
 
+type RendererSyncAttempt = {
+  container: HTMLElement;
+  cols: number;
+  rows: number;
+  contentWidth: number;
+  contentHeight: number;
+  renderedHeight: number;
+};
+
+const rendererSyncAttempts = new WeakMap<Terminal, RendererSyncAttempt>();
+
 function readTerminalCore(terminal: Terminal): TerminalCore {
   return (terminal as unknown as { _core?: TerminalCore })._core ?? {};
 }
@@ -183,12 +194,36 @@ export function fitTerminalToContainer(terminal: Terminal, container: HTMLElemen
     renderedHeight < content.height * 0.92;
 
   if (!needsGridChange && !needsRenderFix) {
+    rendererSyncAttempts.delete(terminal);
     return true;
   }
 
   if (needsGridChange) {
+    rendererSyncAttempts.delete(terminal);
     terminal.resize(next.cols, next.rows);
   } else {
+    if (content === null) {
+      return true;
+    }
+    const previousSync = rendererSyncAttempts.get(terminal);
+    if (
+      previousSync?.container === container &&
+      previousSync.cols === next.cols &&
+      previousSync.rows === next.rows &&
+      previousSync.contentWidth === content.width &&
+      previousSync.contentHeight === content.height &&
+      previousSync.renderedHeight === renderedHeight
+    ) {
+      return true;
+    }
+    rendererSyncAttempts.set(terminal, {
+      container,
+      cols: next.cols,
+      rows: next.rows,
+      contentWidth: content.width,
+      contentHeight: content.height,
+      renderedHeight,
+    });
     syncTerminalRendererToGrid(terminal, next.cols, next.rows);
   }
 

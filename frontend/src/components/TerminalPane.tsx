@@ -16,9 +16,17 @@ import {
   TERMINAL_VIEW_PRIORITY_CHANGED_EVENT,
 } from "../terminalViewPriority";
 import { createBrowserUuid } from "../uuid";
+import {
+  clearQuickInputDraft,
+  quickInputDraftStorageKey,
+  readQuickInputDraft,
+  TerminalQuickInput,
+  writeQuickInputDraft
+} from "./TerminalQuickInput";
+import type { CustomQuickKey } from "../terminalQuickKeys";
 
 type TerminalViewportMode = "desktop" | "phone" | "fixed";
-type TerminalConnectionStatus = "connecting" | "connected" | "reconnecting" | "unavailable" | "error";
+export type TerminalConnectionStatus = "connecting" | "connected" | "reconnecting" | "unavailable" | "error";
 
 type TerminalPaneProps = {
   clientId: string | null;
@@ -28,6 +36,10 @@ type TerminalPaneProps = {
   virtualKeysVisible?: boolean;
   onTerminalSelection?: (windowId: string) => void;
   onQuickInputOpenChange?: (open: boolean) => void;
+  onQuickInputDraftChange?: (draft: string) => void;
+  customQuickKeys?: CustomQuickKey[];
+  onCustomQuickKeySubmit?: (quickKey: CustomQuickKey) => boolean;
+  onTerminalConnectionStatusChange?: (status: TerminalConnectionStatus) => void;
 };
 
 type TerminalWriteTestHook = (data: string | Uint8Array, parsedAt: number) => void;
@@ -46,6 +58,9 @@ export type TerminalPaneHandle = {
   focus: () => void;
   refit: () => void;
   openQuickInput: () => void;
+  setQuickInputDraft: (draft: string) => void;
+  submitQuickInput: (draft?: string) => boolean;
+  connectionStatus: () => TerminalConnectionStatus;
 };
 
 type VirtualKey = {
@@ -87,7 +102,6 @@ const LOW_PRIORITY_SOCKET_CLOSE_DELAY_MS = 1500;
 const VIEW_PRIORITY_RECONCILE_INTERVAL_MS = 750;
 const INPUT_VIEW_PRIORITY_CLAIM_INTERVAL_MS = 250;
 const PENDING_INPUT_QUEUE_MAX_SIZE = 64;
-const QUICK_INPUT_DRAFT_STORAGE_PREFIX = "web-terminal-acp:terminal-quick-input:";
 
 function terminalStatusLabel(status: TerminalConnectionStatus): string {
   switch (status) {
@@ -101,38 +115,6 @@ function terminalStatusLabel(status: TerminalConnectionStatus): string {
       return "Client offline, reconnecting...";
     case "error":
       return "Terminal error";
-  }
-}
-
-function quickInputDraftStorageKey(clientId: string, windowId: string): string {
-  return `${QUICK_INPUT_DRAFT_STORAGE_PREFIX}${encodeURIComponent(clientId)}:${encodeURIComponent(windowId)}`;
-}
-
-function readQuickInputDraft(storageKey: string): string {
-  try {
-    return window.localStorage.getItem(storageKey) ?? "";
-  } catch {
-    return "";
-  }
-}
-
-function writeQuickInputDraft(storageKey: string, draft: string): void {
-  try {
-    if (draft.length === 0) {
-      window.localStorage.removeItem(storageKey);
-      return;
-    }
-    window.localStorage.setItem(storageKey, draft);
-  } catch {
-    return;
-  }
-}
-
-function clearQuickInputDraft(storageKey: string): void {
-  try {
-    window.localStorage.removeItem(storageKey);
-  } catch {
-    return;
   }
 }
 
@@ -161,15 +143,6 @@ function isEditableShortcutTarget(target: EventTarget | null): boolean {
 
   const tag = target.tagName;
   return tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable;
-}
-
-function resizeQuickInputTextarea(textarea: HTMLTextAreaElement | null): void {
-  if (textarea === null) {
-    return;
-  }
-
-  textarea.style.height = "auto";
-  textarea.style.height = `${textarea.scrollHeight}px`;
 }
 
 function decodeOsc52ClipboardPayload(data: string): string | null {
@@ -227,11 +200,14 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   virtualKeysVisible = false,
   onTerminalSelection,
   onQuickInputOpenChange,
+  onQuickInputDraftChange,
+  customQuickKeys = [],
+  onCustomQuickKeySubmit,
+  onTerminalConnectionStatusChange,
 }, ref) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const xtermHostRef = useRef<HTMLDivElement | null>(null);
-  const quickInputRef = useRef<HTMLTextAreaElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const socketWorkerRef = useRef<Worker | null>(null);
   const socketOpenRef = useRef(false);
@@ -240,6 +216,8 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   const viewIdRef = useRef<string>(createBrowserUuid());
   const onTerminalSelectionRef = useRef<TerminalPaneProps["onTerminalSelection"]>(onTerminalSelection);
   const onQuickInputOpenChangeRef = useRef<TerminalPaneProps["onQuickInputOpenChange"]>(onQuickInputOpenChange);
+  const onQuickInputDraftChangeRef = useRef<TerminalPaneProps["onQuickInputDraftChange"]>(onQuickInputDraftChange);
+  const onTerminalConnectionStatusChangeRef = useRef<TerminalPaneProps["onTerminalConnectionStatusChange"]>(onTerminalConnectionStatusChange);
   const fitAndNotifyResizeRef = useRef<(() => void) | null>(null);
   const claimActiveTerminalViewRef = useRef<(() => void) | null>(null);
   const sendTerminalInputRef = useRef<((data: string) => void) | null>(null);
@@ -254,10 +232,19 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   const quickInputStorageKey = clientId !== null && windowId !== null
     ? quickInputDraftStorageKey(clientId, windowId)
     : null;
-  const canSendQuickInput = quickInputDraft.length > 0 && connectionStatus === "connected";
+  const canSendQuickInput = connectionStatus === "connected";
+
+  const updateQuickInputDraft = useCallback((draft: string) => {
+    setQuickInputDraft(draft);
+    onQuickInputDraftChangeRef.current?.(draft);
+    if (quickInputStorageKey !== null) {
+      writeQuickInputDraft(quickInputStorageKey, draft);
+    }
+  }, [quickInputStorageKey]);
 
   const updateConnectionStatus = useCallback((status: TerminalConnectionStatus) => {
     connectionStatusRef.current = status;
+    onTerminalConnectionStatusChangeRef.current?.(status);
     setConnectionStatus(status);
   }, []);
 
@@ -268,6 +255,15 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   useEffect(() => {
     onQuickInputOpenChangeRef.current = onQuickInputOpenChange;
   }, [onQuickInputOpenChange]);
+
+  useEffect(() => {
+    onQuickInputDraftChangeRef.current = onQuickInputDraftChange;
+  }, [onQuickInputDraftChange]);
+
+  useEffect(() => {
+    onTerminalConnectionStatusChangeRef.current = onTerminalConnectionStatusChange;
+    onTerminalConnectionStatusChangeRef.current?.(connectionStatusRef.current);
+  }, [onTerminalConnectionStatusChange]);
 
   useEffect(() => {
     onQuickInputOpenChangeRef.current?.(quickInputOpen);
@@ -281,38 +277,14 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   useEffect(() => {
     if (quickInputStorageKey === null) {
       setQuickInputOpen(false);
-      setQuickInputDraft("");
+      updateQuickInputDraft("");
       return;
     }
 
-    setQuickInputDraft(readQuickInputDraft(quickInputStorageKey));
-  }, [quickInputStorageKey]);
-
-  useLayoutEffect(() => {
-    if (!quickInputOpen) {
-      return;
-    }
-
-    resizeQuickInputTextarea(quickInputRef.current);
-  }, [quickInputDraft, quickInputOpen]);
-
-  useEffect(() => {
-    if (!quickInputOpen) {
-      return;
-    }
-
-    const frame = window.requestAnimationFrame(() => {
-      const textarea = quickInputRef.current;
-      if (textarea === null) {
-        return;
-      }
-
-      textarea.focus();
-      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-      resizeQuickInputTextarea(textarea);
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [quickInputOpen, quickInputStorageKey]);
+    const storedDraft = readQuickInputDraft(quickInputStorageKey);
+    setQuickInputDraft(storedDraft);
+    onQuickInputDraftChangeRef.current?.(storedDraft);
+  }, [quickInputStorageKey, updateQuickInputDraft]);
 
   const clearScheduledFits = useCallback(() => {
     for (const frame of scheduledFitFramesRef.current) {
@@ -388,32 +360,39 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     setQuickInputOpen(true);
   }, [claimTerminalViewPriority, clientId, closeQuickInput, quickInputOpen, windowId]);
 
+  const sendTerminalInput = (data: string, { focusAfterSend = true }: { focusAfterSend?: boolean } = {}) => {
+    claimTerminalViewPriority();
+    sendTerminalInputRef.current?.(data);
+    if (focusAfterSend) {
+      focusTerminal();
+    }
+  };
+
+  const submitQuickInput = useCallback((draftOverride?: string) => {
+    claimTerminalViewPriority();
+    const draft = draftOverride ?? quickInputDraft;
+    if (draft.length === 0 || connectionStatusRef.current !== "connected") {
+      return false;
+    }
+
+    sendTerminalInputRef.current?.(draft);
+    if (quickInputStorageKey !== null) {
+      clearQuickInputDraft(quickInputStorageKey);
+    }
+    updateQuickInputDraft("");
+    setQuickInputOpen(false);
+    focusTerminal();
+    return true;
+  }, [claimTerminalViewPriority, focusTerminal, quickInputDraft, quickInputStorageKey, updateQuickInputDraft]);
+
   useImperativeHandle(ref, () => ({
     focus: focusTerminal,
     refit: scheduleFitAndNotifyResize,
     openQuickInput,
-  }), [focusTerminal, openQuickInput, scheduleFitAndNotifyResize]);
-
-  const sendTerminalInput = (data: string) => {
-    claimTerminalViewPriority();
-    sendTerminalInputRef.current?.(data);
-    focusTerminal();
-  };
-
-  const submitQuickInput = useCallback(() => {
-    claimTerminalViewPriority();
-    if (quickInputDraft.length === 0 || connectionStatusRef.current !== "connected") {
-      return;
-    }
-
-    sendTerminalInputRef.current?.(quickInputDraft);
-    if (quickInputStorageKey !== null) {
-      clearQuickInputDraft(quickInputStorageKey);
-    }
-    setQuickInputDraft("");
-    setQuickInputOpen(false);
-    focusTerminal();
-  }, [claimTerminalViewPriority, focusTerminal, quickInputDraft, quickInputStorageKey]);
+    setQuickInputDraft: updateQuickInputDraft,
+    submitQuickInput,
+    connectionStatus: () => connectionStatusRef.current,
+  }), [focusTerminal, openQuickInput, scheduleFitAndNotifyResize, submitQuickInput, updateQuickInputDraft]);
 
   const sendSelectWindow = useCallback((nextWindowId: string) => {
     const worker = socketWorkerRef.current;
@@ -1237,54 +1216,16 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     </div>
   );
   const quickInputOverlay = quickInputOpen ? (
-    <form
-      className="terminal-quick-input-panel"
-      onMouseDown={(event) => event.stopPropagation()}
-      onTouchStart={(event) => event.stopPropagation()}
-      onSubmit={(event) => {
-        event.preventDefault();
-        submitQuickInput();
-      }}
-    >
-      <textarea
-        ref={quickInputRef}
-        aria-label="Quick terminal input"
-        value={quickInputDraft}
-        placeholder="输入内容，发送时一次性写入终端"
-        spellCheck={false}
-        rows={1}
-        onChange={(event) => {
-          const nextDraft = event.target.value;
-          setQuickInputDraft(nextDraft);
-          if (quickInputStorageKey !== null) {
-            writeQuickInputDraft(quickInputStorageKey, nextDraft);
-          }
-          resizeQuickInputTextarea(event.target);
-        }}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") {
-            event.preventDefault();
-            event.stopPropagation();
-            closeQuickInput();
-            return;
-          }
-
-          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-            event.preventDefault();
-            event.stopPropagation();
-            submitQuickInput();
-          }
-        }}
-      />
-      <div className="terminal-quick-input-actions">
-        <button type="button" onClick={closeQuickInput}>
-          Close
-        </button>
-        <button type="submit" disabled={!canSendQuickInput}>
-          Send
-        </button>
-      </div>
-    </form>
+    <TerminalQuickInput
+      value={quickInputDraft}
+      canSend={canSendQuickInput}
+      onValueChange={updateQuickInputDraft}
+      onSubmit={submitQuickInput}
+      onCancel={closeQuickInput}
+      customQuickKeys={customQuickKeys}
+      onCustomQuickKeySubmit={onCustomQuickKeySubmit}
+      autoFocus
+    />
   ) : null;
 
   return (
@@ -1313,7 +1254,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
               onTouchStart={(event) => event.stopPropagation()}
               onClick={(event) => {
                 event.stopPropagation();
-                sendTerminalInput(key.value);
+                sendTerminalInput(key.value, { focusAfterSend: false });
               }}
             >
               {key.label}

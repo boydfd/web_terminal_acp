@@ -9,6 +9,7 @@ import type {
   AgentRecordEvent,
   AgentSession
 } from "../types";
+import { TerminalQuickInput } from "./TerminalQuickInput";
 
 type EventTone =
   | "base-instructions"
@@ -47,6 +48,12 @@ type AgentRecordViewerProps = AgentRecordViewProps & {
 };
 type AgentRecordModalProps = AgentRecordViewProps & {
   open: boolean;
+  terminalStatusLabel?: string;
+  terminalStatusTone?: "connected" | "connecting" | "reconnecting" | "unavailable" | "error";
+  quickInputDraft?: string;
+  canSendQuickInput?: boolean;
+  onQuickInputDraftChange?: (draft: string) => void;
+  onQuickInputSubmit?: (draft: string) => boolean;
   onClose: () => void;
 };
 type PageInfo = {
@@ -629,6 +636,12 @@ export function AgentRecordModal({
   isLoading = false,
   isError = false,
   isFetching = false,
+  terminalStatusLabel = "Terminal unavailable",
+  terminalStatusTone = "unavailable",
+  quickInputDraft = "",
+  canSendQuickInput = false,
+  onQuickInputDraftChange,
+  onQuickInputSubmit,
   onModeChange,
   onChatRoleFilterChange,
   onSessionChange,
@@ -650,6 +663,7 @@ export function AgentRecordModal({
     : detailRecord;
   const expandedDisplayRecord = mode === "chat" ? expandedChatRecord : expandedDetailRecord;
   const activePageInfo = pageInfo(mode, chatRecord, detailRecord);
+  const canUseQuickInput = onQuickInputDraftChange !== undefined && onQuickInputSubmit !== undefined;
 
   const selectSession = (sessionId: string) => {
     setSelectedSessionId(sessionId);
@@ -702,6 +716,13 @@ export function AgentRecordModal({
     return null;
   }
 
+  const submitQuickInput = (draft: string) => {
+    if (!canUseQuickInput) {
+      return false;
+    }
+    return onQuickInputSubmit(draft);
+  };
+
   return (
     <div className="agent-record-modal" role="dialog" aria-modal="true" aria-label="Agent record">
       <button type="button" className="agent-record-modal-backdrop" aria-label="Collapse agent record" onClick={onClose} />
@@ -712,6 +733,9 @@ export function AgentRecordModal({
             <small>{recordMeta(mode, chatRoleFilter, chatRecord, detailRecord, isLoading, isError)}</small>
           </div>
           <div className="agent-record-actions">
+            <span className={`agent-record-terminal-status ${terminalStatusTone}`} role="status">
+              {terminalStatusLabel}
+            </span>
             <AgentRecordModeToggle mode={mode} onModeChange={onModeChange} disabled={isLoading} />
             {mode === "chat" && (
               <AgentChatRoleFilterToggle
@@ -723,17 +747,31 @@ export function AgentRecordModal({
             <button type="button" onClick={onClose}>Collapse</button>
           </div>
         </div>
-        {sessionTabs}
-        <AgentRecordPagination info={activePageInfo} isFetching={isFetching} onPreviousPage={onPreviousPage} onNextPage={onNextPage} />
-        {isLoading
-          ? <p className="muted">Loading agent record...</p>
-          : isError
-            ? <p className="error" role="alert">Failed to load agent record.</p>
-            : canRenderContent && expandedDisplayRecord
-              ? mode === "chat"
-                ? <AgentChatContent record={expandedDisplayRecord as AgentChatRecord} />
-                : <AgentRecordContent record={expandedDisplayRecord as AgentRecord} />
-              : <p className="muted">No agent record captured yet.</p>}
+        <div className="agent-record-modal-scroll">
+          {sessionTabs}
+          <AgentRecordPagination info={activePageInfo} isFetching={isFetching} onPreviousPage={onPreviousPage} onNextPage={onNextPage} />
+          {isLoading
+            ? <p className="muted">Loading agent record...</p>
+            : isError
+              ? <p className="error" role="alert">Failed to load agent record.</p>
+              : canRenderContent && expandedDisplayRecord
+                ? mode === "chat"
+                  ? <AgentChatContent record={expandedDisplayRecord as AgentChatRecord} />
+                  : <AgentRecordContent record={expandedDisplayRecord as AgentRecord} />
+                : <p className="muted">No agent record captured yet.</p>}
+        </div>
+        {canUseQuickInput && (
+          <TerminalQuickInput
+            className="agent-record-quick-input"
+            value={quickInputDraft}
+            canSend={canSendQuickInput}
+            onValueChange={onQuickInputDraftChange}
+            onSubmit={submitQuickInput}
+            autoFocus
+            placeholder="输入文字后按 Enter 发送；Shift+Enter 换行"
+            submitOnEnter
+          />
+        )}
       </section>
     </div>
   );

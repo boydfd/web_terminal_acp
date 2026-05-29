@@ -14,6 +14,12 @@ type WindowDetailProps = {
   clientId: string | null;
   windowId: string | null;
   gitWorktree?: GitWorktreeActivity | null;
+  terminalStatusLabel?: string;
+  terminalStatusTone?: "connected" | "connecting" | "reconnecting" | "unavailable" | "error";
+  quickInputDraft?: string;
+  canSendQuickInput?: boolean;
+  onQuickInputDraftChange?: (draft: string) => void;
+  onQuickInputSubmit?: (draft: string) => boolean;
 };
 
 type SummaryStatus = {
@@ -110,7 +116,13 @@ function renameTreeWindow(
 export function WindowDetail({
   clientId,
   windowId,
-  gitWorktree = null
+  gitWorktree = null,
+  terminalStatusLabel,
+  terminalStatusTone,
+  quickInputDraft,
+  canSendQuickInput,
+  onQuickInputDraftChange,
+  onQuickInputSubmit
 }: WindowDetailProps) {
   const [allowTitleFolderOverride, setAllowTitleFolderOverride] = useState(false);
   const [detailTab, setDetailTab] = useState<DetailPanelTab>("overview");
@@ -409,6 +421,12 @@ export function WindowDetail({
             isLoading={agentRecord.isLoading}
             isError={agentRecord.isError}
             isFetching={agentRecord.isFetching}
+            terminalStatusLabel={terminalStatusLabel}
+            terminalStatusTone={terminalStatusTone}
+            quickInputDraft={quickInputDraft}
+            canSendQuickInput={canSendQuickInput}
+            onQuickInputDraftChange={onQuickInputDraftChange}
+            onQuickInputSubmit={onQuickInputSubmit}
             onModeChange={agentRecord.setMode}
             onChatRoleFilterChange={agentRecord.setChatRoleFilter}
             onClose={() => agentRecord.setExpanded(false)}

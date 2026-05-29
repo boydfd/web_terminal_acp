@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Web Terminal ACP</string>
+    <string name="title_activity_main">Web Terminal ACP</string>
+    <string name="package_name">com.webterminal.acp</string>
+    <string name="custom_url_scheme">com.webterminal.acp</string>
+</resources>
