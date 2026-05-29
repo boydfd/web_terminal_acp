@@ -35,6 +35,7 @@ AGENT_WATCH_IDLE_INTERVAL_SECONDS = 2.0
 AGENT_WATCH_MAX_INTERVAL_SECONDS = 5.0
 AGENT_WATCH_SLOW_SCAN_SECONDS = 1.0
 AGENT_WATCH_DISCOVERY_INTERVAL_SECONDS = 30.0
+CLAUDE_HISTORY_PENDING_RETRY_SECONDS = 2.0
 AGENT_WATCH_COLLECTION_CONCURRENCY = 2
 AGENT_WATCH_PROCESS_SCAN_INTERVAL_SECONDS = 30.0
 _WATCH_COLLECTION_SEMAPHORE: asyncio.Semaphore | None = None
@@ -48,8 +49,16 @@ def cursor_store_paths_for_window(window_id: UUID | str) -> list[Path]:
     return sorted(path for path in root.rglob("store.db") if path.is_file())
 
 
+def claude_code_home_for_window(window_id: UUID | str) -> Path:
+    return Path.home() / ".web-terminal-acp" / "claude-code-homes" / str(window_id)
+
+
 def claude_code_projects_dir(window_id: UUID | str) -> Path:
-    return Path.home() / ".web-terminal-acp" / "claude-code-homes" / str(window_id) / "projects"
+    return claude_code_home_for_window(window_id) / "projects"
+
+
+def claude_code_history_file(window_id: UUID | str) -> Path:
+    return claude_code_home_for_window(window_id) / "history.jsonl"
 
 
 def iter_claude_code_jsonl_files(window_id: UUID | str) -> list[Path]:
@@ -57,6 +66,13 @@ def iter_claude_code_jsonl_files(window_id: UUID | str) -> list[Path]:
     if not root.exists():
         return []
     return sorted(path for path in root.rglob("*.jsonl") if path.is_file())
+
+
+def iter_claude_code_transcript_files_for_session(window_id: UUID | str, session_id: str) -> list[Path]:
+    root = claude_code_projects_dir(window_id)
+    if not root.exists():
+        return []
+    return sorted(path for path in root.rglob(f"{session_id}.jsonl") if path.is_file())
 
 
 def _initial_process_scan_delay(window_id: UUID, interval_seconds: float) -> float:
@@ -75,6 +91,11 @@ class AgentToolWatcherState:
     claude_code_offsets: dict[Path, int] = field(default_factory=dict)
     claude_code_jsonl_files: list[Path] = field(default_factory=list)
     claude_code_jsonl_files_refreshed_at: float = 0.0
+    claude_code_history_offset: int = 0
+    claude_code_history_session_ids: set[str] = field(default_factory=set)
+    claude_code_pending_history_session_ids: set[str] = field(default_factory=set)
+    claude_code_pending_history_scanned_at: float = 0.0
+    claude_code_history_jsonl_files: set[Path] = field(default_factory=set)
     cursor_store_paths: list[Path] = field(default_factory=list)
     cursor_seen_blob_ids: dict[Path, set[str]] = field(default_factory=dict)
     cursor_last_rowids: dict[Path, int] = field(default_factory=dict)
@@ -328,6 +349,20 @@ def initialize_agent_tool_watcher_state(state: AgentToolWatcherState, *, window_
             state.claude_code_offsets[path] = path.stat().st_size
         except FileNotFoundError:
             state.claude_code_offsets.pop(path, None)
+    history_file = claude_code_history_file(window_id)
+    try:
+        state.claude_code_history_offset = history_file.stat().st_size
+        session_ids = read_all_claude_history_session_ids(history_file)
+        found_session_ids = _add_claude_code_history_transcripts(
+            state,
+            window_id=window_id,
+            session_ids=session_ids,
+            start_at_eof=True,
+        )
+        state.claude_code_history_session_ids.update(found_session_ids)
+        state.claude_code_pending_history_session_ids.update(session_ids - found_session_ids)
+    except FileNotFoundError:
+        state.claude_code_history_offset = 0
 
     state.cursor_store_paths = cursor_store_paths_for_window(window_id)
     for path in state.cursor_store_paths:
@@ -369,7 +404,97 @@ def _cached_claude_code_jsonl_files(state: AgentToolWatcherState, window_id: UUI
     ):
         state.claude_code_jsonl_files = iter_claude_code_jsonl_files(window_id)
         state.claude_code_jsonl_files_refreshed_at = now
-    return state.claude_code_jsonl_files
+    return sorted({*state.claude_code_jsonl_files, *state.claude_code_history_jsonl_files})
+
+
+def _refresh_claude_code_history_sessions(state: AgentToolWatcherState, window_id: UUID) -> None:
+    history_file = claude_code_history_file(window_id)
+    offset = state.claude_code_history_offset
+    try:
+        session_ids, next_offset = read_claude_history_session_ids(history_file, offset)
+    except FileNotFoundError:
+        state.claude_code_history_offset = 0
+        return
+
+    state.claude_code_history_offset = next_offset
+    new_pending_session_ids = session_ids - state.claude_code_history_session_ids
+    state.claude_code_pending_history_session_ids.update(new_pending_session_ids)
+    if not state.claude_code_pending_history_session_ids:
+        return
+
+    now = time.monotonic()
+    pending_retry_due = (
+        state.claude_code_pending_history_scanned_at == 0.0
+        or now - state.claude_code_pending_history_scanned_at >= CLAUDE_HISTORY_PENDING_RETRY_SECONDS
+    )
+    if not new_pending_session_ids and not pending_retry_due:
+        return
+    state.claude_code_pending_history_scanned_at = now
+
+    found_session_ids = _add_claude_code_history_transcripts(
+        state,
+        window_id=window_id,
+        session_ids=state.claude_code_pending_history_session_ids,
+        start_at_eof=False,
+    )
+    if found_session_ids:
+        state.claude_code_pending_history_session_ids.difference_update(found_session_ids)
+        state.claude_code_history_session_ids.update(found_session_ids)
+
+
+def _add_claude_code_history_transcripts(
+    state: AgentToolWatcherState,
+    *,
+    window_id: UUID,
+    session_ids: set[str],
+    start_at_eof: bool,
+) -> set[str]:
+    found_session_ids: set[str] = set()
+    for session_id in sorted(session_ids):
+        for path in iter_claude_code_transcript_files_for_session(window_id, session_id):
+            if path not in state.claude_code_history_jsonl_files:
+                state.claude_code_history_jsonl_files.add(path)
+                if start_at_eof:
+                    try:
+                        state.claude_code_offsets.setdefault(path, path.stat().st_size)
+                    except FileNotFoundError:
+                        state.claude_code_offsets.pop(path, None)
+                        continue
+                else:
+                    state.claude_code_offsets.setdefault(path, 0)
+            found_session_ids.add(session_id)
+    return found_session_ids
+
+
+def read_claude_history_session_ids(path: Path, offset: int) -> tuple[set[str], int]:
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+    if offset > path.stat().st_size:
+        offset = 0
+    entries, next_offset = read_new_jsonl_events(path, offset)
+    return {
+        session_id
+        for entry, _line_offset in entries
+        if (session_id := _claude_history_session_id(entry)) is not None
+    }, next_offset
+
+
+def read_all_claude_history_session_ids(path: Path) -> set[str]:
+    session_ids: set[str] = set()
+    offset = 0
+    while True:
+        batch_session_ids, next_offset = read_claude_history_session_ids(path, offset)
+        session_ids.update(batch_session_ids)
+        if next_offset == offset or next_offset >= path.stat().st_size:
+            return session_ids
+        offset = next_offset
+
+
+def _claude_history_session_id(entry: dict[str, Any]) -> str | None:
+    value = entry.get("sessionId")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def collect_codex_watch_events(
@@ -419,6 +544,7 @@ def collect_claude_code_watch_events(
     window_id: UUID,
     project_path: str | None,
 ) -> list[ManagedAiEvent]:
+    _refresh_claude_code_history_sessions(state, window_id)
     events: list[ManagedAiEvent] = []
     for path in _cached_claude_code_jsonl_files(state, window_id):
         offset = state.claude_code_offsets.get(path, 0)

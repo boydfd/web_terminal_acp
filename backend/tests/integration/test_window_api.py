@@ -1190,6 +1190,67 @@ async def test_get_window_agent_record_chat_filters_agent_default_user_inputs(db
 
 
 @pytest.mark.asyncio
+async def test_get_window_agent_record_chat_excludes_terminal_commands(db_client):
+    client_id = await get_local_client_id(db_client)
+    window_response = await db_client.post(
+        f"/api/clients/{client_id}/windows",
+        json={"cwd": "/tmp/project", "shell_command": "/bin/bash"},
+    )
+    window_id = UUID(window_response.json()["id"])
+
+    async with db_client.session_factory() as session:
+        base_time = datetime.now(timezone.utc)
+        session.add_all(
+            [
+                Event(
+                    client_id=UUID(client_id),
+                    source_type=EventSourceType.terminal,
+                    source_id=str(window_id),
+                    kind="terminal_input_command",
+                    virtual_window_id=window_id,
+                    payload_json={"command": "claude --resume claude-session", "sequence": 1},
+                    fingerprint="agent-record-chat-terminal-agent-command",
+                    created_at=base_time,
+                ),
+                Event(
+                    client_id=UUID(client_id),
+                    source_type=EventSourceType.terminal,
+                    source_id=str(window_id),
+                    kind="terminal_input_command",
+                    virtual_window_id=window_id,
+                    payload_json={"command": "npm test", "sequence": 2},
+                    fingerprint="agent-record-chat-terminal-plain-command",
+                    created_at=base_time + timedelta(milliseconds=1),
+                ),
+                Event(
+                    client_id=UUID(client_id),
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="claude-session-1",
+                    kind="assistant_message",
+                    virtual_window_id=window_id,
+                    payload_json={
+                        "provider": "claude_code",
+                        "type": "assistant",
+                        "message": {"role": "assistant", "content": "real agent response"},
+                    },
+                    fingerprint="agent-record-chat-real-agent-response",
+                    created_at=base_time + timedelta(milliseconds=2),
+                ),
+            ]
+        )
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/windows/{window_id}/agent-record/chat")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [(item["role"], item["body"]) for item in body["messages"]] == [
+        ("agent", "real agent response")
+    ]
+    assert body["messages_total"] == 1
+
+
+@pytest.mark.asyncio
 async def test_get_window_command_history_returns_terminal_input_commands(db_client):
     client_id = await get_local_client_id(db_client)
     window_response = await db_client.post(

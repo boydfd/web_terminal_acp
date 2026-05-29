@@ -86,6 +86,16 @@ export function terminalSelectionWebSocketUrl(clientId: string): string {
   return url.toString();
 }
 
+export function uiEventsWebSocketUrl(): string {
+  const url = new URL(apiUrl("/api/ui-events"));
+  if (url.protocol === "http:") {
+    url.protocol = "ws:";
+  } else if (url.protocol === "https:") {
+    url.protocol = "wss:";
+  }
+  return url.toString();
+}
+
 export function fetchClients(): Promise<Client[]> {
   return request<Client[]>("/api/clients");
 }

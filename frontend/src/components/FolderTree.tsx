@@ -317,6 +317,7 @@ export function FolderTree({
   const [locatingWindowId, setLocatingWindowId] = useState<string | null>(null);
   const windowButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const locateClearTimeoutRef = useRef<number | null>(null);
+  const handledLocateSignalRef = useRef(0);
   const projectSummariesQuery = useQuery({
     queryKey: ["project-summaries", clientId],
     queryFn: () => fetchProjectSummaries(clientId as string),
@@ -392,6 +393,9 @@ export function FolderTree({
     if (locateSelectedWindowSignal === 0 || selectedWindowId === null) {
       return;
     }
+    if (handledLocateSignalRef.current === locateSelectedWindowSignal) {
+      return;
+    }
 
     const frame = window.requestAnimationFrame(() => {
       const selectedButton = windowButtonRefs.current.get(selectedWindowId);
@@ -399,8 +403,8 @@ export function FolderTree({
         return;
       }
 
+      handledLocateSignalRef.current = locateSelectedWindowSignal;
       selectedButton.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
-      selectedButton.focus({ preventScroll: true });
       setLocatingWindowId(selectedWindowId);
 
       if (locateClearTimeoutRef.current !== null) {

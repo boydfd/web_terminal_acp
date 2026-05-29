@@ -19,6 +19,8 @@ from app.client_agent.agent_tool_watchers import (
     collect_cursor_watch_events,
     enqueue_managed_ai_event,
     initialize_agent_tool_watcher_state,
+    read_all_claude_history_session_ids,
+    read_claude_history_session_ids,
     watch_agent_tool_events,
 )
 from app.services.runtime.protocol import AgentMessage
@@ -302,6 +304,175 @@ def test_collect_claude_code_watch_events_reads_managed_home_and_tracks_offsets(
     assert event.payload["type"] == "assistant"
     assert second == []
     assert state.claude_code_offsets[session_file] == session_file.stat().st_size
+
+
+def test_read_claude_history_session_ids_extracts_sessions_and_tracks_offset(tmp_path: Path) -> None:
+    history_file = tmp_path / "history.jsonl"
+    history_file.write_text(
+        json.dumps({"display": "hi", "sessionId": "claude-session-1"}) + "\n"
+        + json.dumps({"display": "missing session"}) + "\n",
+        encoding="utf-8",
+    )
+
+    session_ids, offset = read_claude_history_session_ids(history_file, 0)
+    second_session_ids, second_offset = read_claude_history_session_ids(history_file, offset)
+
+    assert session_ids == {"claude-session-1"}
+    assert offset == history_file.stat().st_size
+    assert second_session_ids == set()
+    assert second_offset == offset
+
+
+def test_read_all_claude_history_session_ids_reads_past_default_batch_limit(tmp_path: Path) -> None:
+    history_file = tmp_path / "history.jsonl"
+    history_file.write_text(
+        "".join(
+            json.dumps({"display": f"prompt {index}", "sessionId": f"claude-session-{index}"}) + "\n"
+            for index in range(125)
+        ),
+        encoding="utf-8",
+    )
+
+    session_ids = read_all_claude_history_session_ids(history_file)
+
+    assert len(session_ids) == 125
+    assert "claude-session-0" in session_ids
+    assert "claude-session-124" in session_ids
+
+
+def test_collect_claude_code_watch_events_maps_history_session_to_managed_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    session_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    history_file = home / ".web-terminal-acp" / "claude-code-homes" / str(WINDOW_ID) / "history.jsonl"
+    transcript_file = (
+        home
+        / ".web-terminal-acp"
+        / "claude-code-homes"
+        / str(WINDOW_ID)
+        / "projects"
+        / "-workspace-project"
+        / f"{session_id}.jsonl"
+    )
+    history_file.parent.mkdir(parents=True)
+    transcript_file.parent.mkdir(parents=True)
+    history_file.write_text(
+        json.dumps({"display": "fix bug", "sessionId": session_id}) + "\n",
+        encoding="utf-8",
+    )
+    transcript_file.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": session_id,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "mapped transcript"}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: home)
+    state = AgentToolWatcherState()
+
+    events = collect_claude_code_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+    second = collect_claude_code_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.provider == "claude_code"
+    assert event.source_path == str(transcript_file)
+    assert event.offset == 0
+    assert event.cursor == 0
+    assert event.payload["sessionId"] == session_id
+    assert event.payload["message"]["content"][0]["text"] == "mapped transcript"
+    assert event.payload["WEB_TERMINAL_CLIENT_ID"] == str(CLIENT_ID)
+    assert event.payload["WEB_TERMINAL_WINDOW_ID"] == str(WINDOW_ID)
+    assert event.payload["WEB_TERMINAL_PROJECT_PATH"] == "/workspace/project"
+    assert second == []
+    assert state.claude_code_history_session_ids == {session_id}
+    assert state.claude_code_history_jsonl_files == {transcript_file}
+    assert state.claude_code_offsets[transcript_file] == transcript_file.stat().st_size
+
+
+def test_initialize_agent_tool_watcher_state_tracks_existing_claude_history_sessions_at_eof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    session_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    history_file = home / ".web-terminal-acp" / "claude-code-homes" / str(WINDOW_ID) / "history.jsonl"
+    transcript_file = (
+        home
+        / ".web-terminal-acp"
+        / "claude-code-homes"
+        / str(WINDOW_ID)
+        / "projects"
+        / "-workspace-project"
+        / f"{session_id}.jsonl"
+    )
+    history_file.parent.mkdir(parents=True)
+    transcript_file.parent.mkdir(parents=True)
+    history_file.write_text(
+        json.dumps({"display": "resume", "sessionId": session_id}) + "\n",
+        encoding="utf-8",
+    )
+    transcript_file.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": session_id,
+                "message": {"role": "assistant", "content": "old transcript"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: home)
+    state = AgentToolWatcherState()
+
+    initialize_agent_tool_watcher_state(state, window_id=WINDOW_ID)
+
+    assert collect_claude_code_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    ) == []
+
+    new_offset = transcript_file.stat().st_size
+    transcript_file.write_text(
+        transcript_file.read_text(encoding="utf-8")
+        + json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": session_id,
+                "message": {"role": "assistant", "content": "new transcript"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    events = collect_claude_code_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+
+    assert [event.offset for event in events] == [new_offset]
+    assert events[0].payload["message"]["content"] == "new transcript"
 
 
 def test_collect_codex_watch_events_reuses_discovered_paths_until_refresh(

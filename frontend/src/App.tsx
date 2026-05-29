@@ -10,6 +10,7 @@ import {
   fetchTree,
   fetchWindowActivity,
   recordTerminalRecent,
+  uiEventsWebSocketUrl,
   updateClient
 } from "./api";
 import { BootstrapClientForm } from "./components/BootstrapClientForm";
@@ -59,6 +60,12 @@ import {
   mergeTreeWithActivity,
   windowActivityMap
 } from "./terminalTree";
+import {
+  applyUiInvalidation,
+  nextUiEventReconnectDelay,
+  parseUiEvent,
+  scheduleWindowActivityRefresh
+} from "./uiEvents";
 import type { BootstrapClientInput, Client, TreeFolder } from "./types";
 type TerminalViewportMode = "desktop" | "phone" | "fixed";
 
@@ -378,6 +385,106 @@ export default function App() {
     windowId: selectedWindowId,
     enabled: agentRecordModalOpen
   });
+
+  useEffect(() => {
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    const delayedRefreshTimers = new Map<string, number>();
+    let reconnectAttempt = 0;
+    let closed = false;
+
+    const clearReconnectTimer = () => {
+      if (reconnectTimer === null) {
+        return;
+      }
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    };
+
+    const clearDelayedRefreshTimers = () => {
+      for (const timer of delayedRefreshTimers.values()) {
+        window.clearTimeout(timer);
+      }
+      delayedRefreshTimers.clear();
+    };
+
+    const scheduleReconnect = () => {
+      if (closed || reconnectTimer !== null) {
+        return;
+      }
+      reconnectAttempt += 1;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, nextUiEventReconnectDelay(reconnectAttempt));
+    };
+
+    const trackDelayedRefresh = (clientId: string | null, timer: number | null) => {
+      if (clientId === null || timer === null) {
+        return;
+      }
+      const previousTimer = delayedRefreshTimers.get(clientId);
+      if (previousTimer !== undefined) {
+        window.clearTimeout(previousTimer);
+      }
+      delayedRefreshTimers.set(clientId, timer);
+    };
+
+    const connect = () => {
+      if (closed) {
+        return;
+      }
+      if (socket !== null) {
+        socket.onclose = null;
+        socket.onerror = null;
+        socket.onmessage = null;
+        socket.close();
+      }
+      const nextSocket = new WebSocket(uiEventsWebSocketUrl());
+      socket = nextSocket;
+      nextSocket.onopen = () => {
+        if (socket !== nextSocket) {
+          return;
+        }
+        reconnectAttempt = 0;
+      };
+      nextSocket.onmessage = (message) => {
+        if (socket !== nextSocket) {
+          return;
+        }
+        if (typeof message.data !== "string") {
+          return;
+        }
+        const event = parseUiEvent(message.data);
+        if (event?.type !== "invalidate") {
+          return;
+        }
+        applyUiInvalidation(queryClient, event);
+        trackDelayedRefresh(event.client_id, scheduleWindowActivityRefresh(queryClient, event, (timer) => {
+          if (event.client_id !== null && delayedRefreshTimers.get(event.client_id) === timer) {
+            delayedRefreshTimers.delete(event.client_id);
+          }
+        }));
+      };
+      nextSocket.onclose = () => {
+        if (socket !== nextSocket) {
+          return;
+        }
+        scheduleReconnect();
+      };
+      nextSocket.onerror = () => {
+        nextSocket.close();
+      };
+    };
+
+    connect();
+    return () => {
+      closed = true;
+      clearReconnectTimer();
+      clearDelayedRefreshTimers();
+      socket?.close();
+    };
+  }, [queryClient]);
 
   const persistTerminalRecent = useCallback((clientId: string, windowId: string, title: string) => {
     void recordTerminalRecent(clientId, { window_id: windowId, title })
@@ -799,6 +906,9 @@ export default function App() {
 
       event.preventDefault();
       event.stopPropagation();
+      if (event.repeat) {
+        return;
+      }
       triggerLocateSelectedTerminal();
     };
 

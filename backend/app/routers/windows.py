@@ -239,22 +239,12 @@ def _string_value(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
-def _terminal_chat_projection(event: Event) -> AgentChatProjection | None:
-    if event.kind != "terminal_input_command":
-        return None
-    body = _string_value(event.payload_json.get("command"))
-    if body is None:
-        return None
-    return AgentChatProjection(role="user", body=body, dedupe_key=f"{event.source_id}:terminal:{body}")
-
-
 def _project_chat(event: Event) -> AgentChatProjection | None:
     adapter = _adapter_for_event(event)
-    chat: AgentChatProjection | None = None
     if adapter is not None:
         with contextlib.suppress(Exception):
-            chat = adapter.project_chat(event)
-    return chat or _terminal_chat_projection(event)
+            return adapter.project_chat(event)
+    return None
 
 
 def _chat_message_out(event: Event, projection: AgentChatProjection) -> AgentChatMessageOut:
@@ -718,7 +708,7 @@ async def read_window_agent_record_chat(
         Event.client_id == client_id,
         Event.virtual_window_id == window_id,
         or_(
-            Event.kind.in_(("terminal_input_command", "user_message", "assistant_message")),
+            Event.kind.in_(("user_message", "assistant_message")),
             Event.kind.in_(("response_item", "event_msg")),
         ),
     )

@@ -502,6 +502,10 @@ test.describe("terminal viewport fit", () => {
 
     await expect(selectedTerminal).toHaveClass(/locating/);
     await expect.poll(
+      () => page.evaluate(() => document.activeElement?.classList.contains("xterm-helper-textarea") ?? false),
+      { timeout: 5000 },
+    ).toBe(true);
+    await expect.poll(
       () => selectedTerminal.evaluate((element) => {
         const sidebar = element.closest(".sidebar");
         if (!(sidebar instanceof HTMLElement)) {
