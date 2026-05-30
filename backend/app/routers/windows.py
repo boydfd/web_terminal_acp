@@ -5,7 +5,7 @@ import contextlib
 import logging
 import posixpath
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
@@ -14,12 +14,21 @@ from sqlalchemy import case, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.agent_tools import get_agent_tool_registry
+from app.agent_tools import agent_activity_source_types, get_agent_tool_registry
 from app.agent_tools.common import fallback_projection
 from app.agent_tools.types import AgentChatProjection, AgentEventProjection, AgentToolAdapter
 from app.config import get_settings
 from app.db import SessionLocal, get_session
-from app.models import AiSession, Client, ClientRuntime, Event, EventSourceType, SummaryJob, VirtualWindow
+from app.models import (
+    AiSession,
+    Client,
+    ClientRuntime,
+    Event,
+    EventSourceType,
+    SummaryJob,
+    TerminalRecentUsage,
+    VirtualWindow,
+)
 from app.repositories.clients import ensure_local_client, get_client
 from app.repositories.summary_jobs import (
     enqueue_manual_summary_retry,
@@ -32,10 +41,15 @@ from app.repositories.windows import (
     create_window,
     delete_window,
     get_window_for_client,
+    list_window_title_history,
     patch_window,
 )
 from app.routers.ui_events import ui_event_hub_from_state
+from app.services import agent_config as agent_config_service
 from app.schemas import (
+    AgentConfigOut,
+    AgentConfigSelectionIn,
+    AgentConfigToggleIn,
     AgentChatMessageOut,
     AgentChatRecordOut,
     AgentEventOut,
@@ -51,6 +65,8 @@ from app.schemas import (
     WindowCreateIn,
     WindowOut,
     WindowPatchIn,
+    WindowTitleHistoryItemOut,
+    WindowTitleHistoryOut,
 )
 from app.services.runtime.client_connections import ClientConnectionRegistry
 from app.services.git_worktree_agent_markers import materialize_agent_worktree_markers
@@ -64,6 +80,7 @@ from app.services.polling_response_cache import (
     store_json_response,
 )
 from app.services.runtime.remote import RemoteClientUnavailable, RemoteRuntime, RemoteTerminalError
+from app.services.event_kinds import AGENT_WORK_PRESENCE_KIND
 from app.services.terminal_work_status import (
     TerminalWorkStatus,
     load_work_status,
@@ -81,13 +98,28 @@ AgentRecordOffset = Annotated[int, Query(ge=0)]
 AgentChatRole = Literal["all", "user", "agent"]
 CommandHistoryLimit = Annotated[int, Query(ge=1, le=200)]
 CommandHistoryOffset = Annotated[int, Query(ge=0)]
-_PROVIDER_ALIASES = {"claude": "claude_code"}
+TitleHistoryLimit = Annotated[int, Query(ge=1, le=200)]
+TitleHistoryOffset = Annotated[int, Query(ge=0)]
+_PROVIDER_ALIASES = {"claude": "claude_code", "cursor": "cursor_cli", "agent": "cursor_cli"}
+_AGENT_PROVIDER_BY_KIND = {
+    "codex": "codex",
+    "claude": "claude_code",
+    "cursor": "cursor_cli",
+}
 
 
 @dataclass(frozen=True)
 class _RuntimeClient:
     id: UUID
     runtime: ClientRuntime
+
+
+@dataclass(frozen=True)
+class _WindowOverviewTimestamps:
+    last_terminal_command_at: datetime | None = None
+    last_agent_event_at: datetime | None = None
+    last_recent_usage_at: datetime | None = None
+    last_agent_presence_at: datetime | None = None
 
 
 def _runtime_client_from_model(client: Client) -> _RuntimeClient:
@@ -103,6 +135,8 @@ async def _require_client(session: AsyncSession, client_id: UUID) -> Client:
 
 def _command_capture_supported(window: VirtualWindow) -> bool:
     shell = window.shell_command or get_settings().default_shell
+    if agent_from_command(shell) is not None:
+        shell = get_settings().default_shell
     return posixpath.basename(shell) in {"bash", "zsh"}
 
 
@@ -126,13 +160,16 @@ def to_window_out(
     summary_job: SummaryJob | None = None,
     runtime_tags: list[str] | None = None,
     work_status: TerminalWorkStatus | None = None,
+    overview_timestamps: _WindowOverviewTimestamps | None = None,
 ) -> WindowOut:
+    timestamps = overview_timestamps or _WindowOverviewTimestamps()
     effective_runtime_tags = runtime_tags
     if effective_runtime_tags is None:
         effective_runtime_tags = runtime_tags_for_window(
             window,
             terminal_agent=agent_from_command(window.shell_command),
         )
+    effective_work_status = work_status or long_idle_work_status()
     return WindowOut(
         id=window.id,
         client_id=window.client_id,
@@ -151,9 +188,98 @@ def to_window_out(
         summary=window.summary,
         title_tags=window.title_tags,
         runtime_tags=effective_runtime_tags,
-        work_status=to_work_status_out(work_status or long_idle_work_status()),
+        work_status=to_work_status_out(effective_work_status),
         summary_job=to_summary_job_out(summary_job),
         created_at=window.created_at,
+        last_terminal_command_at=timestamps.last_terminal_command_at,
+        last_agent_event_at=timestamps.last_agent_event_at,
+        last_active_at=_latest_window_active_at(
+            window,
+            effective_work_status,
+            timestamps,
+        ),
+    )
+
+
+def _aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _max_datetime(*values: datetime | None) -> datetime | None:
+    candidates = [_aware_utc(value) for value in values if value is not None]
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def _latest_window_active_at(
+    window: VirtualWindow,
+    work_status: TerminalWorkStatus,
+    timestamps: _WindowOverviewTimestamps,
+) -> datetime:
+    return _max_datetime(
+        window.created_at,
+        timestamps.last_recent_usage_at,
+        timestamps.last_terminal_command_at,
+        timestamps.last_agent_event_at,
+        window.terminal_last_output_at,
+        timestamps.last_agent_presence_at,
+        work_status.last_activity_at,
+        work_status.last_working_activity_at,
+    ) or _aware_utc(window.created_at)
+
+
+async def _load_window_overview_timestamps(
+    session: AsyncSession,
+    client_id: UUID,
+    window_id: UUID,
+) -> _WindowOverviewTimestamps:
+    latest_command_at = await session.scalar(
+        select(Event.created_at)
+        .where(
+            Event.client_id == client_id,
+            Event.virtual_window_id == window_id,
+            Event.kind == "terminal_input_command",
+        )
+        .order_by(desc(Event.created_at), desc(Event.id))
+        .limit(1)
+    )
+    latest_agent_event_at = await session.scalar(
+        select(Event.created_at)
+        .where(
+            Event.client_id == client_id,
+            Event.virtual_window_id == window_id,
+            Event.source_type.in_(agent_activity_source_types()),
+        )
+        .order_by(desc(Event.created_at), desc(Event.id))
+        .limit(1)
+    )
+    latest_recent_usage_at = await session.scalar(
+        select(TerminalRecentUsage.last_used_at)
+        .where(
+            TerminalRecentUsage.client_id == client_id,
+            TerminalRecentUsage.window_id == window_id,
+        )
+        .order_by(desc(TerminalRecentUsage.last_used_at), desc(TerminalRecentUsage.id))
+        .limit(1)
+    )
+    latest_agent_presence_at = await session.scalar(
+        select(Event.created_at)
+        .where(
+            Event.client_id == client_id,
+            Event.virtual_window_id == window_id,
+            Event.kind == AGENT_WORK_PRESENCE_KIND,
+        )
+        .order_by(desc(Event.created_at), desc(Event.id))
+        .limit(1)
+    )
+    return _WindowOverviewTimestamps(
+        last_terminal_command_at=latest_command_at,
+        last_agent_event_at=latest_agent_event_at,
+        last_recent_usage_at=latest_recent_usage_at,
+        last_agent_presence_at=latest_agent_presence_at,
     )
 
 
@@ -385,6 +511,112 @@ async def runtime_tags_for_window_out(session: AsyncSession, window: VirtualWind
     )
 
 
+async def _agent_provider_for_window(session: AsyncSession, window: VirtualWindow) -> str | None:
+    latest_ai_session = await session.scalar(
+        select(AiSession)
+        .where(
+            AiSession.client_id == window.client_id,
+            AiSession.virtual_window_id == window.id,
+        )
+        .order_by(desc(AiSession.updated_at), desc(AiSession.created_at), desc(AiSession.id))
+        .limit(1)
+    )
+    if latest_ai_session is not None and latest_ai_session.provider:
+        return _canonical_provider(latest_ai_session.provider)
+
+    latest_command = await session.scalar(
+        select(Event.payload_json)
+        .where(
+            Event.client_id == window.client_id,
+            Event.virtual_window_id == window.id,
+            Event.kind == "terminal_input_command",
+        )
+        .order_by(desc(Event.created_at), desc(Event.id))
+        .limit(1)
+    )
+    terminal_agent = agent_from_command(latest_command.get("command") if latest_command else None)
+    if terminal_agent is not None:
+        return _canonical_provider(terminal_agent)
+    return _canonical_provider(agent_from_command(window.shell_command)) if window.shell_command else None
+
+
+def _require_supported_agent(provider: str | None) -> str:
+    if provider in {"codex", "claude_code", "cursor_cli"}:
+        return provider
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="agent config unavailable for this terminal",
+    )
+
+
+def _agent_config_out(payload: object) -> AgentConfigOut:
+    if isinstance(payload, agent_config_service.AgentConfig):
+        payload = {
+            "agent": payload.agent,
+            "sections": [
+                {
+                    "id": section.id,
+                    "name": section.name,
+                    "items": [
+                        {
+                            "id": item.id,
+                            "name": item.name,
+                            "enabled": item.enabled,
+                            "path": item.path,
+                        }
+                        for item in section.items
+                    ],
+                }
+                for section in payload.sections
+            ],
+        }
+    return AgentConfigOut.model_validate(payload)
+
+
+def _agent_selection_from_schema(
+    selection: AgentConfigSelectionIn,
+) -> agent_config_service.AgentConfigSelection:
+    return agent_config_service.AgentConfigSelection(
+        agent=selection.agent,
+        sections=[
+            agent_config_service.AgentConfigSectionSelection(
+                id=section.id,
+                items=[
+                    agent_config_service.AgentConfigItemSelection(id=item.id, enabled=item.enabled)
+                    for item in section.items
+                ],
+            )
+            for section in selection.sections
+        ],
+    )
+
+
+def _agent_command_for_launch(payload: WindowCreateIn) -> str | None:
+    launch = payload.agent_launch
+    if launch is None:
+        return payload.shell_command
+    return launch.command or launch.agent
+
+
+def _agent_for_launch(payload: WindowCreateIn) -> str | None:
+    launch = payload.agent_launch
+    if launch is None:
+        return None
+    return _AGENT_PROVIDER_BY_KIND[launch.agent]
+
+
+def _agent_config_for_launch(payload: WindowCreateIn) -> AgentConfigSelectionIn | None:
+    launch = payload.agent_launch
+    if launch is None or launch.config is None:
+        return None
+    if launch.config.agent != launch.agent:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="agent launch config agent must match launch agent",
+        )
+    return launch.config
+
+
 async def _assign_window_folder_path(
     session: AsyncSession,
     client_id: UUID,
@@ -418,18 +650,21 @@ async def _create_remote_virtual_window_for_client(
     registry: ClientConnectionRegistry,
 ) -> WindowOut:
     client_id = client.id
+    effective_shell = _agent_command_for_launch(payload)
+    agent_config_selection = _agent_config_for_launch(payload)
     try:
         window = await create_window(
             session,
             client_id,
             cwd=payload.cwd,
-            shell_command=payload.shell_command,
+            shell_command=effective_shell,
         )
         remote_runtime = RemoteRuntime(client_id=client_id, registry=registry)
         runtime_window = await remote_runtime.create_window(
             cwd=payload.cwd,
-            shell_command=payload.shell_command,
+            shell_command=effective_shell,
             window_id=window.id,
+            agent_config_selection=agent_config_selection.model_dump(mode="json") if agent_config_selection else None,
         )
         window.remote_session_id = runtime_window.session_id
         window.remote_window_id = runtime_window.window_id
@@ -452,6 +687,20 @@ async def _create_remote_virtual_window_for_client(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="remote runtime unavailable",
         ) from exc
+    except RemoteTerminalError as exc:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        logger.warning(
+            "remote runtime failed during window create",
+            extra={
+                "client_id": str(client_id),
+                "error": str(exc),
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
     except asyncio.CancelledError:
         with contextlib.suppress(Exception):
             await session.rollback()
@@ -460,7 +709,13 @@ async def _create_remote_virtual_window_for_client(
         with contextlib.suppress(Exception):
             await session.rollback()
         raise
-    return to_window_out(window)
+    return to_window_out(
+        window,
+        runtime_tags=runtime_tags_for_window(
+            window,
+            terminal_agent=_agent_for_launch(payload) or agent_from_command(window.shell_command),
+        ),
+    )
 
 
 async def _create_virtual_window_for_client(
@@ -481,8 +736,14 @@ async def _create_virtual_window_for_client(
     tmux_target = None
     window_id = uuid4()
     effective_cwd = payload.cwd
-    effective_shell = payload.shell_command or get_settings().default_shell
+    effective_shell = _agent_command_for_launch(payload) or get_settings().default_shell
     try:
+        agent_config_selection = _agent_config_for_launch(payload)
+        if agent_config_selection is not None:
+            agent_config_service.apply_agent_config_selection(
+                _agent_selection_from_schema(agent_config_selection),
+                window_id=str(window_id),
+            )
         tmux_target = await tmux_manager.create_window(
             effective_cwd,
             effective_shell,
@@ -526,7 +787,13 @@ async def _create_virtual_window_for_client(
             except Exception as cleanup_exc:
                 exc.add_note(f"tmux cleanup failed: {cleanup_exc}")
         raise
-    return to_window_out(window)
+    return to_window_out(
+        window,
+        runtime_tags=runtime_tags_for_window(
+            window,
+            terminal_agent=_agent_for_launch(payload) or agent_from_command(window.shell_command),
+        ),
+    )
 
 
 async def _kill_runtime_window(
@@ -649,7 +916,8 @@ async def _build_window_response(
     summary_job = await get_latest_summary_job(session, window.id)
     runtime_tags = await runtime_tags_for_window_out(session, window)
     work_status = await load_work_status(session, client_id, window.id)
-    payload = to_window_out(window, summary_job, runtime_tags, work_status)
+    timestamps = await _load_window_overview_timestamps(session, client_id, window.id)
+    payload = to_window_out(window, summary_job, runtime_tags, work_status, timestamps)
     return store_json_response(
         cache_key or ("window", response_cache_scope(session), client_id, window_id),
         payload,
@@ -799,6 +1067,41 @@ async def read_window_command_history(
     )
 
 
+@router.get("/clients/{client_id}/windows/{window_id}/title-history", response_model=WindowTitleHistoryOut)
+async def read_window_title_history(
+    client_id: UUID,
+    window_id: UUID,
+    limit: TitleHistoryLimit = 100,
+    offset: TitleHistoryOffset = 0,
+    session: AsyncSession = Depends(get_session),
+) -> WindowTitleHistoryOut:
+    await _require_window_for_agent_record(session, client_id, window_id)
+    items, total = await list_window_title_history(
+        session,
+        client_id,
+        window_id,
+        limit=limit,
+        offset=offset,
+    )
+    return WindowTitleHistoryOut(
+        window_id=window_id,
+        items=[
+            WindowTitleHistoryItemOut(
+                id=item.id,
+                title=item.title,
+                summary=item.summary,
+                source=item.source,
+                created_at=item.created_at,
+            )
+            for item in items
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+        has_more=offset + limit < total,
+    )
+
+
 @router.get("/clients/{client_id}/windows/{window_id}/agent-record/detail", response_model=AgentRecordOut)
 async def read_window_agent_record_detail(
     client_id: UUID,
@@ -858,6 +1161,109 @@ async def read_window_agent_record(
     session: AsyncSession = Depends(get_session),
 ) -> AgentRecordOut:
     return await read_window_agent_record_detail(client_id, window_id, events_limit, events_offset, session)
+
+
+@router.get("/clients/{client_id}/windows/{window_id}/agent-config", response_model=AgentConfigOut)
+async def read_window_agent_config(
+    request: Request,
+    client_id: UUID,
+    window_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> AgentConfigOut:
+    client = await _require_client(session, client_id)
+    window = await get_window_for_client(session, client_id, window_id)
+    if window is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="window not found")
+    agent = _require_supported_agent(await _agent_provider_for_window(session, window))
+    if client.runtime is ClientRuntime.local:
+        return _agent_config_out(agent_config_service.list_agent_config(agent))
+
+    remote_runtime = RemoteRuntime(client_id=client_id, registry=_client_connection_registry(request))
+    try:
+        payload = await remote_runtime.get_agent_config(window_id=window_id, agent=agent)
+    except RemoteClientUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="remote runtime unavailable",
+        ) from exc
+    except RemoteTerminalError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    return _agent_config_out(payload)
+
+
+@router.get("/clients/{client_id}/agent-config/{agent}", response_model=AgentConfigOut)
+async def read_client_agent_config(
+    request: Request,
+    client_id: UUID,
+    agent: str,
+    session: AsyncSession = Depends(get_session),
+) -> AgentConfigOut:
+    client = await _require_client(session, client_id)
+    supported_agent = _require_supported_agent(_canonical_provider(agent))
+    if client.runtime is ClientRuntime.local:
+        return _agent_config_out(agent_config_service.list_agent_config(supported_agent))
+
+    remote_runtime = RemoteRuntime(client_id=client_id, registry=_client_connection_registry(request))
+    try:
+        payload = await remote_runtime.get_agent_config(agent=supported_agent)
+    except RemoteClientUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="remote runtime unavailable",
+        ) from exc
+    except RemoteTerminalError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    return _agent_config_out(payload)
+
+
+@router.patch(
+    "/clients/{client_id}/windows/{window_id}/agent-config/{section_id}/{item_id:path}",
+    response_model=AgentConfigOut,
+)
+async def update_window_agent_config_item(
+    request: Request,
+    client_id: UUID,
+    window_id: UUID,
+    section_id: str,
+    item_id: str,
+    payload: AgentConfigToggleIn,
+    session: AsyncSession = Depends(get_session),
+) -> AgentConfigOut:
+    client = await _require_client(session, client_id)
+    window = await get_window_for_client(session, client_id, window_id)
+    if window is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="window not found")
+    agent = _require_supported_agent(await _agent_provider_for_window(session, window))
+    if client.runtime is ClientRuntime.local:
+        try:
+            return _agent_config_out(
+                agent_config_service.set_agent_config_item_enabled(
+                    agent,
+                    section_id,
+                    item_id,
+                    payload.enabled,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    remote_runtime = RemoteRuntime(client_id=client_id, registry=_client_connection_registry(request))
+    try:
+        response_payload = await remote_runtime.set_agent_config_enabled(
+            window_id=window_id,
+            agent=agent,
+            section_id=section_id,
+            item_id=item_id,
+            enabled=payload.enabled,
+        )
+    except RemoteClientUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="remote runtime unavailable",
+        ) from exc
+    except RemoteTerminalError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    return _agent_config_out(response_payload)
 
 
 def _to_git_worktree_run_out(run) -> GitWorktreeRunOut:
@@ -972,9 +1378,10 @@ async def update_virtual_window(
     summary_job = await get_latest_summary_job(session, window.id)
     runtime_tags = await runtime_tags_for_window_out(session, window)
     work_status = await load_work_status(session, client_id, window.id)
-    updated = to_window_out(window, summary_job, runtime_tags, work_status)
+    timestamps = await _load_window_overview_timestamps(session, client_id, window.id)
+    updated = to_window_out(window, summary_job, runtime_tags, work_status, timestamps)
     await ui_event_hub_from_state(request.app.state).publish_invalidation(
-        ["tree", "window", "search"],
+        ["tree", "window", "search", "title_history"],
         client_id=client_id,
         window_id=window_id,
         reason="window_updated",
@@ -1052,7 +1459,8 @@ async def retry_summary_job(
     await session.refresh(summary_job)
     runtime_tags = await runtime_tags_for_window_out(session, window)
     work_status = await load_work_status(session, client_id, window.id)
-    updated = to_window_out(window, summary_job, runtime_tags, work_status)
+    timestamps = await _load_window_overview_timestamps(session, client_id, window.id)
+    updated = to_window_out(window, summary_job, runtime_tags, work_status, timestamps)
     await ui_event_hub_from_state(request.app.state).publish_invalidation(
         ["window"],
         client_id=client_id,

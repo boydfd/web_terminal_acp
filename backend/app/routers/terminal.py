@@ -11,6 +11,7 @@ from uuid import UUID
 from elasticsearch import AsyncElasticsearch
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, status
 
+from app.auth import require_websocket_auth
 from app.db import SessionLocal
 from app.models import LOCAL_CLIENT_ID, VirtualWindow, WindowStatus
 from app.repositories.clients import get_client
@@ -209,6 +210,9 @@ async def terminal_websocket(
     window_id: UUID,
     tmux_manager: TmuxManager = Depends(get_tmux_manager),
 ) -> None:
+    if not await require_websocket_auth(websocket):
+        return
+
     query_params = getattr(websocket, "query_params", {})
     view_id_text = query_params.get("view_id")
     try:
@@ -744,6 +748,9 @@ async def local_terminal_websocket(
 
 @router.websocket("/api/clients/{client_id}/terminal-selection")
 async def terminal_selection_websocket(websocket: WebSocket, client_id: UUID) -> None:
+    if not await require_websocket_auth(websocket):
+        return
+
     async with SessionLocal() as session:
         client = await get_client(session, client_id)
         if client is None:

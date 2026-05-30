@@ -90,7 +90,9 @@ export function NotificationCenter({
                   onClick={() => onSelectNotification(notification)}
                 >
                   <span className="notification-item-title">{notification.windowTitle}</span>
-                  <span className="notification-item-body">Agent 任务已完成</span>
+                  <span className="notification-item-body">
+                    {notification.status === "ABORTED" ? "Agent 可能已中断" : "Agent 任务已完成"}
+                  </span>
                   <span className="notification-item-time">
                     {new Date(notification.completedAt).toLocaleString()}
                   </span>
@@ -126,6 +128,7 @@ export function NotificationBellButton({
     <button
       type="button"
       className={isOpen ? "notification-bell active" : "notification-bell"}
+      data-onboarding-id="notification-bell"
       aria-expanded={isOpen}
       aria-label={unreadCount > 0 ? `通知中心，${unreadCount} 条未读` : "通知中心"}
       onClick={onClick}

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from uuid import UUID
 
-from app.client_agent.shell_hook import build_managed_shell_command
+from app.client_agent.shell_hook import _agent_environment_script, build_managed_shell_command
 
 CLIENT_ID = UUID("12345678-1234-5678-1234-567812345678")
 WINDOW_ID = UUID("87654321-4321-8765-4321-876543218765")
@@ -34,17 +36,23 @@ def test_bash_managed_shell_command_contains_command_capture_hook() -> None:
     assert "CURSOR_AGENT_HOME='~/.web-terminal-acp/cursor-homes/87654321-4321-8765-4321-876543218765'" in managed.command
     assert '__web_terminal_source_codex_home="${WEB_TERMINAL_ORIGINAL_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}"' in managed.command
     assert "export CODEX_HOME=\"$WEB_TERMINAL_CODEX_HOME\"" in managed.command
+    assert "for __web_terminal_codex_item in auth.json config.toml hooks hooks.json hooks.disabled.json AGENTS.md skills skills.disabled plugins plugins.disabled plugin_marketplaces.json" in managed.command
     assert "export CLAUDE_CONFIG_DIR=\"$WEB_TERMINAL_CLAUDE_CODE_HOME\"" in managed.command
     assert '__web_terminal_source_claude_home="${WEB_TERMINAL_ORIGINAL_CLAUDE_CODE_HOME:-$HOME/.claude}"' in managed.command
     assert "__web_terminal_source_claude_json=\"${WEB_TERMINAL_ORIGINAL_CLAUDE_JSON:-$HOME/.claude.json}\"" in managed.command
     assert "ln -s \"$__web_terminal_source_claude_json\" \"$WEB_TERMINAL_CLAUDE_CODE_HOME/.claude.json\"" in managed.command
-    assert "for __web_terminal_claude_item in settings.json commands hooks plugins api-key-helper.sh" in managed.command
+    assert "for __web_terminal_claude_item in settings.json settings.local.json commands hooks hooks.disabled.json plugins plugins.disabled skills skills.disabled api-key-helper.sh" in managed.command
     assert "__web_terminal_load_claude_settings_env \"$__web_terminal_source_claude_home/settings.json\"" in managed.command
     assert "json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"env\", {})" in managed.command
     assert "__web_terminal_prepare_claude_code_home" in managed.command
     assert "export CURSOR_AGENT_HOME=\"$WEB_TERMINAL_CURSOR_HOME\"" in managed.command
     assert "__web_terminal_prepare_agent_homes" in managed.command
+    assert "__web_terminal_prepare_agent_command_path" in managed.command
+    assert "__web_terminal_prepend_path_once \"~/.local/bin\"" in managed.command
+    assert "__web_terminal_prepend_path_once \"~/.npm-global/bin\"" in managed.command
+    assert "__web_terminal_prepend_path_once \"~/.bun/bin\"" in managed.command
     assert '__web_terminal_prepend_path_once "~/.web-terminal-acp/npm-global/bin"' in managed.command
+    assert "__web_terminal_load_user_shell_env" in managed.command
     assert "__web_terminal_load_zshrc_env" in managed.command
     assert "__web_terminal_missing_claude_env" in managed.command
     assert '[ -n "${ANTHROPIC_BASE_URL:-}" ] || [ -n "${CLAUDE_CODE_API_BASE_URL:-}" ] || return 0' in managed.command
@@ -56,6 +64,8 @@ def test_bash_managed_shell_command_contains_command_capture_hook() -> None:
     assert "__web_terminal_install_agent_permission_wrappers" in managed.command
     assert "command codex --dangerously-bypass-approvals-and-sandbox" in managed.command
     assert "command claude --dangerously-skip-permissions" in managed.command
+    assert "command agent" in managed.command
+    assert "command cursor" in managed.command
     assert "CURSOR_CONFIG_DIR=" in managed.command
     assert "CURSOR_DATA_DIR=" in managed.command
     assert "PROMPT_COMMAND" in managed.command
@@ -97,6 +107,7 @@ def test_zsh_managed_shell_command_contains_preexec_command_capture_hook() -> No
     assert "export CODEX_HOME=\"$WEB_TERMINAL_CODEX_HOME\"" in managed.command
     assert "__web_terminal_prepare_claude_code_home" in managed.command
     assert "__web_terminal_prepare_agent_homes" in managed.command
+    assert "__web_terminal_prepare_agent_command_path" in managed.command
     assert "__web_terminal_prepare_cursor_home" in managed.command
     assert "__web_terminal_install_agent_permission_wrappers" in managed.command
     assert "command codex --dangerously-bypass-approvals-and-sandbox" in managed.command
@@ -159,7 +170,10 @@ def test_direct_codex_shell_command_adds_permission_flag() -> None:
     )
 
     assert managed.command_capture_supported is False
-    assert "exec codex --dangerously-bypass-approvals-and-sandbox resume codex-session" in managed.command
+    assert "codex --dangerously-bypass-approvals-and-sandbox resume codex-session || __web_terminal_agent_exit=$?" in managed.command
+    assert "agent command exited with status" in managed.command
+    assert "__web_terminal_prepare_direct_agent_launch codex" in managed.command
+    assert "__web_terminal_load_user_shell_env" in managed.command
     assert "__web_terminal_load_zshrc_env" in managed.command
 
 
@@ -173,5 +187,165 @@ def test_direct_claude_shell_command_adds_permission_flag() -> None:
     )
 
     assert managed.command_capture_supported is False
-    assert "exec claude --dangerously-skip-permissions --resume claude-session" in managed.command
+    assert "claude --dangerously-skip-permissions --resume claude-session || __web_terminal_agent_exit=$?" in managed.command
+    assert "agent command exited with status" in managed.command
+    assert "__web_terminal_prepare_direct_agent_launch claude" in managed.command
     assert "__web_terminal_load_zshrc_env" in managed.command
+
+
+def test_direct_cursor_agent_shell_command_preserves_arguments() -> None:
+    managed = build_managed_shell_command(
+        shell="agent --resume cursor-session",
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        server_url=SERVER_URL,
+        project_path="/workspace/project",
+    )
+
+    assert managed.command_capture_supported is False
+    assert "agent --resume cursor-session || __web_terminal_agent_exit=$?" in managed.command
+    assert "agent command exited with status" in managed.command
+    assert "__web_terminal_prepare_direct_agent_launch agent" in managed.command
+
+
+def test_direct_agent_commands_find_user_local_executables(tmp_path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    for command_name in ("codex", "claude", "agent"):
+        executable = bin_dir / command_name
+        executable.write_text(
+            "#!/bin/sh\n"
+            f"printf '{command_name}:%s:%s\\n' \"$1\" \"$OPENAI_API_KEY\"\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+
+    env = {
+        "HOME": str(home),
+        "PATH": "/usr/bin:/bin",
+        "OPENAI_API_KEY": "codex-key",
+    }
+    command_cases = [
+        (
+            "codex --version",
+            "codex:--dangerously-bypass-approvals-and-sandbox:codex-key",
+        ),
+        ("claude --version", "claude:--dangerously-skip-permissions:codex-key"),
+        ("agent --version", "agent:--version:codex-key"),
+    ]
+
+    for shell, expected in command_cases:
+        managed = build_managed_shell_command(
+            shell=shell,
+            client_id=CLIENT_ID,
+            window_id=WINDOW_ID,
+            server_url=SERVER_URL,
+        )
+        result = subprocess.run(
+            ["/bin/sh", "-c", managed.command],
+            check=False,
+            env=env,
+            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert expected in result.stdout
+        assert "agent command exited with status 0" in result.stdout
+
+
+def test_agent_environment_prepares_per_window_agent_config_links(tmp_path) -> None:
+    home = tmp_path
+    source_items = {
+        ".codex": [
+            "auth.json",
+            "config.toml",
+            "hooks",
+            "hooks.json",
+            "hooks.disabled.json",
+            "AGENTS.md",
+            "skills",
+            "skills.disabled",
+            "plugins",
+            "plugins.disabled",
+            "plugin_marketplaces.json",
+        ],
+        ".claude": [
+            "settings.json",
+            "settings.local.json",
+            "commands",
+            "hooks",
+            "hooks.disabled.json",
+            "plugins",
+            "plugins.disabled",
+            "skills",
+            "skills.disabled",
+            "api-key-helper.sh",
+        ],
+        ".cursor": [
+            "agent-cli-state.json",
+            "cli-config.json",
+            "hooks",
+            "hooks.json",
+            "hooks.disabled.json",
+            "plugins",
+            "plugins.disabled",
+            "skills-cursor",
+            "skills-cursor.disabled",
+        ],
+    }
+    directory_names = {
+        ".codex": {"hooks", "skills", "skills.disabled", "plugins", "plugins.disabled"},
+        ".claude": {"commands", "hooks", "plugins", "plugins.disabled", "skills", "skills.disabled"},
+        ".cursor": {"hooks", "plugins", "plugins.disabled", "skills-cursor", "skills-cursor.disabled"},
+    }
+    for root_name, item_names in source_items.items():
+        root = home / root_name
+        root.mkdir()
+        for item_name in item_names:
+            path = root / item_name
+            if item_name in directory_names[root_name]:
+                path.mkdir()
+                (path / "marker").write_text(item_name, encoding="utf-8")
+            else:
+                path.write_text("{}", encoding="utf-8")
+    (home / ".cursor" / "chats").mkdir()
+
+    env = {
+        "HOME": str(home),
+        "PATH": os.environ["PATH"],
+        "WEB_TERMINAL_CODEX_HOME": "~/.web-terminal-acp/codex-homes/window-1",
+        "WEB_TERMINAL_CLAUDE_CODE_HOME": "~/.web-terminal-acp/claude-code-homes/window-1",
+        "WEB_TERMINAL_CURSOR_HOME": "~/.web-terminal-acp/cursor-homes/window-1",
+        "CODEX_HOME": "",
+    }
+    result = subprocess.run(
+        ["bash", "-c", _agent_environment_script()],
+        check=False,
+        env=env,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    codex_home = home / ".web-terminal-acp" / "codex-homes" / "window-1"
+    claude_home = home / ".web-terminal-acp" / "claude-code-homes" / "window-1"
+    cursor_home = home / ".web-terminal-acp" / "cursor-homes" / "window-1"
+
+    assert (codex_home / "sessions").is_dir()
+    assert (codex_home / "log").is_dir()
+    assert (codex_home / "shell_snapshots").is_dir()
+    assert (claude_home / "projects").is_dir()
+    assert (cursor_home / "chats").is_dir()
+    assert not (cursor_home / "chats").is_symlink()
+
+    for item_name in source_items[".codex"]:
+        assert (codex_home / item_name).resolve() == home / ".codex" / item_name
+    for item_name in source_items[".claude"]:
+        assert (claude_home / item_name).resolve() == home / ".claude" / item_name
+    for item_name in source_items[".cursor"]:
+        assert (cursor_home / item_name).resolve() == home / ".cursor" / item_name

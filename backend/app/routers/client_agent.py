@@ -313,6 +313,51 @@ async def _mark_client_disconnected_by_id(client_id: UUID) -> bool:
         return changed
 
 
+async def _best_effort_mark_client_seen_with_metadata(
+    client_id: UUID,
+    payload: dict[str, Any],
+    *,
+    message_type: str,
+) -> bool | None:
+    try:
+        return await _mark_client_seen_with_metadata(client_id, payload)
+    except Exception:
+        logger.warning(
+            "client-agent seen update failed; keeping control websocket open",
+            extra={"client_id": str(client_id), "message_type": message_type},
+            exc_info=True,
+        )
+        return None
+
+
+async def _best_effort_handle_inventory_message(
+    websocket: WebSocket,
+    client_id: UUID,
+    message: AgentMessage,
+) -> bool | None:
+    try:
+        return await _handle_inventory_message(websocket, client_id, message)
+    except Exception:
+        logger.warning(
+            "client-agent inventory update failed; keeping control websocket open",
+            extra={"client_id": str(client_id)},
+            exc_info=True,
+        )
+        return None
+
+
+async def _best_effort_mark_client_disconnected_by_id(client_id: UUID) -> bool:
+    try:
+        return await _mark_client_disconnected_by_id(client_id)
+    except Exception:
+        logger.warning(
+            "client-agent offline update failed during websocket cleanup",
+            extra={"client_id": str(client_id)},
+            exc_info=True,
+        )
+        return False
+
+
 async def _handle_inventory_message(websocket: WebSocket, client_id: UUID, message: AgentMessage) -> bool:
     inventory = message.payload.get("tmux_windows", message.payload.get("windows", []))
     if not isinstance(inventory, list):
@@ -1345,37 +1390,54 @@ async def client_agent_websocket(websocket: WebSocket) -> None:
                 continue
 
             if message.type == "hello":
-                if not await _mark_client_seen_with_metadata(client_id, message.payload):
+                marked_seen = await _best_effort_mark_client_seen_with_metadata(
+                    client_id,
+                    message.payload,
+                    message_type=message.type,
+                )
+                if marked_seen is False:
                     await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                     return
-                await _ui_event_hub(websocket).publish_debounced_invalidation(
-                    ("clients", client_id),
-                    ["clients"],
-                    client_id=client_id,
-                    reason="client_hello",
-                    delay_seconds=1.0,
-                )
+                if marked_seen is True:
+                    await _ui_event_hub(websocket).publish_debounced_invalidation(
+                        ("clients", client_id),
+                        ["clients"],
+                        client_id=client_id,
+                        reason="client_hello",
+                        delay_seconds=1.0,
+                    )
                 connection.mark_seen()
                 await connection.send(AgentMessage(type="hello_ack", client_id=client_id))
                 continue
 
             if message.type == "heartbeat":
-                if not await _mark_client_seen_with_metadata(client_id, message.payload):
+                marked_seen = await _best_effort_mark_client_seen_with_metadata(
+                    client_id,
+                    message.payload,
+                    message_type=message.type,
+                )
+                if marked_seen is False:
                     await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                     return
-                await _ui_event_hub(websocket).publish_debounced_invalidation(
-                    ("clients", client_id),
-                    ["clients"],
-                    client_id=client_id,
-                    reason="client_heartbeat",
-                    delay_seconds=1.0,
-                )
+                if marked_seen is True:
+                    await _ui_event_hub(websocket).publish_debounced_invalidation(
+                        ("clients", client_id),
+                        ["clients"],
+                        client_id=client_id,
+                        reason="client_heartbeat",
+                        delay_seconds=1.0,
+                    )
                 connection.mark_seen()
                 await connection.send(AgentMessage(type="heartbeat_ack", client_id=client_id))
                 continue
 
             if message.type == "inventory":
-                if not await _handle_inventory_message(websocket, client_id, message):
+                inventory_handled = await _best_effort_handle_inventory_message(
+                    websocket,
+                    client_id,
+                    message,
+                )
+                if inventory_handled is False:
                     await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                     return
                 connection.mark_seen()
@@ -1444,7 +1506,7 @@ async def client_agent_websocket(websocket: WebSocket) -> None:
         await registry.unregister(connection)
         connection.abort()
         if registry.get(client_id) is None:
-            changed = await _mark_client_disconnected_by_id(client_id)
+            changed = await _best_effort_mark_client_disconnected_by_id(client_id)
             if changed:
                 await _ui_event_hub(websocket).publish_invalidation(
                     ["clients", "tree", "window"],

@@ -24,6 +24,7 @@ type GitDiffBrowserModalProps = {
   clientId: string;
   windowId: string;
   isMobileLayout: boolean;
+  shortcutLabel?: string;
   onClose: () => void;
 };
 
@@ -175,6 +176,7 @@ export function GitDiffBrowserModal({
   clientId,
   windowId,
   isMobileLayout,
+  shortcutLabel = "Git diff",
   onClose
 }: GitDiffBrowserModalProps) {
   const [selectedCommitId, setSelectedCommitId] = useState<string | null>(null);
@@ -275,7 +277,7 @@ export function GitDiffBrowserModal({
       : "Git diff";
   const subtitle = selectedCommit
     ? `${commitLabel(selectedCommit.commit)} | ${selectedCommit.runTitle}`
-    : "Alt+G";
+    : shortcutLabel;
 
   return (
     <div className="git-diff-browser-modal" role="dialog" aria-modal="true" aria-label="Git diff browser">

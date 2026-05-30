@@ -1,4 +1,5 @@
 import traceback
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -8,7 +9,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import Base, get_session
 from app.main import app
-from app.models import ClientRuntime
+from app.models import ClientRegistrationKey, ClientRegistrationKeyStatus, ClientRuntime
+from app.repositories.client_registration_keys import create_registration_key
 from app.routers import clients as clients_router
 from app.repositories.clients import create_client, ensure_local_client
 from app.schemas import BootstrapClientIn
@@ -73,6 +75,7 @@ BOOTSTRAP_PAYLOAD = {
     "passphrase": "ssh-passphrase",
     "server_url": "https://control.example.com",
 }
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _formatted_exception(exc: BaseException) -> str:
@@ -388,3 +391,59 @@ async def test_bootstrap_client_route_rejects_invalid_port(db_client):
     )
 
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_registration_key_is_single_use_for_direct_client_registration(db_client):
+    async with db_client.session_factory() as session:
+        registration_key, key = await create_registration_key(session, label="dev box")
+        key_id = registration_key.id
+        await session.commit()
+
+    payload = {
+        "registration_key": key,
+        "name": "Direct Dev",
+        "hostname": "direct-host",
+        "install_path": "/home/alice/.web-terminal-acp",
+        "server_url": "https://control.example.com",
+    }
+    first = await db_client.post("/api/clients/register", json=payload)
+    second = await db_client.post("/api/clients/register", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 401
+    body = first.json()
+    assert body["name"] == "Direct Dev"
+    assert body["token"]
+    assert body["config"]["client_id"] == body["client_id"]
+    assert body["config"]["token"] == body["token"]
+    assert "client_agent/runner.py" in body["package"]["files"]
+
+    async with db_client.session_factory() as session:
+        used_key = await session.get(ClientRegistrationKey, key_id)
+        assert used_key is not None
+        assert used_key.status is ClientRegistrationKeyStatus.used
+        assert str(used_key.used_client_id) == body["client_id"]
+
+
+@pytest.mark.asyncio
+async def test_create_registration_key_returns_plain_key_once(db_client):
+    response = await db_client.post("/api/clients/registration-keys", json={"label": "desk"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["key"].startswith("wtr_")
+    assert body["label"] == "desk"
+    assert body["created_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_read_registration_script_returns_direct_client_installer(db_client):
+    response = await db_client.get("/api/clients/register-script")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/x-shellscript")
+    assert "WEB_TERMINAL_REGISTRATION_KEY" in response.text
+    assert "/api/clients/register" in response.text
+    assert "raw.githubusercontent.com" not in response.text
+    assert response.text == (REPO_ROOT / "scripts/register-client-direct.sh").read_text(encoding="utf-8")

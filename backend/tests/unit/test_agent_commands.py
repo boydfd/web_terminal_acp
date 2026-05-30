@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.client_agent.agent_commands import (
+    agent_command_for_interactive_shell,
     agent_command_with_permission_flag,
     format_agent_command,
 )
@@ -58,3 +59,26 @@ def test_agent_command_with_permission_flag_does_not_duplicate_existing_flags() 
 def test_agent_command_with_permission_flag_ignores_non_agent_commands() -> None:
     assert agent_command_with_permission_flag("/bin/bash") is None
     assert agent_command_with_permission_flag("echo codex") is None
+
+
+def test_agent_command_with_permission_flag_preserves_cursor_agent_arguments() -> None:
+    assert agent_command_with_permission_flag("agent") is None
+    assert agent_command_with_permission_flag("cursor") is None
+    assert (
+        agent_command_with_permission_flag("agent --resume cursor-session")
+        == "agent --resume cursor-session"
+    )
+    assert agent_command_with_permission_flag("cursor --reuse-window") == "cursor --reuse-window"
+
+
+def test_agent_command_for_interactive_shell_detects_direct_agent_commands() -> None:
+    assert (
+        agent_command_for_interactive_shell("codex")
+        == "codex --dangerously-bypass-approvals-and-sandbox"
+    )
+    assert (
+        agent_command_for_interactive_shell("claude --resume claude-session")
+        == "claude --dangerously-skip-permissions --resume claude-session"
+    )
+    assert agent_command_for_interactive_shell("agent") == "agent"
+    assert agent_command_for_interactive_shell("/bin/bash") is None

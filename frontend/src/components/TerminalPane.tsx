@@ -1,8 +1,24 @@
-import { Terminal } from "@xterm/xterm";
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
+import { Terminal, type ITheme } from "@xterm/xterm";
+import {
+  forwardRef,
+  type PointerEvent as ReactPointerEvent,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 import { terminalWebSocketUrl } from "../api";
 import { createTerminalOutputBuffer } from "../terminalOutputBuffer";
+import {
+  copyTerminalSelection,
+  pasteClipboardEventToTerminal,
+  pasteClipboardToTerminal,
+  terminalClipboardShortcutAction,
+  writeClipboardText
+} from "../terminalClipboard";
 import { parseTerminalSocketControlMessage } from "../terminalSocketProtocol";
 import {
   fitTerminalToContainer,
@@ -15,6 +31,7 @@ import {
   isTerminalViewLowPriority,
   TERMINAL_VIEW_PRIORITY_CHANGED_EVENT,
 } from "../terminalViewPriority";
+import { terminalTouchScrollSequence } from "../terminalTouchScroll";
 import { createBrowserUuid } from "../uuid";
 import {
   clearQuickInputDraft,
@@ -40,6 +57,7 @@ type TerminalPaneProps = {
   customQuickKeys?: CustomQuickKey[];
   onCustomQuickKeySubmit?: (quickKey: CustomQuickKey) => boolean;
   onTerminalConnectionStatusChange?: (status: TerminalConnectionStatus) => void;
+  theme?: ITheme;
 };
 
 type TerminalWriteTestHook = (data: string | Uint8Array, parsedAt: number) => void;
@@ -66,6 +84,15 @@ export type TerminalPaneHandle = {
 type VirtualKey = {
   label: string;
   value: string;
+};
+
+type TouchScrollGesture = {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  lastY: number;
+  accumulatedY: number;
+  scrolling: boolean;
 };
 
 const VIRTUAL_KEYS: VirtualKey[] = [
@@ -102,6 +129,9 @@ const LOW_PRIORITY_SOCKET_CLOSE_DELAY_MS = 1500;
 const VIEW_PRIORITY_RECONCILE_INTERVAL_MS = 750;
 const INPUT_VIEW_PRIORITY_CLAIM_INTERVAL_MS = 250;
 const PENDING_INPUT_QUEUE_MAX_SIZE = 64;
+const TOUCH_SCROLL_START_THRESHOLD_PX = 12;
+const TOUCH_SCROLL_FALLBACK_STEP_PX = 18;
+const TOUCH_SCROLL_MAX_WHEEL_EVENTS_PER_MOVE = 12;
 
 function terminalStatusLabel(status: TerminalConnectionStatus): string {
   switch (status) {
@@ -122,27 +152,27 @@ function terminalOutputByteLength(data: string | Uint8Array): number {
   return typeof data === "string" ? new TextEncoder().encode(data).byteLength : data.byteLength;
 }
 
-function isQuickInputShortcut(event: KeyboardEvent): boolean {
-  const key = event.key.toLocaleLowerCase();
-  return event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey
-    && (event.code === "KeyI" || key === "i" || event.keyCode === 73);
-}
-
-function isEditableShortcutTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) {
-    return false;
+function readTerminalCellHeight(terminal: Terminal, host: HTMLElement): number {
+  const core = (terminal as unknown as {
+    _core?: {
+      _renderService?: {
+        dimensions?: {
+          css?: {
+            cell?: {
+              height?: number;
+            };
+          };
+        };
+      };
+    };
+  })._core;
+  const measuredHeight = core?._renderService?.dimensions?.css?.cell?.height;
+  if (typeof measuredHeight === "number" && measuredHeight > 0) {
+    return measuredHeight;
   }
 
-  if (target.closest(".terminal-quick-input-panel") !== null) {
-    return false;
-  }
-
-  if (target.classList.contains("xterm-helper-textarea") || target.closest(".xterm") !== null) {
-    return false;
-  }
-
-  const tag = target.tagName;
-  return tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable;
+  const rowHeight = terminal.rows > 0 ? host.clientHeight / terminal.rows : 0;
+  return rowHeight > 0 ? rowHeight : TOUCH_SCROLL_FALLBACK_STEP_PX;
 }
 
 function decodeOsc52ClipboardPayload(data: string): string | null {
@@ -165,33 +195,6 @@ function decodeOsc52ClipboardPayload(data: string): string | null {
   }
 }
 
-async function writeClipboardText(text: string, allowDomFallback = false): Promise<void> {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
-  }
-
-  if (!allowDomFallback) {
-    throw new Error("clipboard API is unavailable");
-  }
-
-  const textarea = document.createElement("textarea");
-  textarea.value = text;
-  textarea.setAttribute("readonly", "true");
-  textarea.style.position = "fixed";
-  textarea.style.left = "-9999px";
-  textarea.style.top = "0";
-  document.body.appendChild(textarea);
-  textarea.select();
-  try {
-    if (!document.execCommand("copy")) {
-      throw new Error("copy command failed");
-    }
-  } finally {
-    textarea.remove();
-  }
-}
-
 export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(function TerminalPane({
   clientId,
   windowId,
@@ -204,11 +207,13 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   customQuickKeys = [],
   onCustomQuickKeySubmit,
   onTerminalConnectionStatusChange,
+  theme,
 }, ref) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const xtermHostRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  const touchScrollGestureRef = useRef<TouchScrollGesture | null>(null);
   const socketWorkerRef = useRef<Worker | null>(null);
   const socketOpenRef = useRef(false);
   const activeWindowIdRef = useRef<string | null>(null);
@@ -264,6 +269,15 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     onTerminalConnectionStatusChangeRef.current = onTerminalConnectionStatusChange;
     onTerminalConnectionStatusChangeRef.current?.(connectionStatusRef.current);
   }, [onTerminalConnectionStatusChange]);
+
+  useEffect(() => {
+    if (theme) {
+      const terminal = terminalRef.current;
+      if (terminal) {
+        terminal.options.theme = theme;
+      }
+    }
+  }, [theme]);
 
   useEffect(() => {
     onQuickInputOpenChangeRef.current?.(quickInputOpen);
@@ -346,20 +360,6 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     focusTerminal();
   }, [focusTerminal]);
 
-  const toggleQuickInput = useCallback(() => {
-    if (clientId === null || windowId === null) {
-      return;
-    }
-
-    if (quickInputOpen) {
-      closeQuickInput();
-      return;
-    }
-
-    claimTerminalViewPriority();
-    setQuickInputOpen(true);
-  }, [claimTerminalViewPriority, clientId, closeQuickInput, quickInputOpen, windowId]);
-
   const sendTerminalInput = (data: string, { focusAfterSend = true }: { focusAfterSend?: boolean } = {}) => {
     claimTerminalViewPriority();
     sendTerminalInputRef.current?.(data);
@@ -367,6 +367,41 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       focusTerminal();
     }
   };
+  const copyTerminalClipboardSelection = useCallback(async () => {
+    const terminal = terminalRef.current;
+    if (terminal === null) {
+      return false;
+    }
+
+    try {
+      const copied = await copyTerminalSelection(terminal);
+      if (copied) {
+        setPendingClipboardText(null);
+        focusTerminal();
+      }
+      return copied;
+    } catch {
+      return false;
+    }
+  }, [focusTerminal]);
+  const pasteTerminalClipboardText = useCallback(async () => {
+    if (connectionStatusRef.current !== "connected") {
+      return false;
+    }
+
+    try {
+      const pasted = await pasteClipboardToTerminal(
+        (data) => sendTerminalInput(data, { focusAfterSend: false }),
+        terminalRef.current?.modes.bracketedPasteMode ?? false
+      );
+      if (pasted) {
+        focusTerminal();
+      }
+      return pasted;
+    } catch {
+      return false;
+    }
+  }, [focusTerminal]);
 
   const submitQuickInput = useCallback((draftOverride?: string) => {
     claimTerminalViewPriority();
@@ -384,6 +419,100 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     focusTerminal();
     return true;
   }, [claimTerminalViewPriority, focusTerminal, quickInputDraft, quickInputStorageKey, updateQuickInputDraft]);
+
+  const sendTouchScrollWheelEvents = useCallback((
+    deltaY: number,
+    clientX: number,
+    clientY: number,
+  ): number => {
+    const terminal = terminalRef.current;
+    const host = xtermHostRef.current;
+    if (terminal === null || host === null || connectionStatusRef.current !== "connected") {
+      return 0;
+    }
+
+    const cellHeight = readTerminalCellHeight(terminal, host);
+    const result = terminalTouchScrollSequence({
+      deltaY,
+      clientX,
+      clientY,
+      hostRect: host.getBoundingClientRect(),
+      cols: terminal.cols,
+      rows: terminal.rows,
+      cellHeight,
+      maxWheelEvents: TOUCH_SCROLL_MAX_WHEEL_EVENTS_PER_MOVE,
+    });
+    if (result === null) {
+      return 0;
+    }
+
+    sendTerminalInputRef.current?.(result.sequence);
+    claimTerminalViewPriority();
+    return result.consumedY;
+  }, [claimTerminalViewPriority]);
+
+  const handleTerminalPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    focusTerminal();
+    if (event.pointerType !== "touch" && event.pointerType !== "pen") {
+      touchScrollGestureRef.current = null;
+      return;
+    }
+    if (event.button !== 0) {
+      return;
+    }
+    if (event.target instanceof HTMLElement && event.target.closest(".terminal-quick-input-panel") !== null) {
+      return;
+    }
+
+    touchScrollGestureRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      lastY: event.clientY,
+      accumulatedY: 0,
+      scrolling: false,
+    };
+  }, [focusTerminal]);
+
+  const handleTerminalPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = touchScrollGestureRef.current;
+    if (gesture === null || gesture.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const movedX = event.clientX - gesture.startX;
+    const movedY = event.clientY - gesture.startY;
+    if (!gesture.scrolling) {
+      if (
+        Math.abs(movedY) < TOUCH_SCROLL_START_THRESHOLD_PX
+        || Math.abs(movedY) <= Math.abs(movedX)
+      ) {
+        return;
+      }
+      gesture.scrolling = true;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    const deltaY = gesture.lastY - event.clientY;
+    gesture.lastY = event.clientY;
+    gesture.accumulatedY += deltaY;
+    const consumedY = sendTouchScrollWheelEvents(
+      gesture.accumulatedY,
+      event.clientX,
+      event.clientY,
+    );
+    if (consumedY !== 0) {
+      gesture.accumulatedY -= consumedY;
+    }
+  }, [sendTouchScrollWheelEvents]);
+
+  const handleTerminalPointerEnd = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = touchScrollGestureRef.current;
+    if (gesture !== null && gesture.pointerId === event.pointerId) {
+      touchScrollGestureRef.current = null;
+    }
+  }, []);
 
   useImperativeHandle(ref, () => ({
     focus: focusTerminal,
@@ -415,6 +544,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     const terminal = new Terminal({
       cursorBlink: true,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      theme,
     });
     let closedByCleanup = false;
     let disposed = false;
@@ -604,6 +734,26 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     sendTerminalInputRef.current = sendOrQueueInput;
 
     terminal.attachCustomKeyEventHandler((event) => {
+      const clipboardAction = terminalClipboardShortcutAction(event);
+      if (clipboardAction === "copy") {
+        if (terminal.hasSelection()) {
+          event.preventDefault();
+          event.stopPropagation();
+          void copyTerminalSelection(terminal).then((copied) => {
+            if (copied && isActive()) {
+              setPendingClipboardText(null);
+              focusCurrentTerminal();
+            }
+          }).catch(() => {});
+          return false;
+        }
+        return true;
+      }
+
+      if (clipboardAction === "paste") {
+        return false;
+      }
+
       if (event.key !== "Escape") {
         return true;
       }
@@ -1043,6 +1193,37 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       canvasObserver.observe(pane, { childList: true, subtree: true });
     }
 
+    let nativePasteElement: HTMLElement | undefined;
+    let nativePasteTextarea: HTMLTextAreaElement | undefined;
+    const handleNativePaste = (event: ClipboardEvent) => {
+      if (connectionStatusRef.current !== "connected") {
+        return;
+      }
+
+      const pasted = pasteClipboardEventToTerminal(
+        event,
+        sendOrQueueInput,
+        terminal.modes.bracketedPasteMode,
+      );
+      if (pasted) {
+        focusCurrentTerminal();
+      }
+    };
+    const attachNativePasteHandlers = () => {
+      const element = terminal.element;
+      const textarea = terminal.textarea;
+      if (element !== undefined && nativePasteElement !== element) {
+        nativePasteElement?.removeEventListener("paste", handleNativePaste, true);
+        element.addEventListener("paste", handleNativePaste, true);
+        nativePasteElement = element;
+      }
+      if (textarea !== undefined && nativePasteTextarea !== textarea) {
+        nativePasteTextarea?.removeEventListener("paste", handleNativePaste, true);
+        textarea.addEventListener("paste", handleNativePaste, true);
+        nativePasteTextarea = textarea;
+      }
+    };
+
     const undersizedCheckInterval = window.setInterval(() => {
       if (!isActive() || document.hidden) {
         return;
@@ -1073,6 +1254,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       }
 
       terminal.open(xtermHost);
+      attachNativePasteHandlers();
       attachRenderResizeObserver();
       scheduleFitAndNotifyResize();
       scheduleFitUntilFilled();
@@ -1111,6 +1293,8 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       window.clearInterval(undersizedCheckInterval);
       resizeObserver.disconnect();
       canvasObserver.disconnect();
+      nativePasteElement?.removeEventListener("paste", handleNativePaste, true);
+      nativePasteTextarea?.removeEventListener("paste", handleNativePaste, true);
       document.removeEventListener("visibilitychange", handleTerminalVisibilityChange);
       window.removeEventListener("storage", handleTerminalViewPriorityChange);
       window.removeEventListener(TERMINAL_VIEW_PRIORITY_CHANGED_EVENT, handleTerminalViewPriorityChange);
@@ -1191,23 +1375,8 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     };
   }, [clearScheduledFits, scheduleFitAndNotifyResize]);
 
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (!isQuickInputShortcut(event) || event.defaultPrevented || isEditableShortcutTarget(event.target)) {
-        return;
-      }
-
-      event.preventDefault();
-      event.stopPropagation();
-      toggleQuickInput();
-    };
-
-    window.addEventListener("keydown", handleKeyDown, { capture: true });
-    return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
-  }, [toggleQuickInput]);
-
   if (clientId === null || windowId === null) {
-    return <div className="empty-terminal">Create or select a terminal.</div>;
+    return <div className="empty-terminal" data-onboarding-id="terminal-pane">Create or select a terminal.</div>;
   }
 
   const connectionOverlay = connectionStatus === "connected" ? null : (
@@ -1231,14 +1400,17 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   return (
     <div
       ref={stageRef}
+      data-onboarding-id="terminal-pane"
       className={[
         "terminal-stage",
         `terminal-stage-${viewportMode}`,
         virtualKeysVisible ? "terminal-stage-with-virtual-keys" : "",
         quickInputOpen ? "terminal-stage-quick-input-open" : "",
       ].filter(Boolean).join(" ")}
-      onMouseDown={focusTerminal}
-      onTouchStart={focusTerminal}
+      onPointerDown={handleTerminalPointerDown}
+      onPointerMove={handleTerminalPointerMove}
+      onPointerUp={handleTerminalPointerEnd}
+      onPointerCancel={handleTerminalPointerEnd}
     >
       {virtualKeysVisible && (
         <div className="terminal-virtual-keys" aria-label="Virtual terminal keys">
@@ -1260,6 +1432,35 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
               {key.label}
             </button>
           ))}
+          <button
+            type="button"
+            disabled={connectionStatus !== "connected"}
+            onMouseDown={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            onTouchStart={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              void pasteTerminalClipboardText();
+            }}
+          >
+            Paste
+          </button>
+          <button
+            type="button"
+            onMouseDown={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            onTouchStart={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              void copyTerminalClipboardSelection();
+            }}
+          >
+            Copy
+          </button>
         </div>
       )}
       <div ref={containerRef} className={`terminal-pane terminal-pane-${viewportMode}`}>

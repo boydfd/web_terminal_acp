@@ -18,6 +18,7 @@ function notification(id: string, read: boolean): TerminalNotification {
     windowId: "window-1",
     windowTitle: "Terminal",
     completedAt: "2026-05-24T12:00:00.000Z",
+    status: "FINISHED",
     read
   };
 }
@@ -28,6 +29,10 @@ const COMPLETED_AT = "2026-05-24T12:00:00.000Z";
 const COMPLETED_AT_WITHOUT_MILLIS = "2026-05-24T12:00:00Z";
 
 function treeWithCompletion(completedAt: string): TreeFolder[] {
+  return treeWithTaskStatus("FINISHED", completedAt);
+}
+
+function treeWithTaskStatus(status: "FINISHED" | "ABORTED", completedAt: string): TreeFolder[] {
   return [
     {
       id: "folder-1",
@@ -42,7 +47,9 @@ function treeWithCompletion(completedAt: string): TreeFolder[] {
           runtime_tags: [],
           work_status: { state: "RECENT_ACTIVE", label: "Recent", color: "green" },
           created_at: "2026-05-24T10:00:00.000Z",
-          last_agent_task_completed_at: completedAt
+          last_agent_task_completed_at: status === "FINISHED" ? completedAt : null,
+          last_agent_task_status: status,
+          last_agent_task_status_at: completedAt
         }
       ]
     }
@@ -107,6 +114,17 @@ describe("syncTerminalNotifications", () => {
     const next = syncTerminalNotifications(CLIENT_ID, treeWithCompletion(COMPLETED_AT));
 
     expect(next).toEqual([{ ...stored, read: true }]);
+  });
+
+  it("creates abort notifications from agent task status", () => {
+    const [stored] = syncTerminalNotifications(
+      CLIENT_ID,
+      treeWithTaskStatus("ABORTED", COMPLETED_AT)
+    );
+
+    expect(stored.status).toBe("ABORTED");
+    expect(stored.completedAt).toBe(COMPLETED_AT);
+    expect(stored.id).toBe(`${CLIENT_ID}:${WINDOW_ID}:ABORTED:${COMPLETED_AT}`);
   });
 });
 

@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent_tools import agent_activity_source_types, get_agent_tool_registry
 from app.config import get_settings
 from app.models import Event, SummaryJob, SummaryJobStatus, VirtualWindow
-from app.services.terminal_work_status import RECENT_ACTIVE_WINDOW_SECONDS
+from app.services.agent_activity_projection import event_activity_time, event_is_agent_completion
 from app.services.window_runtime_tags import agent_from_command
 
 INPUT_IDLE_REASON = "input_idle"
@@ -20,6 +20,7 @@ AGENT_IDLE_REASON = "agent_idle"
 TERMINAL_INPUT_COMMAND_KIND = "terminal_input_command"
 TERMINAL_COMMAND_FINISHED_KIND = "terminal_command_finished"
 AGENT_WORK_PRESENCE_KIND = "agent_work_presence"
+SUMMARY_AGENT_BURST_GAP_SECONDS = 5 * 60
 
 
 @dataclass(frozen=True)
@@ -250,16 +251,31 @@ def _touch_agent_activity_state(window: VirtualWindow, event: Event, activity_at
     current = _ensure_aware(activity_at)
     latest = _ensure_aware(window.agent_activity_latest_at) if window.agent_activity_latest_at else None
     if latest is not None and current < latest:
+        if event_is_agent_completion(event):
+            _touch_agent_completion_state(window, event)
         return
     if latest is not None and current == latest and event.id == window.agent_activity_latest_event_id:
         return
-    gap = timedelta(seconds=RECENT_ACTIVE_WINDOW_SECONDS)
+    gap = timedelta(seconds=SUMMARY_AGENT_BURST_GAP_SECONDS)
     if latest is None or current - latest > gap:
         window.agent_activity_burst_start_at = current
     window.agent_activity_latest_at = current
     if event.id is not None:
         window.agent_activity_latest_event_id = event.id
+    if event_is_agent_completion(event):
+        _touch_agent_completion_state(window, event)
     window.agent_activity_generation += 1
+
+
+def _touch_agent_completion_state(window: VirtualWindow, event: Event) -> None:
+    completed_at = event_activity_time(event)
+    latest_completed = (
+        _ensure_aware(window.agent_activity_latest_completed_at)
+        if window.agent_activity_latest_completed_at
+        else None
+    )
+    if latest_completed is None or completed_at >= latest_completed:
+        window.agent_activity_latest_completed_at = completed_at
 
 
 def _agent_activity_time_from_event(event: Event | None) -> datetime | None:
@@ -268,7 +284,7 @@ def _agent_activity_time_from_event(event: Event | None) -> datetime | None:
     if event.kind == AGENT_WORK_PRESENCE_KIND:
         return _ensure_aware(event.created_at)
     if event.source_type in agent_activity_source_types():
-        return _ensure_aware(event.created_at)
+        return event_activity_time(event)
     if event.kind == TERMINAL_INPUT_COMMAND_KIND and _command_agent(event) is not None:
         return _event_input_time(event)
     return None
@@ -298,7 +314,7 @@ async def _was_idle_before(
     if not activity_times:
         return True
     latest_prior = max(activity_times)
-    return moment_aware - latest_prior > timedelta(seconds=RECENT_ACTIVE_WINDOW_SECONDS)
+    return moment_aware - latest_prior > timedelta(seconds=SUMMARY_AGENT_BURST_GAP_SECONDS)
 
 
 async def _event_activity_times_before(
@@ -348,25 +364,21 @@ async def _agent_activity_times_before(
     *,
     current_event_id: UUID | None = None,
 ) -> list[datetime]:
-    times: list[datetime] = []
-    for source_type in agent_activity_source_types():
-        filters = [
-            Event.client_id == window.client_id,
-            Event.virtual_window_id == window.id,
-            Event.source_type == source_type,
-            Event.created_at < moment,
-        ]
-        if current_event_id is not None:
-            filters.append(Event.id != current_event_id)
-        created_at = await session.scalar(
-            select(Event.created_at)
-            .where(*filters)
-            .order_by(desc(Event.created_at), desc(Event.id))
-            .limit(1)
-        )
-        if created_at is not None:
-            times.append(_ensure_aware(created_at))
-    return times
+    filters = [
+        Event.client_id == window.client_id,
+        Event.virtual_window_id == window.id,
+        Event.source_type.in_(agent_activity_source_types()),
+        Event.created_at < moment,
+    ]
+    if current_event_id is not None:
+        filters.append(Event.id != current_event_id)
+    created_at = await session.scalar(
+        select(Event.created_at)
+        .where(*filters)
+        .order_by(desc(Event.created_at), desc(Event.id))
+        .limit(1)
+    )
+    return [_ensure_aware(created_at)] if created_at is not None else []
 
 
 async def _last_summary_at(session: AsyncSession, window_id: UUID) -> datetime | None:

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { fetchProjectSummaries, summarizeProject } from "../api";
 import {
@@ -29,6 +29,8 @@ type FolderTreeProps = {
   onSelectWindow: (window: TreeWindow) => void;
   onDeleteWindow: (window: TreeWindow) => void;
   onCreateTerminalAtGroup?: (node: SwitcherGroupNode) => void;
+  onConfigureTerminalAtGroup?: (node: SwitcherGroupNode) => void;
+  renderHeaderAction?: () => ReactNode;
   creatingTerminal?: boolean;
   createTerminalDisabled?: boolean;
 };
@@ -182,6 +184,7 @@ function DisplayTreeNode({
   onToggleGroup,
   onSummarizeProject,
   onCreateTerminalAtGroup,
+  onConfigureTerminalAtGroup,
   creatingTerminal,
   createTerminalDisabled
 }: {
@@ -199,6 +202,7 @@ function DisplayTreeNode({
   onToggleGroup: (key: string) => void;
   onSummarizeProject?: (projectPath: string) => void;
   onCreateTerminalAtGroup?: (node: SwitcherGroupNode) => void;
+  onConfigureTerminalAtGroup?: (node: SwitcherGroupNode) => void;
   creatingTerminal?: boolean;
   createTerminalDisabled?: boolean;
 }) {
@@ -267,6 +271,21 @@ function DisplayTreeNode({
             +
           </button>
         )}
+        {showCreateTerminal && onConfigureTerminalAtGroup && (
+          <button
+            type="button"
+            className="switcher-configure-terminal-button tree-configure-terminal-button"
+            disabled={creatingTerminal || createTerminalDisabled}
+            aria-label={`配置 ${createLabel} 新终端`}
+            title={`配置 ${createLabel} 新终端`}
+            onClick={(event) => {
+              event.stopPropagation();
+              onConfigureTerminalAtGroup(node);
+            }}
+          >
+            配置
+          </button>
+        )}
       </div>
       {isExpanded && (
         <ul>
@@ -287,6 +306,7 @@ function DisplayTreeNode({
               onToggleGroup={onToggleGroup}
               onSummarizeProject={onSummarizeProject}
               onCreateTerminalAtGroup={onCreateTerminalAtGroup}
+              onConfigureTerminalAtGroup={onConfigureTerminalAtGroup}
               creatingTerminal={creatingTerminal}
               createTerminalDisabled={createTerminalDisabled}
             />
@@ -309,6 +329,8 @@ export function FolderTree({
   onSelectWindow,
   onDeleteWindow,
   onCreateTerminalAtGroup,
+  onConfigureTerminalAtGroup,
+  renderHeaderAction,
   creatingTerminal,
   createTerminalDisabled
 }: FolderTreeProps) {
@@ -433,9 +455,10 @@ export function FolderTree({
   };
 
   return (
-    <div>
+    <div data-onboarding-id="terminal-tree">
       <div className="tree-header">
         <h2>Terminals</h2>
+        {renderHeaderAction?.()}
       </div>
       <ul className="tree-root">
         {displayTree.map((node) => (
@@ -459,6 +482,7 @@ export function FolderTree({
                 : undefined
             }
             onCreateTerminalAtGroup={onCreateTerminalAtGroup}
+            onConfigureTerminalAtGroup={onConfigureTerminalAtGroup}
             creatingTerminal={creatingTerminal}
             createTerminalDisabled={createTerminalDisabled}
           />

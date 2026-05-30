@@ -1,6 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { ProjectSummary } from "../types";
+import {
+  AGENT_LAUNCH_OPTIONS,
+  agentLaunchForKind,
+  isAgentLaunchKind,
+} from "../agentLaunch";
+import type { AgentLaunchMode } from "../agentLaunch";
+import type { AgentLaunchKind, AgentLaunchConfig, ProjectSummary } from "../types";
 import { projectGroupLabel } from "../terminalGrouping";
 
 type ProjectTerminalPickerProps = {
@@ -11,7 +17,8 @@ type ProjectTerminalPickerProps = {
   creatingTerminal?: boolean;
   createTerminalDisabled?: boolean;
   onClose: () => void;
-  onCreateTerminal: (projectPath: string) => void;
+  onCreateTerminal: (projectPath: string, agentLaunch: AgentLaunchConfig | null) => void;
+  onConfigureTerminal?: (projectPath: string, agent: AgentLaunchKind) => void;
 };
 
 type ProjectOption = {
@@ -27,10 +34,12 @@ export function ProjectTerminalPicker({
   creatingTerminal,
   createTerminalDisabled,
   onClose,
-  onCreateTerminal
+  onCreateTerminal,
+  onConfigureTerminal
 }: ProjectTerminalPickerProps) {
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
+  const [selectedMode, setSelectedMode] = useState<AgentLaunchMode>("shell");
   const inputRef = useRef<HTMLInputElement | null>(null);
   const projectSummaryLookup = useMemo(() => {
     const lookup = new Map<string, ProjectSummary>();
@@ -62,6 +71,7 @@ export function ProjectTerminalPicker({
     if (!isOpen) {
       setQuery("");
       setActiveIndex(0);
+      setSelectedMode("shell");
       return;
     }
 
@@ -78,6 +88,11 @@ export function ProjectTerminalPicker({
     });
   }, [filteredOptions.length]);
 
+  const activeOption = filteredOptions[activeIndex] ?? null;
+  const createTerminalForProject = useCallback((projectPath: string) => {
+    onCreateTerminal(projectPath, isAgentLaunchKind(selectedMode) ? agentLaunchForKind(selectedMode) : null);
+  }, [onCreateTerminal, selectedMode]);
+
   useEffect(() => {
     if (!isOpen) {
       return;
@@ -91,6 +106,17 @@ export function ProjectTerminalPicker({
       }
 
       if (filteredOptions.length === 0) {
+        return;
+      }
+
+      if (event.key === "Tab") {
+        event.preventDefault();
+        setSelectedMode((currentMode) => {
+          const currentIndex = AGENT_LAUNCH_OPTIONS.findIndex((option) => option.id === currentMode);
+          const offset = event.shiftKey ? -1 : 1;
+          const nextIndex = (currentIndex + offset + AGENT_LAUNCH_OPTIONS.length) % AGENT_LAUNCH_OPTIONS.length;
+          return AGENT_LAUNCH_OPTIONS[nextIndex].id;
+        });
         return;
       }
 
@@ -113,7 +139,7 @@ export function ProjectTerminalPicker({
         }
 
         event.preventDefault();
-        onCreateTerminal(option.path);
+        createTerminalForProject(option.path);
       }
     };
 
@@ -125,8 +151,8 @@ export function ProjectTerminalPicker({
     creatingTerminal,
     filteredOptions,
     isOpen,
-    onClose,
-    onCreateTerminal
+    createTerminalForProject,
+    onClose
   ]);
 
   if (!isOpen) {
@@ -146,11 +172,45 @@ export function ProjectTerminalPicker({
         <div className="project-terminal-picker-header">
           <div>
             <h2>New terminal by project path</h2>
-            <p className="muted">Shift+Alt+N 选择现有项目路径新建 terminal</p>
+            <p className="muted">选择现有项目路径新建 terminal</p>
           </div>
-          <button type="button" onClick={onClose}>
-            Close
-          </button>
+          <div className="project-terminal-picker-actions">
+            {onConfigureTerminal && (
+              <button
+                type="button"
+                disabled={
+                  activeOption === null
+                  || !isAgentLaunchKind(selectedMode)
+                  || creatingTerminal
+                  || createTerminalDisabled
+                }
+                onClick={() => {
+                  if (activeOption !== null && isAgentLaunchKind(selectedMode)) {
+                    onConfigureTerminal(activeOption.path, selectedMode);
+                  }
+                }}
+              >
+                配置
+              </button>
+            )}
+            <button type="button" onClick={onClose}>
+              Close
+            </button>
+          </div>
+        </div>
+
+        <div className="project-terminal-picker-agent-tabs" role="tablist" aria-label="Agent">
+          {AGENT_LAUNCH_OPTIONS.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              className={selectedMode === option.id ? "active" : undefined}
+              aria-selected={selectedMode === option.id}
+              onClick={() => setSelectedMode(option.id)}
+            >
+              {option.label}
+            </button>
+          ))}
         </div>
 
         <input
@@ -179,7 +239,7 @@ export function ProjectTerminalPicker({
               const isActive = index === activeIndex;
 
               return (
-                <li key={option.path}>
+                <li key={option.path} className="project-terminal-picker-result">
                   <button
                     type="button"
                     aria-selected={isActive}
@@ -190,7 +250,7 @@ export function ProjectTerminalPicker({
                         return;
                       }
 
-                      onCreateTerminal(option.path);
+                      createTerminalForProject(option.path);
                     }}
                     role="option"
                     title={option.path}

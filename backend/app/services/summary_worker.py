@@ -117,6 +117,7 @@ async def process_next_summary_job(
             session,
             window.client_id,
             window.id,
+            title_history_source="summary",
             **patch_values,
         )
         if updated_window is None:
@@ -165,7 +166,7 @@ async def process_next_summary_job(
         await mark_summary_job_succeeded(session, job)
         _queue_ui_invalidation(
             session,
-            ["window", "tree", "search"],
+            ["window", "tree", "search", "title_history"],
             client_id=updated_window.client_id,
             window_id=updated_window.id,
             reason="summary_succeeded",

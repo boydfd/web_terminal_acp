@@ -26,6 +26,16 @@ export type UiEvent = UiConnectedEvent | UiInvalidateEvent | UiTerminalSelection
 const UI_EVENT_RECONNECT_BASE_MS = 500;
 const UI_EVENT_RECONNECT_MAX_MS = 10000;
 const WINDOW_ACTIVITY_REFRESH_DELAY_MS = 1200;
+const WINDOW_ACTIVITY_REFRESH_MIN_INTERVAL_MS = 3000;
+const ACTIVITY_ONLY_INVALIDATION_REASONS = new Set([
+  "agent_work_presence",
+  "ai_event",
+  "claude_jsonl_ingested",
+  "git_worktree",
+  "terminal_command",
+  "terminal_output",
+  "trace_ingested"
+]);
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
@@ -79,10 +89,13 @@ export function queryKeysForUiInvalidation(event: UiInvalidateEvent): QueryKey[]
   if (resources.has("clients")) {
     keys.push(["clients"]);
   }
+  if (resources.has("ui_settings")) {
+    keys.push(["custom-quick-keys"]);
+  }
   if (clientId !== null && resources.has("tree")) {
     keys.push(["tree", clientId]);
   }
-  if (clientId !== null && resources.has("window")) {
+  if (clientId !== null && resources.has("window") && !isActivityOnlyWindowInvalidation(event)) {
     keys.push(["window-activity", clientId]);
   }
   if (clientId !== null && windowId !== null && resources.has("window")) {
@@ -90,6 +103,9 @@ export function queryKeysForUiInvalidation(event: UiInvalidateEvent): QueryKey[]
   }
   if (clientId !== null && windowId !== null && resources.has("command_history")) {
     keys.push(["command-history", clientId, windowId]);
+  }
+  if (clientId !== null && windowId !== null && resources.has("title_history")) {
+    keys.push(["title-history", clientId, windowId]);
   }
   if (clientId !== null && windowId !== null && resources.has("agent_record")) {
     keys.push(["agent-record", "chat", clientId, windowId]);
@@ -106,6 +122,14 @@ export function applyUiInvalidation(queryClient: QueryClient, event: UiInvalidat
   for (const queryKey of queryKeysForUiInvalidation(event)) {
     void queryClient.invalidateQueries({ queryKey });
   }
+}
+
+export function isActivityOnlyWindowInvalidation(event: UiInvalidateEvent): boolean {
+  return (
+    event.reason !== null &&
+    event.resources.includes("window") &&
+    ACTIVITY_ONLY_INVALIDATION_REASONS.has(event.reason)
+  );
 }
 
 export function scheduleWindowActivityRefresh(
@@ -125,6 +149,25 @@ export function scheduleWindowActivityRefresh(
     onComplete?.(timer);
   }, WINDOW_ACTIVITY_REFRESH_DELAY_MS);
   return timer;
+}
+
+export function reserveWindowActivityRefresh(
+  event: UiInvalidateEvent,
+  lastRefreshAtByClient: Map<string, number>,
+  nowMs = Date.now()
+): boolean {
+  if (event.client_id === null || !event.resources.includes("window")) {
+    return false;
+  }
+  const lastRefreshAt = lastRefreshAtByClient.get(event.client_id);
+  if (
+    lastRefreshAt !== undefined &&
+    nowMs - lastRefreshAt < WINDOW_ACTIVITY_REFRESH_MIN_INTERVAL_MS
+  ) {
+    return false;
+  }
+  lastRefreshAtByClient.set(event.client_id, nowMs);
+  return true;
 }
 
 export function nextUiEventReconnectDelay(attempt: number): number {

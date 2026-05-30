@@ -5,6 +5,7 @@ import errno
 import os
 import pty
 import select
+import shlex
 import shutil
 import subprocess
 import threading
@@ -397,6 +398,7 @@ async def test_attach_streams_raw_tmux_pty_bytes(monkeypatch) -> None:
         ["tmux", "has-session", "-t", "web_terminal_view__7"],
         ["tmux", "new-session", "-d", "-t", "client_pool", "-s", "web_terminal_view__7"],
         ["tmux", "set-option", "-t", "web_terminal_view__7", "window-size", "manual"],
+        ["tmux", "set-option", "-t", "web_terminal_view__7", "mouse", "on"],
         ["tmux", "select-window", "-t", "web_terminal_view__7:@7"],
         ["tmux", "set-option", "-p", "-t", "web_terminal_view__7:@7", "allow-passthrough", "on"],
         ["tmux", "kill-session", "-t", "web_terminal_view__7"],
@@ -464,6 +466,83 @@ async def test_tmux_attach_stream_preserves_managed_shell_command_markers() -> N
 
             assert sent is True
             assert b"web-terminal-command" in output
+        finally:
+            process.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=1)
+            os.close(master_fd)
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.asyncio
+async def test_tmux_literal_send_keys_command_reaches_shell_hook_and_history(tmp_path) -> None:
+    session = f"wt_send_keys_unit_{os.getpid()}_{int(time.time() * 1000)}"
+    env = {**os.environ, "TERM": "xterm-256color"}
+    history_path = tmp_path / "history.txt"
+    managed_shell = build_managed_shell_command(
+        shell="/bin/bash",
+        client_id="12345678-1234-5678-1234-567812345678",
+        window_id=WINDOW_ID,
+        server_url="http://127.0.0.1:8000",
+        project_path="/tmp",
+    ).command
+    agent_command = "echo WT_SEND_KEYS_HISTORY_TOKEN"
+    history_command = f"fc -ln -2 > {shlex.quote(str(history_path))}"
+
+    subprocess.run(["tmux", "kill-session", "-t", session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    try:
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", session, "-x", "80", "-y", "24", managed_shell],
+            check=True,
+            env=env,
+        )
+        subprocess.run(
+            ["tmux", "set-option", "-t", session, "allow-passthrough", "on"],
+            check=True,
+            env=env,
+        )
+        master_fd, slave_fd = pty.openpty()
+        process = subprocess.Popen(
+            ["tmux", "attach-session", "-t", session],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+            env=env,
+        )
+        os.close(slave_fd)
+        try:
+            output = bytearray()
+            sent_agent = False
+            sent_history = False
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select([master_fd], [], [], 0.05)
+                if readable:
+                    try:
+                        chunk = os.read(master_fd, 65536)
+                    except OSError as exc:
+                        if exc.errno == errno.EIO:
+                            break
+                        raise
+                    output.extend(chunk)
+                if not sent_agent and (b"$ " in output or b"# " in output):
+                    subprocess.run(["tmux", "send-keys", "-l", "-t", session, "--", agent_command], check=True, env=env)
+                    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True, env=env)
+                    sent_agent = True
+                if sent_agent and not sent_history and b"WT_SEND_KEYS_HISTORY_TOKEN" in output:
+                    subprocess.run(["tmux", "send-keys", "-l", "-t", session, "--", history_command], check=True, env=env)
+                    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True, env=env)
+                    sent_history = True
+                if sent_history and history_path.exists() and b"web-terminal-command" in output:
+                    break
+
+            assert sent_agent is True
+            assert sent_history is True
+            assert b"web-terminal-command" in output
+            assert agent_command in history_path.read_text(encoding="utf-8")
         finally:
             process.terminate()
             with contextlib.suppress(subprocess.TimeoutExpired):

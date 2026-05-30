@@ -26,13 +26,14 @@ function formatLastUpdate(client: Client): string {
 
   const updatedAt = new Date(client.last_update_at);
   if (Number.isNaN(updatedAt.getTime())) {
-    return "Updated unknown";
+    return "Unknown";
   }
 
-  return `Updated ${updatedAt.toLocaleString(undefined, {
+  return updatedAt.toLocaleString(undefined, {
     dateStyle: "medium",
-    timeStyle: "short"
-  })}`;
+    timeStyle: "short",
+    hour12: false
+  });
 }
 
 export function ClientList({
@@ -47,43 +48,45 @@ export function ClientList({
   }
 
   return (
-    <section className="client-list" aria-labelledby="client-list-heading">
-      <h2 id="client-list-heading">Clients</h2>
-      <div className="client-cards">
-        {clients.map((client) => {
-          const isSelected = client.id === selectedClientId;
-          return (
-            <div
-              key={client.id}
-              aria-current={isSelected ? "true" : undefined}
-              className={isSelected ? "client-card selected" : "client-card"}
-            >
-              <button type="button" className="client-card-main" onClick={() => onSelectClient(client.id)}>
-                <span className="client-card-header">
-                  <strong>{client.name}</strong>
-                  <span className={`client-status ${client.status.toLowerCase()}`}>{client.status}</span>
+    <div className="client-cards">
+      {clients.map((client) => {
+        const isSelected = client.id === selectedClientId;
+        return (
+          <div
+            key={client.id}
+            aria-current={isSelected ? "true" : undefined}
+            className={isSelected ? "client-card selected" : "client-card"}
+          >
+            <button type="button" className="client-card-main" onClick={() => onSelectClient(client.id)}>
+              <span className="client-card-header">
+                <strong>{client.name}</strong>
+                <span className={`client-status ${client.status.toLowerCase()}`}>{client.status}</span>
+              </span>
+              {isSelected && (
+                <span className="client-details">
+                  <span className="client-meta">
+                    <span>{client.runtime}</span>
+                    <span>{formatHostname(client)}</span>
+                  </span>
+                  <span className="client-version">{formatVersion(client)}</span>
+                  <span className="client-update-time">{formatLastUpdate(client)}</span>
                 </span>
-                <span className="client-meta">
-                  <span>{client.runtime}</span>
-                  <span>{formatHostname(client)}</span>
-                </span>
-                <span className="client-version">{formatVersion(client)}</span>
-                <span className="client-update-time">{formatLastUpdate(client)}</span>
-              </button>
-              {client.runtime === "remote" && (
-                <button
-                  type="button"
-                  className="client-card-action"
-                  disabled={client.status !== "ONLINE" || updatingClientId === client.id}
-                  onClick={() => onUpdateClient(client.id)}
-                >
-                  {updatingClientId === client.id ? "Starting..." : "Update"}
-                </button>
               )}
-            </div>
-          );
-        })}
-      </div>
-    </section>
+            </button>
+            {isSelected && client.runtime === "remote" && (
+              <button
+                type="button"
+                className="client-card-action"
+                data-onboarding-id="remote-client-update"
+                disabled={client.status !== "ONLINE" || updatingClientId === client.id}
+                onClick={() => onUpdateClient(client.id)}
+              >
+                {updatingClientId === client.id ? "Starting..." : "Update"}
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }

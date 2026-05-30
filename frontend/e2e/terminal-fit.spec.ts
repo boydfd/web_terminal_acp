@@ -4,6 +4,8 @@ import type { Socket } from "node:net";
 
 import { expect, test, type Page } from "@playwright/test";
 
+import type { ClientWindowsActivity, TerminalRecentPage, TreeFolderCore } from "../src/types";
+
 const LOCAL_CLIENT_ID = "00000000-0000-0000-0000-000000000001";
 const LOCAL_WINDOW_ID = process.env.PLAYWRIGHT_WINDOW_ID ?? "00000000-0000-0000-0000-000000000002";
 const TERMINAL_ACTIVE_VIEW_STORAGE_KEY = "web-terminal-acp:active-terminal-view";
@@ -181,7 +183,9 @@ function terminalOutput(rows = 40): string {
 type MockApiOptions = {
   slowTreeMs?: number;
   slowSocketMs?: number;
-  tree?: ReturnType<typeof testTree>;
+  tree?: TreeFolderCore[];
+  activity?: ClientWindowsActivity;
+  recents?: TerminalRecentPage;
   onRequest?: (url: URL) => void;
   onTerminalMessage?: (message: string | Buffer, ws: MockTerminalSocket) => void;
   afterTerminalConnected?: (ws: MockTerminalSocket) => void;
@@ -306,7 +310,7 @@ async function startMockApiServer(options?: MockApiOptions): Promise<{ baseUrl: 
         }
         sendJson(response, options?.tree ?? testTree());
       } else if (url.pathname === `${clientPath}/windows/activity`) {
-        sendJson(response, {
+        sendJson(response, options?.activity ?? {
           windows: [{
             window_id: LOCAL_WINDOW_ID,
             work_status: window.work_status,
@@ -319,7 +323,15 @@ async function startMockApiServer(options?: MockApiOptions): Promise<{ baseUrl: 
         sendJson(response, window);
       } else if (url.pathname === `${clientPath}/project-summaries`) {
         sendJson(response, []);
-      } else if (url.pathname === `${clientPath}/terminal-recents`) {
+      } else if (url.pathname === `${clientPath}/terminal-recents` && request.method === "GET") {
+        sendJson(response, options?.recents ?? {
+          items: [{ window_id: LOCAL_WINDOW_ID, title: window.title, last_used_at: window.created_at }],
+          page: Number(url.searchParams.get("page") ?? "1"),
+          page_size: Number(url.searchParams.get("page_size") ?? "20"),
+          total: 1,
+          total_pages: 1,
+        });
+      } else if (url.pathname === `${clientPath}/terminal-recents` && request.method === "POST") {
         sendJson(response, { window_id: LOCAL_WINDOW_ID, title: window.title, last_used_at: window.created_at });
       } else if (url.pathname === `${clientPath}/search`) {
         sendJson(response, { query: "", results: [] });
@@ -517,6 +529,89 @@ test.describe("terminal viewport fit", () => {
       }),
       { timeout: 5000 },
     ).toBe(true);
+  });
+
+  test("Alt+W switcher fits narrow mobile viewports", async ({ page }) => {
+    const now = "2026-05-25T13:45:00.000Z";
+    const selectedWindow = testWindow();
+    const longProjectPath = "/workspace/really-long-project-name-with-many-segments/apps/mobile-web-terminal/client";
+    const windows = [
+      {
+        ...selectedWindow,
+        title: "Playwright mobile terminal with an intentionally long title that should not overflow",
+      },
+      ...Array.from({ length: 4 }, (_, index) => {
+        const suffix = String(index + 1).padStart(2, "0");
+        return {
+          id: `00000000-0000-0000-0000-0000000020${suffix}`,
+          title: `Agent workspace ${suffix} with verbose terminal task title and project metadata`,
+          status: "ACTIVE",
+          title_tags: [`mobile-${suffix}`],
+          created_at: now,
+        };
+      }),
+    ];
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await mockApi(page, {
+      tree: [{
+        id: "00000000-0000-0000-0000-000000000010",
+        name: "移动端终端切换测试分组",
+        path: "/移动端终端切换测试分组",
+        folders: [],
+        windows,
+      }],
+      activity: {
+        windows: windows.map((window, index) => ({
+          window_id: window.id,
+          work_status: selectedWindow.work_status,
+          runtime_tags: ["codex", `${longProjectPath}-${index}`],
+          last_agent_task_completed_at: null,
+          git_worktree: null,
+        })),
+      },
+      recents: {
+        items: windows.map((window) => ({
+          window_id: window.id,
+          title: window.title,
+          last_used_at: now,
+        })),
+        page: 1,
+        page_size: 20,
+        total: windows.length,
+        total_pages: 1,
+      },
+    });
+    await page.goto(terminalPath(), { waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".xterm-rows", { timeout: 30_000 });
+
+    await page.keyboard.press("Alt+W");
+    await expect(page.locator(".terminal-switcher")).toBeVisible();
+
+    const metrics = await page.evaluate(() => {
+      const viewportWidth = document.documentElement.clientWidth;
+      const dialog = document.querySelector(".terminal-switcher");
+      const rows = Array.from(document.querySelectorAll(".switcher-window"));
+      const metaRows = Array.from(document.querySelectorAll(".switcher-window-meta"));
+      const rects = [dialog, ...rows, ...metaRows]
+        .filter((element): element is Element => element instanceof Element)
+        .map((element) => element.getBoundingClientRect());
+
+      return {
+        viewportWidth,
+        documentScrollWidth: document.documentElement.scrollWidth,
+        maxRight: Math.max(...rects.map((rect) => rect.right)),
+        minLeft: Math.min(...rects.map((rect) => rect.left)),
+        dialogWidth: dialog instanceof HTMLElement ? dialog.getBoundingClientRect().width : 0,
+        rowCount: rows.length,
+      };
+    });
+
+    expect(metrics.rowCount).toBeGreaterThan(1);
+    expect(metrics.documentScrollWidth).toBeLessThanOrEqual(metrics.viewportWidth);
+    expect(metrics.minLeft).toBeGreaterThanOrEqual(0);
+    expect(metrics.maxRight).toBeLessThanOrEqual(metrics.viewportWidth);
+    expect(metrics.dialogWidth).toBeLessThanOrEqual(374);
   });
 
   test("reconnects and focuses terminal after page reload", async ({ page }) => {
@@ -717,14 +812,12 @@ test.describe("terminal viewport fit", () => {
     await page.waitForSelector(".mobile-terminal-active .xterm-rows", { timeout: 30_000 });
     await waitForFilledTerminal(page, 0.9, 60_000, "fit-row-40");
 
-    await page.locator(".terminal-menu-button").evaluate((button) => {
-      if (!(button instanceof HTMLButtonElement)) {
-        throw new Error("terminal menu button is not a button");
-      }
-      button.click();
-    });
-    await page.getByRole("menuitem", { name: /Virtual keys/ }).click();
-    await expect(page.locator(".terminal-virtual-keys")).toBeVisible();
+    const virtualKeys = page.locator(".terminal-virtual-keys");
+    if (!await virtualKeys.isVisible()) {
+      await page.getByRole("button", { name: "Controls" }).click();
+      await page.getByRole("menuitem", { name: /Virtual keys/ }).click();
+    }
+    await expect(virtualKeys).toBeVisible();
 
     await page.keyboard.press("Alt+I");
     const quickInput = page.getByLabel("Quick terminal input");

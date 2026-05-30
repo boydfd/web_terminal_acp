@@ -1,12 +1,18 @@
 import type {
+  AgentConfig,
+  AgentLaunchConfig,
   AgentChatRecord,
   AgentChatRoleFilter,
   AgentRecord,
+  AuthStatus,
   BootstrapClientInput,
   BootstrapClientResult,
   Client,
+  ClientRegistrationKeyResult,
   ClientUpdateResult,
   CommandHistory,
+  WindowTitleHistory,
+  LoginResult,
   SearchResponse,
   ProjectSummary,
   TerminalRecent,
@@ -16,11 +22,17 @@ import type {
   TreeFolderCore,
   VirtualWindow
 } from "./types";
+import { customQuickKeyForStorage, type CustomQuickKey } from "./terminalQuickKeys";
 import type { SummaryOutputLanguage } from "./userPreferences";
 import { readApiBase } from "./apiBase";
+import { appendAuthToken, readAuthToken } from "./auth";
 
 export type RetrySummaryPayload = {
   allow_title_folder_override: boolean;
+};
+
+export type CustomQuickKeysResponse = {
+  quick_keys: CustomQuickKey[];
 };
 
 function apiBaseUrl(): URL {
@@ -44,6 +56,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (init?.body !== undefined && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
+  const authToken = readAuthToken();
+  if (authToken !== null && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${authToken}`);
+  }
   const response = await fetch(apiUrl(path), {
     ...init,
     headers
@@ -63,11 +79,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export function fetchAuthStatus(): Promise<AuthStatus> {
+  return request<AuthStatus>("/api/auth/status");
+}
+
+export function login(secret: string): Promise<LoginResult> {
+  return request<LoginResult>("/api/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ secret })
+  });
+}
+
 export function terminalWebSocketUrl(clientId: string, windowId: string, viewId?: string): string {
   const url = new URL(apiUrl(`/api/clients/${pathSegment(clientId)}/terminal/${pathSegment(windowId)}`));
   if (viewId !== undefined) {
     url.searchParams.set("view_id", viewId);
   }
+  appendAuthToken(url);
   if (url.protocol === "http:") {
     url.protocol = "ws:";
   } else if (url.protocol === "https:") {
@@ -78,6 +106,7 @@ export function terminalWebSocketUrl(clientId: string, windowId: string, viewId?
 
 export function terminalSelectionWebSocketUrl(clientId: string): string {
   const url = new URL(apiUrl(`/api/clients/${pathSegment(clientId)}/terminal-selection`));
+  appendAuthToken(url);
   if (url.protocol === "http:") {
     url.protocol = "ws:";
   } else if (url.protocol === "https:") {
@@ -88,6 +117,7 @@ export function terminalSelectionWebSocketUrl(clientId: string): string {
 
 export function uiEventsWebSocketUrl(): string {
   const url = new URL(apiUrl("/api/ui-events"));
+  appendAuthToken(url);
   if (url.protocol === "http:") {
     url.protocol = "ws:";
   } else if (url.protocol === "https:") {
@@ -100,10 +130,28 @@ export function fetchClients(): Promise<Client[]> {
   return request<Client[]>("/api/clients");
 }
 
+export function fetchCustomQuickKeys(): Promise<CustomQuickKeysResponse> {
+  return request<CustomQuickKeysResponse>("/api/ui-settings/custom-quick-keys");
+}
+
+export function updateCustomQuickKeys(quickKeys: CustomQuickKey[]): Promise<CustomQuickKeysResponse> {
+  return request<CustomQuickKeysResponse>("/api/ui-settings/custom-quick-keys", {
+    method: "PUT",
+    body: JSON.stringify({ quick_keys: quickKeys.map(customQuickKeyForStorage) })
+  });
+}
+
 export function bootstrapClient(payload: BootstrapClientInput): Promise<BootstrapClientResult> {
   return request<BootstrapClientResult>("/api/clients/bootstrap", {
     method: "POST",
     body: JSON.stringify(payload)
+  });
+}
+
+export function createClientRegistrationKey(label?: string | null): Promise<ClientRegistrationKeyResult> {
+  return request<ClientRegistrationKeyResult>("/api/clients/registration-keys", {
+    method: "POST",
+    body: JSON.stringify({ label: label ?? null })
   });
 }
 
@@ -146,6 +194,7 @@ export type CreateWindowInput = {
   cwd?: string | null;
   shell_command?: string | null;
   folder_path?: string | null;
+  agent_launch?: AgentLaunchConfig | null;
 };
 
 export function createWindow(clientId: string, input: CreateWindowInput = {}): Promise<VirtualWindow> {
@@ -154,17 +203,21 @@ export function createWindow(clientId: string, input: CreateWindowInput = {}): P
     body: JSON.stringify({
       cwd: input.cwd ?? null,
       shell_command: input.shell_command ?? null,
-      folder_path: input.folder_path ?? null
+      folder_path: input.folder_path ?? null,
+      agent_launch: input.agent_launch ?? null
     })
   });
 }
 
 export async function deleteWindow(clientId: string, windowId: string): Promise<void> {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  const authToken = readAuthToken();
+  if (authToken !== null) {
+    headers.set("Authorization", `Bearer ${authToken}`);
+  }
   const response = await fetch(apiUrl(`/api/clients/${pathSegment(clientId)}/windows/${pathSegment(windowId)}`), {
     method: "DELETE",
-    headers: {
-      "Content-Type": "application/json"
-    }
+    headers
   });
   if (!response.ok) {
     let detail: string | null = null;
@@ -220,6 +273,34 @@ export function fetchAgentRecordDetail(clientId: string, windowId: string, limit
   );
 }
 
+export function fetchAgentConfig(clientId: string, windowId: string): Promise<AgentConfig> {
+  return request<AgentConfig>(
+    `/api/clients/${pathSegment(clientId)}/windows/${pathSegment(windowId)}/agent-config`
+  );
+}
+
+export function fetchClientAgentConfig(clientId: string, agent: AgentConfig["agent"]): Promise<AgentConfig> {
+  return request<AgentConfig>(
+    `/api/clients/${pathSegment(clientId)}/agent-config/${pathSegment(agent)}`
+  );
+}
+
+export function updateAgentConfigItem(
+  clientId: string,
+  windowId: string,
+  sectionId: string,
+  itemId: string,
+  enabled: boolean
+): Promise<AgentConfig> {
+  return request<AgentConfig>(
+    `/api/clients/${pathSegment(clientId)}/windows/${pathSegment(windowId)}/agent-config/${pathSegment(sectionId)}/${pathSegment(itemId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ enabled })
+    }
+  );
+}
+
 export function fetchCommandHistory(clientId: string, windowId: string, limit = 100, offset = 0): Promise<CommandHistory> {
   const params = new URLSearchParams({
     commands_limit: String(limit),
@@ -227,6 +308,21 @@ export function fetchCommandHistory(clientId: string, windowId: string, limit = 
   });
   return request<CommandHistory>(
     `/api/clients/${pathSegment(clientId)}/windows/${pathSegment(windowId)}/command-history?${params.toString()}`
+  );
+}
+
+export function fetchWindowTitleHistory(
+  clientId: string,
+  windowId: string,
+  limit = 100,
+  offset = 0
+): Promise<WindowTitleHistory> {
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset)
+  });
+  return request<WindowTitleHistory>(
+    `/api/clients/${pathSegment(clientId)}/windows/${pathSegment(windowId)}/title-history?${params.toString()}`
   );
 }
 

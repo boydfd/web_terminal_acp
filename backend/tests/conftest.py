@@ -1,7 +1,19 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.config import get_settings
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def disable_http_auth_for_legacy_tests():
+    settings = get_settings()
+    previous = settings.web_terminal_disable_auth_for_tests
+    settings.web_terminal_disable_auth_for_tests = True
+    try:
+        yield
+    finally:
+        settings.web_terminal_disable_auth_for_tests = previous
 
 
 @pytest.fixture

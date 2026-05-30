@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 import traceback
 from types import SimpleNamespace
 from uuid import uuid4
@@ -14,6 +17,7 @@ from app.services.bootstrap.installer import (
     BootstrapDependencyError,
     BootstrapSecretRedactor,
     build_client_config,
+    build_client_config_payload,
     bootstrap_client,
     client_app_file_contents,
     dependency_check_script,
@@ -86,6 +90,24 @@ def test_build_client_config_contains_token_only_in_target_config():
     assert PASSPHRASE not in config_text
 
 
+def test_build_client_config_payload_matches_target_config_shape():
+    client_id = uuid4()
+    payload = build_client_config_payload(
+        SimpleNamespace(id=client_id, name="Remote Dev"),
+        token=TOKEN,
+        server_url="https://control.example.com/",
+        install_path="~/.web-terminal-acp",
+    )
+
+    assert payload == {
+        "client_id": str(client_id),
+        "token": TOKEN,
+        "server_url": "https://control.example.com/",
+        "name": "Remote Dev",
+        "install_path": "~/.web-terminal-acp",
+    }
+
+
 def test_client_app_file_contents_packages_agent_tool_watchers():
     files = client_app_file_contents()
 
@@ -96,6 +118,7 @@ def test_client_app_file_contents_packages_agent_tool_watchers():
     assert "client_agent/agent_work_presence.py" in files
     assert "client_agent/cursor_watcher.py" in files
     assert "client_agent/outbound.py" in files
+    assert "services/agent_config.py" in files
     idle_source = files["client_agent/agent_idle.py"]
     watcher_source = files["client_agent/agent_tool_watchers.py"]
     presence_source = files["client_agent/agent_work_presence.py"]
@@ -108,6 +131,26 @@ def test_client_app_file_contents_packages_agent_tool_watchers():
     assert "def detect_agent_work_presence" in presence_source
     assert "app.agent_tools" not in presence_source
     assert "class BulkUploadWriter" in outbound_source
+
+
+def test_packaged_client_agent_runner_imports_from_isolated_bundle(tmp_path):
+    bundle_root = tmp_path / "bundle"
+    for relative_path, text in client_app_file_contents().items():
+        target = bundle_root / "app" / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    env = {**os.environ, "PYTHONPATH": str(bundle_root)}
+    result = subprocess.run(
+        [sys.executable, "-c", "import app.client_agent.runner"],
+        check=False,
+        env=env,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 class FakeSsh:

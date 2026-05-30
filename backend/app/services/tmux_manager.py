@@ -4,11 +4,12 @@ import asyncio
 import contextlib
 import os
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import ClassVar, Protocol
 from uuid import UUID
 
+from app.client_agent.agent_commands import agent_command_for_interactive_shell
 from app.client_agent.shell_hook import build_managed_shell_command
 from app.config import get_settings
 from app.models import LOCAL_CLIENT_ID
@@ -41,6 +42,42 @@ def shadow_session_name(window_id: str, view_id: str | None = None) -> str:
 
 def build_attach_command(target: TmuxAttachTarget) -> list[str]:
     return ["tmux", "attach-session", "-t", target.session]
+
+
+def _mountinfo_bind_path_pairs(lines: Iterable[str]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for line in lines:
+        parts = line.rstrip("\n").split(" ")
+        if " - " not in line:
+            continue
+        separator_index = parts.index("-")
+        if separator_index < 5:
+            continue
+        root = parts[3].replace("\\040", " ").rstrip("/")
+        mount_point = parts[4].replace("\\040", " ")
+        if root.startswith("/") and root != "/" and mount_point.startswith("/"):
+            pairs.append((root, mount_point.rstrip("/")))
+    pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+    return pairs
+
+
+def _docker_bind_mount_path_pairs() -> list[tuple[str, str]]:
+    if not os.path.exists("/.dockerenv"):
+        return []
+    with contextlib.suppress(OSError):
+        with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
+            return _mountinfo_bind_path_pairs(mountinfo)
+    return []
+
+
+def _map_host_path_to_container_path(path: str) -> str:
+    for source, mount_point in _docker_bind_mount_path_pairs():
+        if path == source:
+            return mount_point or "/"
+        if path.startswith(f"{source}/"):
+            suffix = path[len(source) :].lstrip("/")
+            return os.path.join(mount_point or "/", suffix)
+    return path
 
 
 def get_tmux_manager() -> "TmuxManager":
@@ -129,6 +166,8 @@ class TmuxManager:
     async def _ensure_terminal_session_options(self, session_name: str) -> None:
         with contextlib.suppress(TmuxCommandError):
             await self._run(["tmux", "set-option", "-t", session_name, "window-size", "manual"])
+        with contextlib.suppress(TmuxCommandError):
+            await self._run(["tmux", "set-option", "-t", session_name, "mouse", "on"])
 
     async def _ensure_pane_passthrough(self, tmux_target: str) -> None:
         with contextlib.suppress(TmuxCommandError):
@@ -163,8 +202,14 @@ class TmuxManager:
         window_id: UUID | str | None = None,
     ) -> TmuxTarget:
         await self.ensure_pool()
-        effective_cwd = cwd or os.getcwd()
+        requested_cwd = cwd or os.getcwd()
+        effective_cwd = _map_host_path_to_container_path(requested_cwd)
         effective_shell = shell_command or self.default_shell
+        interactive_agent_command = (
+            agent_command_for_interactive_shell(shell_command)
+            if shell_command is not None
+            else None
+        )
         command = [
             "tmux",
             "new-window",
@@ -175,10 +220,10 @@ class TmuxManager:
             self.pool_session,
         ]
         command.extend(["-c", effective_cwd])
-        shell = effective_shell
+        shell = self.default_shell if interactive_agent_command is not None else effective_shell
         if window_id is not None:
             shell = build_managed_shell_command(
-                shell=effective_shell,
+                shell=shell,
                 client_id=client_id,
                 window_id=window_id,
                 server_url=self.server_url,
@@ -187,13 +232,57 @@ class TmuxManager:
         command.append(shell)
         tmux_window_id = (await self._run(command)).strip()
         await self._ensure_pane_passthrough(f"{self.pool_session}:{tmux_window_id}")
-        await self.select_window(TmuxTarget(session=self.pool_session, window_id=tmux_window_id))
+        try:
+            await self.select_window(TmuxTarget(session=self.pool_session, window_id=tmux_window_id))
+        except TmuxCommandError as exc:
+            if not _is_missing_tmux_window_error(exc, tmux_window_id):
+                raise
+            interactive_agent_command = None
+            recovery_shell = self.default_shell
+            if window_id is not None:
+                recovery_shell = build_managed_shell_command(
+                    shell=self.default_shell,
+                    client_id=client_id,
+                    window_id=window_id,
+                    server_url=self.server_url,
+                    project_path=effective_cwd,
+                ).command
+            tmux_window_id = (
+                await self._run(
+                    [
+                        "tmux",
+                        "new-window",
+                        "-P",
+                        "-F",
+                        "#{window_id}",
+                        "-t",
+                        self.pool_session,
+                        "-c",
+                        effective_cwd,
+                        recovery_shell,
+                    ]
+                )
+            ).strip()
+            await self._ensure_pane_passthrough(f"{self.pool_session}:{tmux_window_id}")
+            await self.select_window(TmuxTarget(session=self.pool_session, window_id=tmux_window_id))
+        if interactive_agent_command is not None:
+            await self._send_literal_command(
+                f"{self.pool_session}:{tmux_window_id}", interactive_agent_command
+            )
+        effective_cwd = await self.window_cwd(
+            TmuxTarget(session=self.pool_session, window_id=tmux_window_id),
+            fallback=effective_cwd,
+        )
         return TmuxTarget(
             session=self.pool_session,
             window_id=tmux_window_id,
             cwd=effective_cwd,
             shell_command=effective_shell,
         )
+
+    async def _send_literal_command(self, tmux_target: str, command: str) -> None:
+        await self._run(["tmux", "send-keys", "-l", "-t", tmux_target, "--", command])
+        await self._run(["tmux", "send-keys", "-t", tmux_target, "Enter"])
 
     async def recreate_window(
         self,
@@ -304,6 +393,22 @@ class TmuxManager:
             return False
         return window_id == target.window_id
 
+    async def window_cwd(self, target: TmuxTarget, *, fallback: str | None = None) -> str | None:
+        try:
+            cwd = (
+                await self._run([
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    f"{target.session}:{target.window_id}",
+                    "#{pane_current_path}",
+                ])
+            ).strip()
+        except TmuxCommandError:
+            return fallback
+        return cwd or fallback
+
     async def kill_window(self, target: TmuxTarget) -> None:
         if not await self.has_window(target):
             return
@@ -322,3 +427,8 @@ class TmuxManager:
             "-t",
             f"{target.session}:{target.window_id}",
         ])
+
+
+def _is_missing_tmux_window_error(exc: BaseException, window_id: str) -> bool:
+    message = str(exc)
+    return f"can't find window: {window_id}" in message or re.search(r"can't find window: @\d+", message) is not None

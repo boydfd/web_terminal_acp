@@ -7,19 +7,25 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import SessionLocal, get_session
 from app.models import Client, ClientRuntime
 from app.repositories.clients import authenticate_client, get_client, list_clients
+from app.repositories.client_registration_keys import create_registration_key
 from app.routers.ui_events import ui_event_hub_from_state
 from app.schemas import (
     BootstrapClientIn,
     BootstrapClientOut,
+    ClientRegistrationKeyCreateIn,
+    ClientRegistrationKeyOut,
     ClientOut,
     ClientPatchIn,
     ClientUpdateCompleteIn,
     ClientUpdateOut,
+    DirectClientRegisterIn,
+    DirectClientRegisterOut,
 )
 from app.services.bootstrap.installer import (
     BootstrapConnectionError,
@@ -34,6 +40,8 @@ from app.services.client_update import (
     build_client_update_package,
     start_client_update,
 )
+from app.services.direct_registration import ClientRegistrationKeyInvalid, register_direct_client
+from app.services.direct_registration_script import read_direct_registration_script
 from app.services.polling_response_cache import (
     begin_response_cache_refresh,
     cached_or_stale_json_response,
@@ -192,6 +200,63 @@ async def bootstrap_remote_client(
         name=result.name,
         status=result.status,
         reused=result.reused,
+    )
+
+
+@router.post("/registration-keys", response_model=ClientRegistrationKeyOut)
+async def create_client_registration_key(
+    payload: ClientRegistrationKeyCreateIn,
+    session: AsyncSession = Depends(get_session),
+) -> ClientRegistrationKeyOut:
+    registration_key, key = await create_registration_key(session, label=payload.label)
+    await session.commit()
+    await session.refresh(registration_key)
+    return ClientRegistrationKeyOut(
+        id=registration_key.id,
+        key=key,
+        label=registration_key.label,
+        created_at=registration_key.created_at,
+    )
+
+
+@router.get("/register-script", response_class=PlainTextResponse)
+async def read_client_registration_script() -> PlainTextResponse:
+    return PlainTextResponse(
+        read_direct_registration_script(),
+        media_type="text/x-shellscript; charset=utf-8",
+        headers={"Content-Disposition": 'inline; filename="register-client-direct.sh"'},
+    )
+
+
+@router.post("/register", response_model=DirectClientRegisterOut)
+async def register_client_directly(
+    request: Request,
+    payload: DirectClientRegisterIn,
+    session: AsyncSession = Depends(get_session),
+) -> DirectClientRegisterOut:
+    try:
+        client, token, config, package = await register_direct_client(
+            session,
+            registration_key=payload.registration_key,
+            name=payload.name,
+            hostname=payload.hostname,
+            install_path=payload.install_path,
+            server_url=payload.server_url,
+        )
+    except ClientRegistrationKeyInvalid as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from None
+    await session.commit()
+    await ui_event_hub_from_state(request.app.state).publish_invalidation(
+        ["clients"],
+        client_id=client.id,
+        reason="client_registered",
+    )
+    return DirectClientRegisterOut(
+        client_id=client.id,
+        token=token,
+        name=client.name,
+        config=config,
+        package=package,
     )
 
 

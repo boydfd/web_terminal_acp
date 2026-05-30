@@ -74,7 +74,8 @@ def test_work_status_from_activity_treats_recent_working_activity_as_working() -
     status = work_status_from_activity(
         now=now,
         last_activity_at=now - timedelta(minutes=10),
-        last_working_activity_at=now - timedelta(seconds=20),
+        last_agent_active_at=now - timedelta(minutes=10),
+        last_agent_output_at=now - timedelta(seconds=20),
     )
     assert status.state == "WORKING"
 
@@ -109,10 +110,11 @@ async def test_touch_agent_work_presence_refreshes_bucketed_event(db_session) ->
 
     assert first.id == second.id
     assert second.created_at == second_at
+    assert window.agent_activity_latest_at is None
 
 
 @pytest.mark.asyncio
-async def test_load_work_status_keeps_presence_out_of_working_activity(db_session) -> None:
+async def test_load_work_status_keeps_presence_out_of_activity(db_session) -> None:
     now = datetime(2026, 5, 24, 12, 0, tzinfo=timezone.utc)
     client_id = uuid4()
     window = VirtualWindow(id=uuid4(), client_id=client_id, title="Terminal", status=WindowStatus.active)
@@ -146,9 +148,9 @@ async def test_load_work_status_keeps_presence_out_of_working_activity(db_sessio
 
     status = await load_work_status(db_session, client_id, window.id, now=now)
 
-    assert status.state == "WORKING"
-    assert status.last_activity_at == now - timedelta(seconds=15)
-    assert status.last_working_activity_at == now - timedelta(seconds=30)
+    assert status.state == "RECENT_ACTIVE"
+    assert status.last_activity_at == now - timedelta(seconds=30)
+    assert status.last_working_activity_at is None
 
 
 @pytest.mark.asyncio
@@ -198,5 +200,5 @@ async def test_load_work_status_ignores_stale_agent_work_presence_without_active
 
     status = await load_work_status(db_session, client_id, window.id, now=now)
 
-    # Presence still counts as recent terminal activity, but must not keep WORKING.
+    # Presence is process-only metadata and must not affect terminal or agent activity.
     assert status.state == "RECENT_ACTIVE"

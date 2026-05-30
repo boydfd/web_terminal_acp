@@ -343,6 +343,162 @@ def test_client_agent_websocket_heartbeat_marks_client_online(client_agent_db):
     assert db_client.connected_at is not None
 
 
+def test_client_agent_websocket_heartbeat_survives_seen_update_failure(
+    client_agent_db,
+    monkeypatch,
+):
+    async def fail_seen_update(client_id: UUID, payload: dict[str, object]) -> bool:
+        raise RuntimeError("database temporarily unavailable")
+
+    monkeypatch.setattr(
+        client_agent_router,
+        "_mark_client_seen_with_metadata",
+        fail_seen_update,
+    )
+
+    test_client = TestClient(app)
+    try:
+        with test_client.websocket_connect(
+            "/api/client-agent/ws",
+            headers={
+                "X-Client-Id": str(client_agent_db.client_id),
+                "Authorization": f"Bearer {client_agent_db.token}",
+            },
+        ) as websocket:
+            websocket.send_text(
+                encode_agent_message(
+                    AgentMessage(type="heartbeat", client_id=client_agent_db.client_id)
+                )
+            )
+            first_response = websocket.receive_json()
+            websocket.send_text(
+                encode_agent_message(
+                    AgentMessage(type="heartbeat", client_id=client_agent_db.client_id)
+                )
+            )
+            second_response = websocket.receive_json()
+    finally:
+        test_client.close()
+
+    assert first_response["type"] == "heartbeat_ack"
+    assert second_response["type"] == "heartbeat_ack"
+
+
+def test_client_agent_websocket_hello_survives_seen_update_failure(
+    client_agent_db,
+    monkeypatch,
+):
+    async def fail_seen_update(client_id: UUID, payload: dict[str, object]) -> bool:
+        raise RuntimeError("database temporarily unavailable")
+
+    monkeypatch.setattr(
+        client_agent_router,
+        "_mark_client_seen_with_metadata",
+        fail_seen_update,
+    )
+
+    test_client = TestClient(app)
+    try:
+        with test_client.websocket_connect(
+            "/api/client-agent/ws",
+            headers={
+                "X-Client-Id": str(client_agent_db.client_id),
+                "Authorization": f"Bearer {client_agent_db.token}",
+            },
+        ) as websocket:
+            websocket.send_text(
+                encode_agent_message(
+                    AgentMessage(
+                        type="hello",
+                        client_id=client_agent_db.client_id,
+                        payload={"hostname": "edge-host", "version": "9.9.9"},
+                    )
+                )
+            )
+            response = websocket.receive_json()
+    finally:
+        test_client.close()
+
+    assert response["type"] == "hello_ack"
+
+
+def test_client_agent_websocket_disconnect_cleanup_survives_offline_update_failure(
+    client_agent_db,
+    monkeypatch,
+):
+    async def fail_offline_update(client_id: UUID) -> bool:
+        raise RuntimeError("database temporarily unavailable")
+
+    monkeypatch.setattr(
+        client_agent_router,
+        "_mark_client_disconnected_by_id",
+        fail_offline_update,
+    )
+
+    test_client = TestClient(app)
+    try:
+        with test_client.websocket_connect(
+            "/api/client-agent/ws",
+            headers={
+                "X-Client-Id": str(client_agent_db.client_id),
+                "Authorization": f"Bearer {client_agent_db.token}",
+            },
+        ) as websocket:
+            websocket.send_text(
+                encode_agent_message(
+                    AgentMessage(type="heartbeat", client_id=client_agent_db.client_id)
+                )
+            )
+            response = websocket.receive_json()
+    finally:
+        test_client.close()
+
+    assert response["type"] == "heartbeat_ack"
+
+
+def test_client_agent_websocket_inventory_survives_inventory_update_failure(
+    client_agent_db,
+    monkeypatch,
+):
+    async def fail_inventory_update(websocket, client_id: UUID, message: AgentMessage) -> bool:
+        raise RuntimeError("database temporarily unavailable")
+
+    monkeypatch.setattr(
+        client_agent_router,
+        "_handle_inventory_message",
+        fail_inventory_update,
+    )
+
+    test_client = TestClient(app)
+    try:
+        with test_client.websocket_connect(
+            "/api/client-agent/ws",
+            headers={
+                "X-Client-Id": str(client_agent_db.client_id),
+                "Authorization": f"Bearer {client_agent_db.token}",
+            },
+        ) as websocket:
+            websocket.send_text(
+                encode_agent_message(
+                    AgentMessage(
+                        type="inventory",
+                        client_id=client_agent_db.client_id,
+                        payload={"tmux_windows": []},
+                    )
+                )
+            )
+            websocket.send_text(
+                encode_agent_message(
+                    AgentMessage(type="heartbeat", client_id=client_agent_db.client_id)
+                )
+            )
+            response = websocket.receive_json()
+    finally:
+        test_client.close()
+
+    assert response["type"] == "heartbeat_ack"
+
+
 def test_client_agent_websocket_hello_records_client_version(client_agent_db):
     test_client = TestClient(app)
     try:

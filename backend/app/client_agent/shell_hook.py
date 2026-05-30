@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+import shlex
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -95,11 +96,29 @@ exec {quoted_shell} -i
 
 
 def _direct_launcher(shell: str) -> str:
+    command = _exec_command(shell)
+    if _is_direct_agent_command(shell):
+        command_name = _direct_agent_command_name(shell)
+        prepare_direct_agent = (
+            f"__web_terminal_prepare_direct_agent_launch {_shell_quote(command_name)}"
+            if command_name is not None
+            else "__web_terminal_prepare_agent_command_path"
+        )
+        return f"""{_agent_environment_script()}
+if __web_terminal_missing_claude_env; then
+  __web_terminal_load_zshrc_env
+fi
+{prepare_direct_agent}
+__web_terminal_agent_exit=0
+{command} || __web_terminal_agent_exit=$?
+printf '\\n[web-terminal] agent command exited with status %s; opening shell...\\n' "$__web_terminal_agent_exit"
+exec "${{SHELL:-/bin/sh}}" -i
+"""
     return f"""{_agent_environment_script()}
 if __web_terminal_missing_claude_env; then
   __web_terminal_load_zshrc_env
 fi
-exec {_exec_command(shell)}
+exec {command}
 """
 
 
@@ -111,7 +130,7 @@ def _agent_environment_script() -> str:
     "~/"*) WEB_TERMINAL_CODEX_HOME="$HOME/${WEB_TERMINAL_CODEX_HOME#"~/"}" ;;
   esac
   mkdir -p "$WEB_TERMINAL_CODEX_HOME/sessions" "$WEB_TERMINAL_CODEX_HOME/log" "$WEB_TERMINAL_CODEX_HOME/shell_snapshots" 2>/dev/null || return 0
-  for __web_terminal_codex_item in auth.json config.toml AGENTS.md skills plugins plugin_marketplaces.json; do
+  for __web_terminal_codex_item in auth.json config.toml hooks hooks.json hooks.disabled.json AGENTS.md skills skills.disabled plugins plugins.disabled plugin_marketplaces.json; do
     [ -e "$__web_terminal_source_codex_home/$__web_terminal_codex_item" ] || continue
     [ -e "$WEB_TERMINAL_CODEX_HOME/$__web_terminal_codex_item" ] && continue
     ln -s "$__web_terminal_source_codex_home/$__web_terminal_codex_item" "$WEB_TERMINAL_CODEX_HOME/$__web_terminal_codex_item" 2>/dev/null || true
@@ -120,7 +139,7 @@ def _agent_environment_script() -> str:
 }
 __web_terminal_export_env_line() {
   case "$1" in
-    ANTHROPIC_*=*|CLAUDE_CODE_*=*|HTTP_PROXY=*|HTTPS_PROXY=*|NO_PROXY=*|http_proxy=*|https_proxy=*|no_proxy=*)
+    OPENAI_*=*|ANTHROPIC_*=*|CLAUDE_CODE_*=*|HTTP_PROXY=*|HTTPS_PROXY=*|NO_PROXY=*|http_proxy=*|https_proxy=*|no_proxy=*)
       export "$1"
       ;;
   esac
@@ -172,7 +191,7 @@ __web_terminal_prepare_claude_code_home() {
   if [ -e "$__web_terminal_source_claude_json" ] && [ ! -e "$WEB_TERMINAL_CLAUDE_CODE_HOME/.claude.json" ]; then
     ln -s "$__web_terminal_source_claude_json" "$WEB_TERMINAL_CLAUDE_CODE_HOME/.claude.json" 2>/dev/null || true
   fi
-  for __web_terminal_claude_item in settings.json commands hooks plugins api-key-helper.sh; do
+  for __web_terminal_claude_item in settings.json settings.local.json commands hooks hooks.disabled.json plugins plugins.disabled skills skills.disabled api-key-helper.sh; do
     [ -e "$__web_terminal_source_claude_home/$__web_terminal_claude_item" ] || continue
     [ -e "$WEB_TERMINAL_CLAUDE_CODE_HOME/$__web_terminal_claude_item" ] && continue
     ln -s "$__web_terminal_source_claude_home/$__web_terminal_claude_item" "$WEB_TERMINAL_CLAUDE_CODE_HOME/$__web_terminal_claude_item" 2>/dev/null || true
@@ -194,6 +213,19 @@ __web_terminal_prepend_path_once() {
     *) export PATH="$__web_terminal_path_to_add:$PATH" ;;
   esac
 }
+__web_terminal_prepare_agent_command_path() {
+  __web_terminal_prepend_path_once "~/.web-terminal-acp/npm-global/bin"
+  __web_terminal_prepend_path_once "~/.local/bin"
+  __web_terminal_prepend_path_once "~/.npm-global/bin"
+  __web_terminal_prepend_path_once "~/.npm-packages/bin"
+  __web_terminal_prepend_path_once "~/.bun/bin"
+  __web_terminal_prepend_path_once "~/.cargo/bin"
+  __web_terminal_prepend_path_once "/opt/homebrew/bin"
+  __web_terminal_prepend_path_once "/usr/local/bin"
+}
+__web_terminal_agent_command_available() {
+  command -v "$1" >/dev/null 2>&1
+}
 __web_terminal_mkdir_env_path() {
   eval "__web_terminal_env_path=\${$1:-}"
   [ -n "$__web_terminal_env_path" ] || return 0
@@ -201,7 +233,7 @@ __web_terminal_mkdir_env_path() {
   mkdir -p "$__web_terminal_env_path" 2>/dev/null || true
 }
 __web_terminal_prepare_agent_homes() {
-  __web_terminal_prepend_path_once "~/.web-terminal-acp/npm-global/bin"
+  __web_terminal_prepare_agent_command_path
   __web_terminal_prepare_codex_home
   __web_terminal_prepare_claude_code_home
   case "$WEB_TERMINAL_CURSOR_HOME" in
@@ -253,7 +285,7 @@ __web_terminal_load_zshrc_env() {
   ) || return 0
   while IFS= read -r __web_terminal_env_line; do
     case "$__web_terminal_env_line" in
-      ANTHROPIC_*=*|CLAUDE_CODE_*=*|HTTP_PROXY=*|HTTPS_PROXY=*|NO_PROXY=*|http_proxy=*|https_proxy=*|no_proxy=*)
+      OPENAI_*=*|ANTHROPIC_*=*|CLAUDE_CODE_*=*|HTTP_PROXY=*|HTTPS_PROXY=*|NO_PROXY=*|http_proxy=*|https_proxy=*|no_proxy=*)
         __web_terminal_export_env_line "$__web_terminal_env_line"
         ;;
     esac
@@ -262,13 +294,34 @@ $__web_terminal_zshrc_env
 WEB_TERMINAL_ZSHRC_ENV
   unset __web_terminal_zshrc_env __web_terminal_env_line
 }
-__web_terminal_prepare_agent_homes
-__web_terminal_prepare_cursor_home
-'''
-
-
-def _common_hook_script() -> str:
-    return _agent_environment_script() + r'''__web_terminal_agent_arg_present() {
+__web_terminal_load_user_shell_env() {
+  __web_terminal_user_shell="${SHELL:-}"
+  [ -n "$__web_terminal_user_shell" ] || __web_terminal_user_shell="$(command -v zsh 2>/dev/null || command -v bash 2>/dev/null || true)"
+  [ -n "$__web_terminal_user_shell" ] || return 0
+  [ -x "$__web_terminal_user_shell" ] || return 0
+  case "${__web_terminal_user_shell##*/}" in
+    zsh|bash|sh) ;;
+    *) return 0 ;;
+  esac
+  __web_terminal_user_env=$(
+    env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-${USER:-}}" PATH="$PATH" SHELL="$__web_terminal_user_shell" \
+      "$__web_terminal_user_shell" -ic 'env' 2>/dev/null
+  ) || return 0
+  while IFS= read -r __web_terminal_env_line; do
+    case "$__web_terminal_env_line" in
+      PATH=*)
+        export "$__web_terminal_env_line"
+        ;;
+      OPENAI_*=*|ANTHROPIC_*=*|CLAUDE_CODE_*=*|HTTP_PROXY=*|HTTPS_PROXY=*|NO_PROXY=*|http_proxy=*|https_proxy=*|no_proxy=*)
+        __web_terminal_export_env_line "$__web_terminal_env_line"
+        ;;
+    esac
+  done <<WEB_TERMINAL_USER_SHELL_ENV
+$__web_terminal_user_env
+WEB_TERMINAL_USER_SHELL_ENV
+  unset __web_terminal_user_shell __web_terminal_user_env __web_terminal_env_line
+}
+__web_terminal_agent_arg_present() {
   __web_terminal_expected="$1"
   shift
   for __web_terminal_arg in "$@"; do
@@ -293,7 +346,30 @@ __web_terminal_install_agent_permission_wrappers() {
       command claude --dangerously-skip-permissions "$@"
     fi
   }
+  unalias agent 2>/dev/null || true
+  agent() {
+    command agent "$@"
+  }
+  unalias cursor 2>/dev/null || true
+  cursor() {
+    command cursor "$@"
+  }
 }
+__web_terminal_prepare_direct_agent_launch() {
+  __web_terminal_prepare_agent_command_path
+  if [ -n "$1" ] && ! __web_terminal_agent_command_available "$1"; then
+    __web_terminal_load_user_shell_env
+    __web_terminal_prepare_agent_command_path
+  fi
+  __web_terminal_install_agent_permission_wrappers
+}
+__web_terminal_prepare_agent_homes
+__web_terminal_prepare_cursor_home
+'''
+
+
+def _common_hook_script() -> str:
+    return _agent_environment_script() + r'''
 __web_terminal_sequence=0
 __web_terminal_active_sequence=""
 __web_terminal_active_command=""
@@ -461,3 +537,24 @@ def _shell_quote(value: str) -> str:
 
 def _exec_command(value: str) -> str:
     return agent_command_with_permission_flag(value) or _shell_quote(value)
+
+
+def _is_direct_agent_command(value: str) -> bool:
+    return _direct_agent_command_name(value) is not None
+
+
+def _direct_agent_command_name(value: str) -> str | None:
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        return None
+    for token in tokens:
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", token):
+            continue
+        if token in {"command", "env", "sudo"}:
+            continue
+        basename = posixpath.basename(token)
+        if basename in {"codex", "claude", "agent", "cursor"}:
+            return basename
+        return None
+    return None

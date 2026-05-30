@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from app.services import tmux_manager
 from app.services.tmux_manager import (
     TmuxAttachTarget,
     TmuxCommandError,
@@ -30,6 +31,20 @@ def test_build_attach_command_targets_shadow_session():
     assert command == ["tmux", "attach-session", "-t", "web_terminal_view__42"]
 
 
+def test_mountinfo_bind_path_pairs_uses_mount_root_as_host_path():
+    pairs = tmux_manager._mountinfo_bind_path_pairs(
+        [
+            (
+                "2662 2549 254:1 /srv/workspace "
+                "/workspace rw,relatime - ext4 /dev/vda1 rw,discard,errors=remount-ro"
+            ),
+            "1 0 0:1 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw",
+        ]
+    )
+
+    assert pairs == [("/srv/workspace", "/workspace")]
+
+
 @pytest.mark.asyncio
 async def test_create_window_uses_pool_and_returns_tmux_target():
     calls: list[list[str]] = []
@@ -53,17 +68,56 @@ async def test_create_window_uses_pool_and_returns_tmux_target():
     assert calls == [
         ["tmux", "has-session", "-t", "web_terminal_acp_pool"],
         ["tmux", "set-option", "-t", "web_terminal_acp_pool", "window-size", "manual"],
+        ["tmux", "set-option", "-t", "web_terminal_acp_pool", "mouse", "on"],
         ["tmux", "set-option", "-s", "set-clipboard", "external"],
         ["tmux", "show-options", "-s", "terminal-features"],
         ["tmux", "set-option", "-as", "terminal-features", ",xterm*:clipboard"],
         ["tmux", "new-window", "-P", "-F", "#{window_id}", "-t", "web_terminal_acp_pool", "-c", "/tmp/project", "/bin/zsh"],
         ["tmux", "set-option", "-p", "-t", "web_terminal_acp_pool:@42", "allow-passthrough", "on"],
         ["tmux", "select-window", "-t", "web_terminal_acp_pool:@42"],
+        ["tmux", "display-message", "-p", "-t", "web_terminal_acp_pool:@42", "#{pane_current_path}"],
     ]
 
 
 @pytest.mark.asyncio
-async def test_create_window_adds_permission_flag_to_direct_claude_start():
+async def test_create_window_maps_host_bind_mount_path_and_returns_actual_cwd(monkeypatch):
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        tmux_manager,
+        "_docker_bind_mount_path_pairs",
+        lambda: [("/srv/workspace", "/workspace")],
+    )
+
+    async def fake_run(args: list[str]) -> str:
+        calls.append(args)
+        if args[:3] == ["tmux", "new-window", "-P"]:
+            return "@42\n"
+        if args == [
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            "web_terminal_acp_pool:@42",
+            "#{pane_current_path}",
+        ]:
+            return "/workspace/web_terminal_acp\n"
+        return ""
+
+    manager = TmuxManager(pool_session="web_terminal_acp_pool", default_shell="/bin/bash", runner=fake_run)
+
+    target = await manager.create_window(
+        "/srv/workspace/web_terminal_acp",
+        None,
+    )
+
+    assert target.cwd == "/workspace/web_terminal_acp"
+    new_window_call = next(call for call in calls if call[:3] == ["tmux", "new-window", "-P"])
+    assert new_window_call[-2:] == ["/workspace/web_terminal_acp", "/bin/bash"]
+
+
+@pytest.mark.asyncio
+async def test_create_window_launches_direct_agent_inside_default_shell_with_literal_send_keys():
     calls: list[list[str]] = []
 
     async def fake_run(args: list[str]) -> str:
@@ -82,8 +136,18 @@ async def test_create_window_adds_permission_flag_to_direct_claude_start():
 
     assert target.shell_command == "claude --resume claude-session"
     new_window_call = next(call for call in calls if call[:3] == ["tmux", "new-window", "-P"])
-    assert "exec claude --dangerously-skip-permissions --resume claude-session" in new_window_call[-1]
-    assert "__web_terminal_load_zshrc_env" in new_window_call[-1]
+    assert "exec /bin/bash --rcfile" in new_window_call[-1]
+    assert "claude --dangerously-skip-permissions --resume claude-session" not in new_window_call[-1]
+    assert [
+        "tmux",
+        "send-keys",
+        "-l",
+        "-t",
+        "web_terminal_acp_pool:@42",
+        "--",
+        "claude --dangerously-skip-permissions --resume claude-session",
+    ] in calls
+    assert ["tmux", "send-keys", "-t", "web_terminal_acp_pool:@42", "Enter"] in calls
 
 
 @pytest.mark.asyncio
@@ -152,6 +216,7 @@ async def test_ensure_pool_creates_missing_pool_session():
         ["tmux", "has-session", "-t", "web_terminal_acp_pool"],
         ["tmux", "new-session", "-d", "-s", "web_terminal_acp_pool", "/bin/bash"],
         ["tmux", "set-option", "-t", "web_terminal_acp_pool", "window-size", "manual"],
+        ["tmux", "set-option", "-t", "web_terminal_acp_pool", "mouse", "on"],
         ["tmux", "set-option", "-s", "set-clipboard", "external"],
         ["tmux", "show-options", "-s", "terminal-features"],
         ["tmux", "set-option", "-as", "terminal-features", ",xterm*:clipboard"],
@@ -178,6 +243,7 @@ async def test_ensure_shadow_session_groups_to_pool_and_selects_window():
     assert calls == [
         ["tmux", "has-session", "-t", "web_terminal_acp_pool"],
         ["tmux", "set-option", "-t", "web_terminal_acp_pool", "window-size", "manual"],
+        ["tmux", "set-option", "-t", "web_terminal_acp_pool", "mouse", "on"],
         ["tmux", "set-option", "-s", "set-clipboard", "external"],
         ["tmux", "show-options", "-s", "terminal-features"],
         ["tmux", "set-option", "-as", "terminal-features", ",xterm*:clipboard"],
@@ -185,6 +251,7 @@ async def test_ensure_shadow_session_groups_to_pool_and_selects_window():
         ["tmux", "has-session", "-t", "web_terminal_view__42"],
         ["tmux", "new-session", "-d", "-t", "web_terminal_acp_pool", "-s", "web_terminal_view__42"],
         ["tmux", "set-option", "-t", "web_terminal_view__42", "window-size", "manual"],
+        ["tmux", "set-option", "-t", "web_terminal_view__42", "mouse", "on"],
         ["tmux", "select-window", "-t", "web_terminal_view__42:@42"],
         ["tmux", "set-option", "-p", "-t", "web_terminal_view__42:@42", "allow-passthrough", "on"],
     ]
@@ -333,7 +400,9 @@ async def test_ensure_shadow_session_is_idempotent_when_concurrent_creation_race
             return ""
         if args in [
             ["tmux", "set-option", "-t", "web_terminal_acp_pool", "window-size", "manual"],
+            ["tmux", "set-option", "-t", "web_terminal_acp_pool", "mouse", "on"],
             ["tmux", "set-option", "-t", "web_terminal_view__42", "window-size", "manual"],
+            ["tmux", "set-option", "-t", "web_terminal_view__42", "mouse", "on"],
             ["tmux", "set-option", "-p", "-t", "web_terminal_view__42:@42", "allow-passthrough", "on"],
             ["tmux", "set-option", "-s", "set-clipboard", "external"],
             ["tmux", "show-options", "-s", "terminal-features"],

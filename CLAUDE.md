@@ -13,6 +13,13 @@
 
 在 Web Terminal 中开发时，必须使用 skill **`web-terminal-git-worktree`**（见 [AGENTS.md](./AGENTS.md)）。
 
+## Remote Client Bundle
+
+- Remote client bootstrap/self-update 只上传 `backend/app/services/bootstrap/installer.py::client_app_file_contents()` 中列出的精简包，不会自动包含整个 backend。
+- `backend/app/client_agent/**` 新增任何启动或运行时 `app.*` import 时，同步更新精简包清单；remote client 在 WebSocket hello 前退出时，优先查远端 `~/.web-terminal-acp/logs/client.log` 的 `ImportError` / `ModuleNotFoundError`。
+- 包清单变更必须有隔离包导入测试覆盖，例如确认精简包可单独 import `app.client_agent.runner`。
+- 已离线且启动不起来的 remote client 无法 self-update，需要重新 Bootstrap remote client。
+
 ## Web Terminal 性能优先级
 
 Web Terminal 的性能优化和回归判断必须按以下优先级排序：

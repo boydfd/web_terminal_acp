@@ -8,6 +8,8 @@ WindowTitle = Annotated[str, StringConstraints(strip_whitespace=True, min_length
 WindowText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)]
 WindowTitleTag = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
 WindowStatusIn = Literal["ACTIVE", "ARCHIVED", "ERROR", "DISCONNECTED"]
+AgentKindIn = Literal["codex", "claude", "cursor"]
+AgentConfigSectionKindIn = Literal["skills", "plugins", "hooks"]
 ClientName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 ClientStatusOut = Literal["ONLINE", "OFFLINE", "ERROR"]
 ClientRuntimeOut = Literal["local", "remote"]
@@ -15,6 +17,8 @@ BootstrapHost = Annotated[str, StringConstraints(strip_whitespace=True, min_leng
 BootstrapUsername = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 BootstrapPrivateKey = Annotated[str, StringConstraints(min_length=1)]
 BootstrapServerUrl = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2048)]
+LoginSecret = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
+RegistrationKey = Annotated[str, StringConstraints(strip_whitespace=True, min_length=16, max_length=512)]
 
 
 class BootstrapClientIn(BaseModel):
@@ -34,6 +38,42 @@ class BootstrapClientOut(BaseModel):
     reused: bool
 
 
+class LoginIn(BaseModel):
+    secret: LoginSecret
+
+
+class LoginOut(BaseModel):
+    token: str
+    enabled: bool = True
+
+
+class ClientRegistrationKeyCreateIn(BaseModel):
+    label: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)] | None = None
+
+
+class ClientRegistrationKeyOut(BaseModel):
+    id: UUID
+    key: str
+    label: str | None = None
+    created_at: datetime | None = None
+
+
+class DirectClientRegisterIn(BaseModel):
+    registration_key: RegistrationKey
+    name: ClientName
+    hostname: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)] | None = None
+    install_path: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)] | None = None
+    server_url: BootstrapServerUrl
+
+
+class DirectClientRegisterOut(BaseModel):
+    client_id: UUID
+    token: str
+    name: str
+    config: dict[str, Any]
+    package: dict[str, Any]
+
+
 class ClientUpdateOut(BaseModel):
     client_id: UUID
     job_id: str
@@ -42,9 +82,9 @@ class ClientUpdateOut(BaseModel):
 
 
 class WorkStatusOut(BaseModel):
-    state: Literal["LONG_IDLE", "RECENT_ACTIVE", "WORKING"]
+    state: Literal["LONG_IDLE", "RECENT_ACTIVE", "WORKING", "FINISHED", "ABORTED"]
     label: str
-    color: Literal["gray", "green", "orange"]
+    color: Literal["gray", "green", "orange", "red"]
     last_activity_at: datetime | None
     last_working_activity_at: datetime | None
 
@@ -69,6 +109,8 @@ class WindowActivityOut(BaseModel):
     work_status: WorkStatusOut
     runtime_tags: list[str] = Field(default_factory=list)
     last_agent_task_completed_at: datetime | None = None
+    last_agent_task_status: Literal["FINISHED", "ABORTED"] | None = None
+    last_agent_task_status_at: datetime | None = None
     git_worktree: GitWorktreeActivityOut | None = None
 
 
@@ -144,10 +186,33 @@ class FolderOut(BaseModel):
     path: str
 
 
+class AgentConfigSelectionItemIn(BaseModel):
+    id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
+    enabled: bool
+
+
+class AgentConfigSelectionSectionIn(BaseModel):
+    id: AgentConfigSectionKindIn
+    items: list[AgentConfigSelectionItemIn] = Field(default_factory=list, max_length=500)
+
+
+class AgentConfigSelectionIn(BaseModel):
+    agent: AgentKindIn
+    sections: list[AgentConfigSelectionSectionIn] = Field(default_factory=list, max_length=3)
+
+
+class AgentLaunchIn(BaseModel):
+    agent: AgentKindIn
+    command: WindowText | None = None
+    config: AgentConfigSelectionIn | None = None
+    template_id: str | None = None
+
+
 class WindowCreateIn(BaseModel):
     cwd: WindowText | None = None
     shell_command: WindowText | None = None
     folder_path: WindowText | None = None
+    agent_launch: AgentLaunchIn | None = None
 
 
 class WindowPatchIn(BaseModel):
@@ -190,6 +255,9 @@ class WindowOut(BaseModel):
     work_status: WorkStatusOut
     summary_job: SummaryJobOut | None
     created_at: datetime
+    last_terminal_command_at: datetime | None
+    last_agent_event_at: datetime | None
+    last_active_at: datetime
 
 
 class AgentSessionOut(BaseModel):
@@ -255,6 +323,28 @@ class AgentChatRecordOut(BaseModel):
     messages_has_more: bool
 
 
+class AgentConfigItemOut(BaseModel):
+    id: str
+    name: str
+    enabled: bool
+    path: str | None = None
+
+
+class AgentConfigSectionOut(BaseModel):
+    id: Literal["skills", "plugins", "hooks"]
+    name: str
+    items: list[AgentConfigItemOut] = Field(default_factory=list)
+
+
+class AgentConfigOut(BaseModel):
+    agent: AgentKindIn
+    sections: list[AgentConfigSectionOut] = Field(default_factory=list)
+
+
+class AgentConfigToggleIn(BaseModel):
+    enabled: bool
+
+
 class CommandHistoryItemOut(BaseModel):
     id: UUID
     command: str
@@ -274,6 +364,23 @@ class CommandHistoryOut(BaseModel):
     commands_limit: int
     commands_offset: int
     commands_has_more: bool
+
+
+class WindowTitleHistoryItemOut(BaseModel):
+    id: UUID
+    title: str
+    summary: str | None
+    source: str
+    created_at: datetime
+
+
+class WindowTitleHistoryOut(BaseModel):
+    window_id: UUID
+    items: list[WindowTitleHistoryItemOut]
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
 
 
 class SummaryJobRetryIn(BaseModel):
@@ -318,6 +425,21 @@ class TerminalRecentPageOut(BaseModel):
 class TerminalRecentTouchIn(BaseModel):
     window_id: UUID
     title: WindowTitle
+
+
+class CustomQuickKeyOut(BaseModel):
+    id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
+    label: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
+    input: Annotated[str, StringConstraints(min_length=1, max_length=4096)]
+    shortcut: dict[str, Any] | None = None
+
+
+class CustomQuickKeysOut(BaseModel):
+    quick_keys: list[CustomQuickKeyOut] = Field(default_factory=list, max_length=100)
+
+
+class CustomQuickKeysPutIn(BaseModel):
+    quick_keys: list[CustomQuickKeyOut] = Field(default_factory=list, max_length=100)
 
 
 class ProjectSummaryOut(BaseModel):

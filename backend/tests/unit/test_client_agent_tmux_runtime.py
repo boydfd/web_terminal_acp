@@ -43,6 +43,7 @@ async def test_create_window_ensures_pool_and_returns_remote_target_when_pool_mi
         ["tmux", "has-session", "-t", "client_pool"],
         ["tmux", "new-session", "-d", "-s", "client_pool", "/bin/bash"],
         ["tmux", "set-option", "-t", "client_pool", "window-size", "manual"],
+        ["tmux", "set-option", "-t", "client_pool", "mouse", "on"],
         ["tmux", "set-option", "-s", "set-clipboard", "external"],
         ["tmux", "show-options", "-s", "terminal-features"],
         ["tmux", "set-option", "-as", "terminal-features", ",xterm*:clipboard"],
@@ -119,7 +120,7 @@ def test_managed_shell_command_adds_permission_flag_to_direct_codex_start() -> N
         project_path="/workspace/project",
     )
 
-    assert "exec codex --dangerously-bypass-approvals-and-sandbox resume codex-session" in command
+    assert "codex --dangerously-bypass-approvals-and-sandbox resume codex-session || __web_terminal_agent_exit=$?" in command
     assert "__web_terminal_load_zshrc_env" in command
 
 
@@ -162,6 +163,7 @@ async def test_list_windows_ensures_pool_and_returns_runtime_windows_from_tmux_o
     assert calls == [
         ["tmux", "has-session", "-t", "client_pool"],
         ["tmux", "set-option", "-t", "client_pool", "window-size", "manual"],
+        ["tmux", "set-option", "-t", "client_pool", "mouse", "on"],
         ["tmux", "set-option", "-s", "set-clipboard", "external"],
         ["tmux", "show-options", "-s", "terminal-features"],
         ["tmux", "set-option", "-as", "terminal-features", ",xterm*:clipboard"],
@@ -195,6 +197,46 @@ async def test_has_window_checks_remote_tmux_target() -> None:
     assert calls == [
         ["tmux", "display-message", "-p", "-t", "client_pool:@9", "#{window_id}"],
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_window_launches_direct_agent_inside_default_shell_with_literal_send_keys() -> None:
+    calls: list[list[str]] = []
+
+    async def fake_run(args: list[str]) -> str:
+        calls.append(args)
+        if args[:3] == ["tmux", "new-window", "-P"]:
+            return "@9\n"
+        return ""
+
+    runtime = ClientTmuxRuntime(
+        client_id=CLIENT_ID,
+        server_url="https://control.example.com",
+        pool_session="client_pool",
+        default_shell="/bin/bash",
+        runner=fake_run,
+    )
+
+    target = await runtime.create_window(
+        WINDOW_ID,
+        cwd="/workspace/project",
+        shell_command="codex resume codex-session",
+    )
+
+    new_window_call = next(call for call in calls if call[:3] == ["tmux", "new-window", "-P"])
+    assert new_window_call[-1] == runtime.managed_shell_command(WINDOW_ID, project_path="/workspace/project")
+    assert target.remote_window_id == "@9"
+    assert target.shell_command == "codex resume codex-session"
+    assert [
+        "tmux",
+        "send-keys",
+        "-l",
+        "-t",
+        "client_pool:@9",
+        "--",
+        "codex --dangerously-bypass-approvals-and-sandbox resume codex-session",
+    ] in calls
+    assert ["tmux", "send-keys", "-t", "client_pool:@9", "Enter"] in calls
 
 
 @pytest.mark.asyncio

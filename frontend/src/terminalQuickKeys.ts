@@ -1,9 +1,11 @@
+import { normalizeKeyboardShortcut, type KeyboardShortcut } from "./keyboardShortcuts";
 import { createBrowserUuid } from "./uuid";
 
 export type CustomQuickKey = {
   id: string;
   label: string;
   input: string;
+  shortcut?: KeyboardShortcut | null;
 };
 
 export type TerminalSpecialKey = {
@@ -38,7 +40,7 @@ export const TERMINAL_SPECIAL_KEYS: TerminalSpecialKey[] = [
   { token: "PageDown", label: "PgDn", value: "\x1b[6~", aliases: ["PgDn"] }
 ];
 
-const CUSTOM_QUICK_KEYS_STORAGE_KEY = "web-terminal-acp:custom-quick-keys";
+const LEGACY_CUSTOM_QUICK_KEYS_STORAGE_KEY = "web-terminal-acp:custom-quick-keys";
 const MAX_QUICK_KEYS = 100;
 const MAX_LABEL_LENGTH = 80;
 const MAX_INPUT_LENGTH = 4096;
@@ -123,11 +125,16 @@ export function normalizeCustomQuickKeys(value: unknown): CustomQuickKey[] {
     }
 
     const rawId = cleanString(record.id, 128);
-    quickKeys.push({
+    const quickKey: CustomQuickKey = {
       id: rawId.length > 0 ? rawId : `quick-key-${index}`,
       label,
       input
-    });
+    };
+    const shortcut = normalizeKeyboardShortcut(record.shortcut);
+    if (shortcut !== null) {
+      quickKey.shortcut = shortcut;
+    }
+    quickKeys.push(quickKey);
 
     if (quickKeys.length >= MAX_QUICK_KEYS) {
       break;
@@ -137,13 +144,26 @@ export function normalizeCustomQuickKeys(value: unknown): CustomQuickKey[] {
   return quickKeys;
 }
 
-export function readCustomQuickKeys(): CustomQuickKey[] {
+export function customQuickKeyForStorage(quickKey: CustomQuickKey): CustomQuickKey {
+  const normalizedQuickKey: CustomQuickKey = {
+    id: quickKey.id,
+    label: quickKey.label,
+    input: quickKey.input
+  };
+  const shortcut = normalizeKeyboardShortcut(quickKey.shortcut);
+  if (shortcut !== null) {
+    normalizedQuickKey.shortcut = shortcut;
+  }
+  return normalizedQuickKey;
+}
+
+export function readLegacyCustomQuickKeys(): CustomQuickKey[] {
   if (typeof window === "undefined") {
     return [];
   }
 
   try {
-    const rawValue = window.localStorage.getItem(CUSTOM_QUICK_KEYS_STORAGE_KEY);
+    const rawValue = window.localStorage.getItem(LEGACY_CUSTOM_QUICK_KEYS_STORAGE_KEY);
     if (rawValue === null) {
       return [];
     }
@@ -153,18 +173,13 @@ export function readCustomQuickKeys(): CustomQuickKey[] {
   }
 }
 
-export function writeCustomQuickKeys(quickKeys: CustomQuickKey[]): void {
+export function clearLegacyCustomQuickKeys(): void {
   if (typeof window === "undefined") {
     return;
   }
 
-  const normalizedQuickKeys = normalizeCustomQuickKeys(quickKeys);
   try {
-    if (normalizedQuickKeys.length === 0) {
-      window.localStorage.removeItem(CUSTOM_QUICK_KEYS_STORAGE_KEY);
-      return;
-    }
-    window.localStorage.setItem(CUSTOM_QUICK_KEYS_STORAGE_KEY, JSON.stringify(normalizedQuickKeys));
+    window.localStorage.removeItem(LEGACY_CUSTOM_QUICK_KEYS_STORAGE_KEY);
   } catch {
     return;
   }

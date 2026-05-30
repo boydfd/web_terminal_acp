@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from uuid import UUID
 
+from app.client_agent.agent_commands import agent_command_for_interactive_shell
 from app.client_agent.config import default_user_shell
 from app.client_agent.shell_hook import build_managed_shell_command
 
@@ -69,6 +71,8 @@ class ClientTmuxRuntime:
     async def _ensure_terminal_session_options(self, session_name: str) -> None:
         with contextlib.suppress(RuntimeError):
             await self._run(["tmux", "set-option", "-t", session_name, "window-size", "manual"])
+        with contextlib.suppress(RuntimeError):
+            await self._run(["tmux", "set-option", "-t", session_name, "mouse", "on"])
 
     async def _ensure_pane_passthrough(self, tmux_target: str) -> None:
         with contextlib.suppress(RuntimeError):
@@ -117,6 +121,12 @@ class ClientTmuxRuntime:
         local_window_id = UUID(str(window_id))
         effective_cwd = cwd or os.getcwd()
         effective_shell = shell_command or self.default_shell
+        interactive_agent_command = (
+            agent_command_for_interactive_shell(shell_command)
+            if shell_command is not None
+            else None
+        )
+        window_shell = self.default_shell if interactive_agent_command is not None else effective_shell
         await self.ensure_pool()
         remote_window_id = (
             await self._run(
@@ -132,14 +142,45 @@ class ClientTmuxRuntime:
                     effective_cwd,
                     self.managed_shell_command(
                         local_window_id,
-                        effective_shell,
+                        window_shell,
                         project_path=effective_cwd,
                     ),
                 ]
             )
         ).strip()
         await self._ensure_pane_passthrough(f"{self.pool_session}:{remote_window_id}")
-        await self.select_window(remote_window_id)
+        try:
+            await self.select_window(remote_window_id)
+        except RuntimeError as exc:
+            if not _is_missing_tmux_window_error(exc, remote_window_id):
+                raise
+            interactive_agent_command = None
+            remote_window_id = (
+                await self._run(
+                    [
+                        "tmux",
+                        "new-window",
+                        "-P",
+                        "-F",
+                        "#{window_id}",
+                        "-t",
+                        self.pool_session,
+                        "-c",
+                        effective_cwd,
+                        self.managed_shell_command(
+                            local_window_id,
+                            self.default_shell,
+                            project_path=effective_cwd,
+                        ),
+                    ]
+                )
+            ).strip()
+            await self._ensure_pane_passthrough(f"{self.pool_session}:{remote_window_id}")
+            await self.select_window(remote_window_id)
+        if interactive_agent_command is not None:
+            await self._send_literal_command(
+                f"{self.pool_session}:{remote_window_id}", interactive_agent_command
+            )
         await self._run(
             [
                 "tmux",
@@ -170,6 +211,10 @@ class ClientTmuxRuntime:
             shell_command=effective_shell,
             managed_agent_tools=True,
         )
+
+    async def _send_literal_command(self, tmux_target: str, command: str) -> None:
+        await self._run(["tmux", "send-keys", "-l", "-t", tmux_target, "--", command])
+        await self._run(["tmux", "send-keys", "-t", tmux_target, "Enter"])
 
     async def recreate_window(
         self,
@@ -268,3 +313,11 @@ def _parse_uuid(value: str) -> UUID | None:
         return UUID(value)
     except ValueError:
         return None
+
+
+def _is_missing_tmux_window_error(exc: BaseException, remote_window_id: str) -> bool:
+    message = str(exc)
+    return (
+        f"can't find window: {remote_window_id}" in message
+        or re.search(r"can't find window: @\d+", message) is not None
+    )

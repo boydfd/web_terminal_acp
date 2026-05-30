@@ -88,7 +88,7 @@ export function TerminalQuickInput({
     () => filterCustomQuickKeys(normalizedQuickKeys, quickKeyQuery),
     [normalizedQuickKeys, quickKeyQuery]
   );
-  const canUseQuickKeys = normalizedQuickKeys.length > 0 && onCustomQuickKeySubmit !== undefined;
+  const canUseQuickKeys = onCustomQuickKeySubmit !== undefined;
   const canSubmit = canSend && localValue.length > 0;
 
   useEffect(() => {
@@ -134,9 +134,10 @@ export function TerminalQuickInput({
     <form
       className={[
         "terminal-quick-input-panel",
-        quickKeysOpen && canUseQuickKeys ? "terminal-quick-input-panel-expanded" : "",
+        quickKeysOpen ? "terminal-quick-input-panel-expanded" : "",
         className
       ].filter(Boolean).join(" ")}
+      data-onboarding-id="quick-input-panel"
       onMouseDown={(event) => event.stopPropagation()}
       onTouchStart={(event) => event.stopPropagation()}
       onSubmit={(event) => {

@@ -2,54 +2,69 @@
 
 # Web Terminal ACP
 
-A web-based control plane for **artifact-centric agent terminals**: run shells and AI coding agents in the browser, organize sessions in a virtual folder tree, ingest Claude/Codex/Cursor activity, and search everything with Elasticsearch-backed full-text search.
+Web Terminal ACP is a browser-based control plane for shell and AI coding agent work. It gives you tmux-backed terminals in the browser, a durable folder tree for long-running sessions, searchable terminal and agent history, and optional remote clients that connect back to the server over WebSocket.
 
-Built for operators who want a durable record of terminal work—not just a live PTY—without giving up tmux, Claude Code, Codex, or Cursor CLI on the host.
+It is built for teams and solo operators who want a persistent record of agent work without replacing the local tools they already use: shells, tmux, Claude Code, Codex, Cursor CLI, and OpenAI-compatible model endpoints.
 
-## What you get
+## Highlights
 
-- **Browser terminals** — `xterm.js` + FastAPI WebSocket bridge into tmux-backed shells
-- **Virtual folder tree** — group terminals by project, auto-suggested paths, manual moves
-- **Multi-client** — local runtime on the server plus optional **remote clients** over WebSocket (SSH bootstrap installs the agent on another machine)
-- **AI session ingest** — Claude Code JSONL watcher, Codex trace receiver, Cursor CLI adapter registry
-- **Summaries & search** — OpenAI-compatible LLM for titles/tags/summaries; Elasticsearch for terminal output and events
-- **Git worktree tracking** — OSC markers + UI for agent-linked worktrees (see `.cursor/skills/web-terminal-git-worktree`)
-- **Agent presence** — working/idle badges, desktop notifications, recent terminals, project-level summaries
-
-Authentication is **not** built into the MVP: bind locally and put Nginx (or another reverse proxy) in front for LAN/WAN access.
+- **Browser terminal workspace**: xterm.js terminal panes backed by tmux, with reconnectable sessions.
+- **Multi-client runtime**: use the server host directly, or register other machines as remote clients.
+- **Agent-aware records**: ingest Claude Code JSONL, Codex traces, Cursor adapter events, terminal output, and summaries.
+- **Search and summaries**: Elasticsearch indexes terminal output and agent events; an OpenAI-compatible API can generate titles, tags, summaries, and folder suggestions.
+- **Agent worktree tracking**: Web Terminal-managed shells expose `WEB_TERMINAL_WINDOW_ID` so coding agents can work in linked git worktrees and surface status in the UI.
+- **Direct remote-client registration**: generate a one-time token in Settings, then let the remote host pull its own install script and client bundle from the server.
 
 ## Architecture
 
 | Layer | Role |
-|-------|------|
-| **React UI** | Folder tree, terminal panes, search, client bootstrap, settings |
-| **FastAPI** | REST, WebSockets, tmux orchestration, ingest, summary workers |
-| **PostgreSQL** | Folders, virtual windows, clients, AI sessions, events, jobs |
-| **Elasticsearch** | Search index for terminal chunks, AI events, summaries |
-| **tmux** | Process host for shells and agent CLIs |
-| **client-agent** | Optional remote daemon (`python -m app.client_agent`) |
+| --- | --- |
+| React + Vite | Browser UI, terminals, settings, search, client registration |
+| FastAPI | REST API, WebSockets, tmux orchestration, auth, workers |
+| PostgreSQL | Folders, windows, clients, events, sessions, jobs |
+| Elasticsearch | Full-text search over terminal chunks, summaries, and agent events |
+| Redis | Fast state/cache support for UI polling and runtime paths |
+| tmux | Process host for local and remote shell sessions |
+| client-agent | Optional Python daemon installed on remote machines |
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the full product design.
+## Requirements
 
-## Prerequisites
+For the Web Terminal server:
 
-- [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/)
-- **tmux** on the host when running the backend outside Docker (Compose backend image includes tmux)
-- For summaries: any **OpenAI-compatible** HTTP API (Ollama, vLLM, cloud provider, etc.)
-- Optional: Claude Code / Codex / Cursor CLI installed and configured on the machine whose sessions you want to ingest
+- Docker Engine and Docker Compose v2.
+- Linux is the primary deployment target. macOS can run the stack for development, but host shell integration differs.
+- At least 4 GB RAM available for the app stack.
+- On Linux, Elasticsearch usually requires `vm.max_map_count >= 262144`.
+- Optional: an OpenAI-compatible API for generated summaries.
+- Optional: Claude Code, Codex, Cursor CLI, or other agent CLIs installed and authenticated on the machine where you want to run them.
 
-**Elasticsearch on Linux:** if the ES container fails to start, raise `vm.max_map_count` (e.g. `sudo sysctl -w vm.max_map_count=262144`). The Makefile prints a warning when it is too low.
+For a direct remote client:
 
-## Quick start (Docker Compose)
+- `bash`
+- `tmux`
+- `python3`
+- Python venv/ensurepip support. On Debian/Ubuntu this is usually `python3-venv`.
+- Network access from the remote host to the Web Terminal backend URL.
+- Optional: Codex / Claude Code / Cursor CLI installed on that remote host if you want to launch those tools there.
+
+The direct registration script checks these dependencies before installing. If a package is missing and the current user cannot install it, stop and ask the machine owner/admin to install it; do not bypass dependency checks with a partial install.
+
+## Quick Start With Docker
 
 ```bash
-git clone https://github.com/boydfd-machine/web_terminal_acp.git
+git clone https://github.com/boydfd/web_terminal_acp.git
 cd web_terminal_acp
 cp .env.example .env
-# Edit .env — at minimum set paths and OPENAI_COMPAT_* if you want summaries
 ```
 
-Build the heavy backend base image once (includes Node, Claude Code, Codex, acpx, Chromium for agent-browser):
+Edit `.env` before starting:
+
+- Set `WEB_TERMINAL_AUTH_SECRET` to a strong secret if the UI/API is reachable by anyone except you.
+- Set `WORKSPACE_DIR` to the host directory you want exposed inside Web Terminal as `/workspace`.
+- Set `OPENAI_COMPAT_BASE_URL`, `OPENAI_COMPAT_API_KEY`, and `OPENAI_COMPAT_MODEL` if you want generated summaries.
+- Review the mounted agent config directories (`~/.claude`, `~/.codex`, `~/.agents`, `~/.acpx`) because they can expose host credentials inside the backend container.
+
+Build and start:
 
 ```bash
 docker compose --profile build-base build backend-base
@@ -57,102 +72,187 @@ docker compose build
 docker compose up -d --wait
 ```
 
-Open the UI at **http://localhost:5173** (frontend). API health: **http://localhost:8001/healthz** (default published backend port).
+Open:
 
-### First-time data directories
+- UI: http://localhost:5173
+- API health: http://localhost:8001/healthz
 
-Compose uses named volumes for Postgres and Elasticsearch. For bind mounts under `./data` instead, use the Makefile:
+If Elasticsearch fails on Linux:
 
 ```bash
-make preflight/init   # creates ./data/postgres and ./data/elasticsearch
-make deploy-up
+sudo sysctl -w vm.max_map_count=262144
+docker compose up -d --wait elasticsearch
 ```
 
 ## Configuration
 
-Copy `.env.example` to `.env`. Important variables:
+Important `.env` values:
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | Async PostgreSQL URL | local Compose Postgres |
-| `ELASTICSEARCH_URL` | Elasticsearch base URL | `http://127.0.0.1:19201` |
-| `DEFAULT_SHELL` | Shell for new local terminals; `auto` uses the backend user's login shell | `auto` |
-| `CLAUDE_PROJECTS_DIR` | Claude Code projects root (JSONL ingest) | `~/.claude/projects` |
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `WEB_TERMINAL_AUTH_SECRET` | Enables built-in UI/API login when non-empty | empty |
+| `WEB_TERMINAL_AUTH_SESSION_TTL_SECONDS` | Login session lifetime | `604800` |
+| `BACKEND_PUBLISHED_PORT` | Backend host port | `8001` |
 | `WORKSPACE_DIR` | Host path mounted into backend as `/workspace` | `~/workspace` |
-| `OPENAI_COMPAT_BASE_URL` | Summarization API base | `http://127.0.0.1:11434/v1` |
-| `OPENAI_COMPAT_API_KEY` | API key for summarizer | `dev-local-key` |
-| `OPENAI_COMPAT_MODEL` | Model name | `local-summarizer` |
-| `BACKEND_PUBLISHED_PORT` | Host port for API | `8001` |
-| `VITE_API_BASE` | Frontend build-time fallback API origin; leave empty for Docker nginx proxying. Desktop builds can set the backend address at runtime in Settings. | empty |
+| `CLAUDE_PROJECTS_DIR` | Claude Code projects directory for JSONL ingest | `~/.claude/projects` |
+| `DEFAULT_SHELL` | Shell for new terminals; `auto` uses the runtime user's login shell | `auto` |
+| `OPENAI_COMPAT_BASE_URL` | OpenAI-compatible API base URL | `http://127.0.0.1:11434/v1` |
+| `OPENAI_COMPAT_API_KEY` | API key for summary generation | `dev-local-key` |
+| `OPENAI_COMPAT_MODEL` | Model used for generated summaries | `local-summarizer` |
+| `VITE_API_BASE` | Frontend build-time fallback API origin; leave empty for Docker nginx proxying | empty |
+| `VITE_ENABLE_ONBOARDING` | Frontend build-time switch for the new-user guide; set `true` to enable | empty |
 
-Agent tool configs are mounted from `~/.claude`, `~/.codex`, `~/.agents`, `~/.acpx` by default so in-container agents share your host credentials (adjust for your threat model).
+Do not commit `.env`. Before exposing the app beyond localhost, set `WEB_TERMINAL_AUTH_SECRET`, use strong database passwords, and put a TLS reverse proxy in front of the UI/backend.
 
-**Security:** never commit `.env`. Use strong Postgres passwords and proxy auth before exposing ports on a network.
+## Desktop App Builds
 
-## Local development (without full Docker app stack)
+Unsigned Electron packages can be built from the frontend project:
 
 ```bash
-# Terminal 1 — infra only
-make services-up
-
-# Terminal 2 — backend
-cd backend && uv sync && uv run alembic upgrade head
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-
-# Terminal 3 — frontend
-cd frontend && npm install && npm run dev -- --host 127.0.0.1
+cd frontend
+npm run electron:dist:win:portable
+npm run electron:dist:mac:zip
 ```
 
-Run tests:
+The desktop app defaults to `http://127.0.0.1:8001` for the backend. To connect it to a different server after launch, open **Settings** and set **Backend address** to the reachable backend URL. This runtime setting is stored locally by the desktop app, so release builds do not need a baked `VITE_API_BASE` for every deployment.
+
+## Install A Remote Client
+
+Remote clients let another machine host shells and agent CLIs while Web Terminal remains the control plane. There are two supported paths.
+
+### Option A: Direct Registration
+
+Use this when the remote host should install itself and you do not want the server to SSH into it.
+
+1. Start the Web Terminal server.
+2. Open the UI, then open **Settings** -> **Client registration**.
+3. Generate a one-time registration key.
+4. On the remote host, run the script shown in Settings.
+
+The command has this shape:
+
+```bash
+curl -fsSL http://your-server:8001/api/clients/register-script -o register-client-direct.sh
+chmod +x register-client-direct.sh
+WEB_TERMINAL_SERVER_URL=http://your-server:8001 \
+WEB_TERMINAL_REGISTRATION_KEY=wtr_xxx \
+./register-client-direct.sh
+```
+
+What the script does:
+
+- Verifies `bash`, `tmux`, `python3`, and Python venv/pip support.
+- Calls `POST /api/clients/register` with the one-time key.
+- Receives a generated client token, `config.json`, requirements, and a minimal Python client bundle.
+- Installs the client under `~/.web-terminal-acp` by default.
+- Creates a Python virtual environment and installs the returned requirements.
+- Starts `python -m app.client_agent` in a tmux session.
+
+Useful optional flags:
+
+```bash
+./register-client-direct.sh \
+  --server-url http://your-server:8001 \
+  --registration-key wtr_xxx \
+  --name build-host-1 \
+  --install-path ~/.web-terminal-acp
+```
+
+If the script exits with missing dependencies, install the named packages first. For example, on Debian/Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y bash tmux python3 python3-venv
+```
+
+If you do not have permission to install packages, ask an administrator to install them, then rerun the registration command. A remote client that cannot create its venv or run tmux is not considered installed.
+
+### Option B: SSH Bootstrap
+
+Use this when the Web Terminal server is allowed to SSH into the remote host.
+
+1. Open **Clients** -> **Bootstrap remote client** in the UI.
+2. Provide the SSH host, user, port, private key, optional passphrase, install path, and server URL.
+3. The backend connects over SSH, checks dependencies, writes the client config/bundle, installs requirements, and starts the remote client daemon.
+
+The same dependency rule applies: missing `tmux`, `python3`, or venv support must be installed on the remote host before bootstrap can complete.
+
+### Verify Remote Client Health
+
+On the remote host:
+
+```bash
+tmux ls | grep web_terminal_acp_client
+tail -n 100 ~/.web-terminal-acp/logs/client.log
+```
+
+In the UI, the client should appear as **ONLINE**. If it remains offline, check that the remote host can reach the backend URL and that the backend URL is the same URL the browser/server can use externally, not a container-only hostname.
+
+## Agent-Facing Setup Guide
+
+If you are asking an AI agent to install or operate this project, give it [AGENT_README.md](AGENT_README.md). That guide is intentionally procedural and interactive: it tells the agent to confirm Docker, ask whether this host should also become a remote client, generate the registration key through the UI/API, fetch the install script from the server, and stop for human package installation when it lacks permission.
+
+For agents changing this repository, see [AGENTS.md](AGENTS.md) for project-specific development rules and versioning requirements.
+
+## Local Development
+
+Run shared services:
+
+```bash
+make services-up
+```
+
+Run the backend:
+
+```bash
+cd backend
+uv sync
+uv run alembic upgrade head
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Run the frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev -- --host 127.0.0.1
+```
+
+Verification:
 
 ```bash
 make backend-test
-make frontend-build   # tsc + vite build
+make frontend-build
 ```
 
-## Remote client bootstrap
+## Project Layout
 
-1. Start the control plane (Compose or local backend).
-2. In the UI, open **Clients** → **Bootstrap remote client**.
-3. Provide SSH host/user/port, private key (and passphrase if needed), install path, and server URL.
-4. The server installs `~/.web-terminal-acp/config.json` and starts `client-agent` on the remote host over WebSocket.
-
-Remote machines need tmux, a Python runtime with venv/ensurepip support (for example `python3-venv` on Debian/Ubuntu), and network access back to your Web Terminal API. To run Codex or Claude Code from remote terminals, install those CLIs on the remote host in `PATH`; `~/.web-terminal-acp/npm-global/bin` is added automatically for user-local npm installs.
-
-## Agent git worktrees (Cursor / Claude / Codex)
-
-When `WEB_TERMINAL_WINDOW_ID` is set in a managed terminal, agents should use the bundled skill:
-
-`.cursor/skills/web-terminal-git-worktree`
-
-It creates `.web-terminal-acp/worktrees/<window-id>`, registers the worktree with the UI, and keeps edits off the main checkout.
-
-## Project layout
-
-```
+```text
 web_terminal_acp/
-├── backend/          # FastAPI, client-agent, migrations, tests
-├── frontend/         # React + Vite + xterm.js
-├── docs/DESIGN.md    # Product & data model design
-├── docker-compose.yml
-├── Makefile
-└── scripts/build-images.sh
+├── backend/              # FastAPI app, client-agent, migrations, tests
+├── frontend/             # React, Vite, xterm.js, Electron support
+├── scripts/              # Build/release/helper scripts
+├── docker-compose.yml    # Docker deployment stack
+├── Makefile              # Local service/test/deploy targets
+├── AGENT_README.md       # Operator guide for installation agents
+└── AGENTS.md             # Contributor/agent development rules
 ```
 
 ## Versioning
 
-Client protocol and UI version are kept in sync:
+Client protocol and UI version sources are kept in sync:
 
 - `backend/app/version.py`
 - `frontend/package.json`
 - `frontend/package-lock.json`
 
-Bump **PATCH** for fixes, **MINOR** for compatible features, **MAJOR** for breaking protocol or storage changes.
+Use SemVer:
+
+- `PATCH` for compatible fixes and documentation-only release updates.
+- `MINOR` for compatible features or behavior additions.
+- `MAJOR` for incompatible protocol, API, storage, or deployment changes.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-## Contributing
-
-Issues and PRs welcome. For development workflow notes aimed at coding agents, see [AGENTS.md](AGENTS.md).
+MIT. See [LICENSE](LICENSE).

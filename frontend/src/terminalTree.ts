@@ -24,6 +24,8 @@ export function windowActivityMap(
       work_status: item.work_status,
       runtime_tags: item.runtime_tags,
       last_agent_task_completed_at: item.last_agent_task_completed_at ?? null,
+      last_agent_task_status: item.last_agent_task_status ?? null,
+      last_agent_task_status_at: item.last_agent_task_status_at ?? null,
       git_worktree: item.git_worktree ?? null
     });
   }
@@ -35,6 +37,8 @@ export type WindowActivityRecord = {
   work_status: WorkStatus;
   runtime_tags: string[];
   last_agent_task_completed_at?: string | null;
+  last_agent_task_status?: "FINISHED" | "ABORTED" | null;
+  last_agent_task_status_at?: string | null;
   git_worktree?: import("./types").GitWorktreeActivity | null;
 };
 
@@ -53,6 +57,8 @@ export function mergeTreeWithActivity(
       work_status: activity.work_status,
       runtime_tags: activity.runtime_tags,
       last_agent_task_completed_at: activity.last_agent_task_completed_at ?? null,
+      last_agent_task_status: activity.last_agent_task_status ?? null,
+      last_agent_task_status_at: activity.last_agent_task_status_at ?? null,
       git_worktree: activity.git_worktree ?? null
     };
   };

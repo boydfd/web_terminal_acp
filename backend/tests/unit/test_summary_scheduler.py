@@ -347,21 +347,15 @@ async def test_agent_activity_scheduler_avoids_terminal_output_scans(counted_db_
     assert event_reads
     assert all(" OR " not in statement.upper() for statement in event_reads)
     assert all("terminal_output" not in statement for statement in event_reads)
-    assert all("source_type IN" not in statement for statement in event_reads)
-    source_row_reads = [
-        statement
-        for statement in event_reads
-        if "events.source_type = ?" in statement
-    ]
-    assert all("LIMIT" in statement.upper() for statement in source_row_reads)
     source_time_reads = [
         statement
         for statement in statements
         if "FROM events" in statement
         and "events.created_at" in statement
-        and "events.source_type = ?" in statement
+        and "events.source_type IN" in statement
     ]
-    assert all("LIMIT" in statement.upper() for statement in source_time_reads)
+    assert len(source_time_reads) == 1
+    assert "LIMIT" in source_time_reads[0].upper()
 
 
 @pytest.mark.asyncio
@@ -377,6 +371,64 @@ async def test_duplicate_agent_activity_does_not_advance_generation(db_session):
     assert second_job is not None
     assert window.agent_activity_generation == 1
     assert second_job.input_generation == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_completion_updates_window_activity_completion_state(db_session):
+    window = await create_window(db_session)
+    completed_at = datetime(2026, 5, 21, 12, 0, tzinfo=timezone.utc)
+    event = Event(
+        client_id=window.client_id,
+        source_type=EventSourceType.agent_tool_record,
+        source_id="codex-session-1",
+        kind="event_msg",
+        virtual_window_id=window.id,
+        payload_json={
+            "provider": "codex",
+            "raw_type": "event_msg",
+            "payload": {"type": "task_completed"},
+            "timestamp": completed_at.isoformat(),
+        },
+        fingerprint="agent-completion-window-state",
+        created_at=completed_at + timedelta(milliseconds=30),
+    )
+    db_session.add(event)
+    await db_session.flush()
+
+    await schedule_summary_after_agent_activity(db_session, window, event=event)
+
+    assert window.agent_activity_latest_at == completed_at
+    assert window.agent_activity_latest_completed_at == completed_at
+
+
+@pytest.mark.asyncio
+async def test_late_completion_updates_completion_state_without_rewinding_activity(db_session):
+    window = await create_window(db_session)
+    output_at = datetime(2026, 5, 21, 12, 0, 10, tzinfo=timezone.utc)
+    completed_at = output_at - timedelta(seconds=10)
+    window.agent_activity_latest_at = output_at
+    event = Event(
+        client_id=window.client_id,
+        source_type=EventSourceType.agent_tool_record,
+        source_id="codex-session-1",
+        kind="event_msg",
+        virtual_window_id=window.id,
+        payload_json={
+            "provider": "codex",
+            "raw_type": "event_msg",
+            "payload": {"type": "task_completed"},
+            "timestamp": completed_at.isoformat(),
+        },
+        fingerprint="agent-completion-window-state-late",
+        created_at=output_at + timedelta(milliseconds=30),
+    )
+    db_session.add(event)
+    await db_session.flush()
+
+    await schedule_summary_after_agent_activity(db_session, window, event=event)
+
+    assert window.agent_activity_latest_at == output_at
+    assert window.agent_activity_latest_completed_at == completed_at
 
 
 @pytest.mark.asyncio

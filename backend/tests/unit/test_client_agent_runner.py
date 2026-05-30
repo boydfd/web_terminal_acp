@@ -3,6 +3,7 @@ from uuid import UUID
 
 import pytest
 
+from app.services.agent_config import AgentConfig, AgentConfigItem, AgentConfigSection
 from app.client_agent.runner import _handle_agent_message, _should_restore_agent_tool_watcher
 from app.client_agent.tmux_runtime import ClientRuntimeWindow
 from app.services.runtime.protocol import AgentMessage
@@ -187,6 +188,53 @@ async def test_create_window_registers_existing_unified_agent_tool_watcher() -> 
 
 
 @pytest.mark.asyncio
+async def test_create_window_applies_agent_config_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    applied: list[tuple[str, str]] = []
+
+    def fake_apply(selection, *, window_id, home=None):
+        applied.append((selection.agent, window_id))
+        calls.append("apply_config")
+        return AgentConfig(agent=selection.agent, sections=[])
+
+    monkeypatch.setattr(
+        "app.client_agent.runner.agent_config_service.apply_agent_config_selection",
+        fake_apply,
+    )
+
+    await handle_message_for_test(
+        FakeWriter(),
+        FakeBulkWriter(),
+        object(),
+        FakeRuntime(calls),
+        FakeTerminal(calls),
+        FakeIdleSupervisor(calls),
+        FakeAgentToolWatcher(calls),
+        {},
+        {},
+        AgentMessage(
+            type="create_window",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            request_id="request-1",
+            payload={
+                "cwd": "/workspace/project",
+                "shell_command": "codex",
+                "agent_config_selection": {
+                    "agent": "codex",
+                    "sections": [
+                        {"id": "skills", "items": [{"id": "docker", "enabled": False}]}
+                    ],
+                },
+            },
+        ),
+    )
+
+    assert calls[:2] == ["apply_config", "create_window"]
+    assert applied == [("codex", str(WINDOW_ID))]
+
+
+@pytest.mark.asyncio
 async def test_kill_window_removes_window_from_unified_agent_tool_watcher_first() -> None:
     calls: list[str] = []
     terminal = FakeTerminal(calls)
@@ -308,6 +356,54 @@ async def test_terminal_select_window_recreates_missing_tmux_window_before_lates
     ]
     assert supervisor.resume_calls == [(WINDOW_ID, True)]
     assert writer.messages[-1].payload["remote_window_id"] == "@9"
+
+
+@pytest.mark.asyncio
+async def test_agent_config_get_returns_serialized_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    writer = FakeWriter()
+
+    def fake_list_agent_config(agent: str):
+        assert agent == "codex"
+        return AgentConfig(
+            agent="codex",
+            sections=[
+                AgentConfigSection(
+                    id="skills",
+                    name="Skills",
+                    items=[AgentConfigItem(id="docker", name="docker", enabled=True)],
+                ),
+                AgentConfigSection(id="plugins", name="Plugins", items=[]),
+                AgentConfigSection(id="hooks", name="Hooks", items=[]),
+            ],
+        )
+
+    monkeypatch.setattr(
+        "app.client_agent.runner.agent_config_service.list_agent_config",
+        fake_list_agent_config,
+    )
+
+    await handle_message_for_test(
+        writer,
+        FakeBulkWriter(),
+        object(),
+        FakeRuntime(),
+        FakeTerminal([]),
+        FakeIdleSupervisor([]),
+        FakeAgentToolWatcher([]),
+        {},
+        {},
+        AgentMessage(
+            type="agent_config_get",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            request_id="request-1",
+            payload={"agent": "codex"},
+        ),
+    )
+
+    assert writer.messages[-1].type == "agent_config_result"
+    assert writer.messages[-1].payload["agent"] == "codex"
+    assert writer.messages[-1].payload["sections"][0]["items"][0]["id"] == "docker"
 
 
 class FakeWriter:

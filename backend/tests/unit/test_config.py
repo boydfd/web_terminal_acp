@@ -15,7 +15,10 @@ SETTINGS_ENV_VARS = (
     "OPENAI_COMPAT_BASE_URL",
     "OPENAI_COMPAT_API_KEY",
     "OPENAI_COMPAT_MODEL",
+    "REDIS_URL",
     "SUMMARY_OUTPUT_LANGUAGE",
+    "WEB_TERMINAL_AUTH_SECRET",
+    "WEB_TERMINAL_AUTH_SESSION_TTL_SECONDS",
 )
 
 
@@ -116,3 +119,23 @@ def test_settings_accept_summary_output_language(monkeypatch):
     settings = Settings(_env_file=None)
 
     assert settings.summary_output_language == "English"
+
+
+def test_settings_accept_redis_url(monkeypatch):
+    clear_settings_env(monkeypatch)
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.redis_url == "redis://redis:6379/0"
+
+
+def test_settings_accept_auth_secret(monkeypatch):
+    clear_settings_env(monkeypatch)
+    monkeypatch.setenv("WEB_TERMINAL_AUTH_SECRET", "login-secret")
+    monkeypatch.setenv("WEB_TERMINAL_AUTH_SESSION_TTL_SECONDS", "30")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.web_terminal_auth_secret == "login-secret"
+    assert settings.web_terminal_auth_session_ttl_seconds == 30

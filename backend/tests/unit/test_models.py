@@ -23,6 +23,7 @@ from app.models import (
     SummaryJob,
     SummaryJobStatus,
     VirtualWindow,
+    WindowTitleHistory,
     WindowStatus,
 )
 from app.repositories.clients import hash_client_token
@@ -218,8 +219,11 @@ def test_metadata_schema_constraints_match_spec():
         ("events", ("ai_session_id",)),
         ("events", ("source_type", "source_id")),
         ("events", ("source_type", "created_at", "id")),
+        ("events", ("client_id", "virtual_window_id", "source_type", "created_at", "id")),
+        ("events", ("client_id", "virtual_window_id", "kind", "created_at", "id")),
         ("summary_jobs", ("virtual_window_id",)),
         ("summary_jobs", ("status", "run_after")),
+        ("window_title_history", ("client_id", "virtual_window_id", "created_at", "id")),
     }
     actual_indexes = {
         (table.name, tuple(index.columns.keys()))
@@ -227,6 +231,19 @@ def test_metadata_schema_constraints_match_spec():
         for index in table.indexes
     }
     assert expected_indexes <= actual_indexes
+    agent_activity_index = next(
+        index
+        for index in Event.__table__.indexes
+        if index.name == "ix_events_agent_activity_window_created"
+    )
+    assert tuple(agent_activity_index.columns.keys()) == (
+        "client_id",
+        "virtual_window_id",
+        "created_at",
+        "id",
+    )
+    assert agent_activity_index.dialect_options["postgresql"]["where"] is not None
+    assert agent_activity_index.dialect_options["sqlite"]["where"] is not None
 
     assert Client.__table__.c.status.server_default is not None
     assert Client.__table__.c.runtime.server_default is not None
@@ -238,10 +255,12 @@ def test_metadata_schema_constraints_match_spec():
     assert VirtualWindow.__table__.c.folder_manually_overridden.nullable is False
     assert VirtualWindow.__table__.c.agent_activity_latest_at.nullable is True
     assert VirtualWindow.__table__.c.agent_activity_latest_event_id.nullable is True
+    assert VirtualWindow.__table__.c.agent_activity_latest_completed_at.nullable is True
     assert VirtualWindow.__table__.c.agent_activity_burst_start_at.nullable is True
     assert VirtualWindow.__table__.c.agent_activity_generation.nullable is False
     assert AiSession.__table__.c.client_id.nullable is False
     assert Event.__table__.c.client_id.nullable is False
+    assert Base.metadata.tables["ui_settings"].c.value_json.nullable is False
 
     assert Folder.__table__.c.sort_order.server_default is not None
     assert VirtualWindow.__table__.c.status.server_default is not None
@@ -262,6 +281,11 @@ def test_metadata_schema_constraints_match_spec():
     assert SummaryJob.__table__.c.trigger_reason.nullable is True
     assert SummaryJob.__table__.c.run_after.nullable is True
     assert SummaryJob.__table__.c.run_after.server_default is None
+    assert WindowTitleHistory.__table__.c.client_id.nullable is False
+    assert WindowTitleHistory.__table__.c.virtual_window_id.nullable is False
+    assert WindowTitleHistory.__table__.c.title.nullable is False
+    assert WindowTitleHistory.__table__.c.summary.nullable is True
+    assert WindowTitleHistory.__table__.c.source.nullable is False
 
 
 def test_sqlite_create_all_persists_models_and_relationships():
@@ -305,7 +329,14 @@ def test_sqlite_create_all_persists_models_and_relationships():
             virtual_window=window,
             status=SummaryJobStatus.pending,
         )
-        session.add_all([folder, window, ai_session, event, job])
+        title_history = WindowTitleHistory(
+            client=client,
+            virtual_window=window,
+            title="Terminal-15:30",
+            summary="Initial summary.",
+            source="summary",
+        )
+        session.add_all([folder, window, ai_session, event, job, title_history])
         session.commit()
 
         assert client.id == LOCAL_CLIENT_ID
@@ -346,6 +377,13 @@ def test_sqlite_create_all_persists_models_and_relationships():
         assert loaded_job.allow_title_folder_override is False
         assert loaded_job.input_generation == 0
         assert loaded_job.virtual_window.title == "Terminal-15:30"
+        loaded_title_history = session.scalars(
+            select(WindowTitleHistory).where(WindowTitleHistory.virtual_window_id == loaded_window.id)
+        ).one()
+        assert loaded_title_history.client_id == loaded_window.client_id
+        assert loaded_title_history.title == "Terminal-15:30"
+        assert loaded_title_history.summary == "Initial summary."
+        assert loaded_title_history.source == "summary"
 
 
 def test_sqlite_folder_sibling_unique_constraint_rejects_duplicate_names():
@@ -477,6 +515,74 @@ def test_sqlite_alembic_migration_seeds_local_client_parent_row(tmp_path, monkey
         assert session.scalars(select(Client).where(Client.runtime == ClientRuntime.local)).all() == [
             session.get(Client, LOCAL_CLIENT_ID)
         ]
+
+
+def test_sqlite_alembic_migrated_schema_creates_ui_settings(tmp_path, monkeypatch):
+    database_path = tmp_path / "migrated-ui-settings.db"
+    database_url = f"sqlite+aiosqlite:///{database_path}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+
+    try:
+        config = Config(str(BACKEND_DIR / "alembic.ini"))
+        config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+        command.upgrade(config, "head")
+    finally:
+        get_settings.cache_clear()
+
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO ui_settings (key, value_json) VALUES (?, ?)",
+            ("custom_quick_keys", '{"quick_keys": []}'),
+        )
+        row = connection.exec_driver_sql(
+            "SELECT value_json FROM ui_settings WHERE key = ?",
+            ("custom_quick_keys",),
+        ).mappings().one()
+
+    assert row["value_json"] == '{"quick_keys": []}'
+
+
+def test_sqlite_alembic_migrated_schema_creates_window_title_history(tmp_path, monkeypatch):
+    database_path = tmp_path / "migrated-title-history.db"
+    database_url = f"sqlite+aiosqlite:///{database_path}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+
+    try:
+        config = Config(str(BACKEND_DIR / "alembic.ini"))
+        config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+        command.upgrade(config, "head")
+    finally:
+        get_settings.cache_clear()
+
+    window_id = _uuid_hex()
+    history_id = _uuid_hex()
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    with engine.begin() as connection:
+        _insert_valid_window(connection, window_id)
+        connection.exec_driver_sql(
+            "INSERT INTO window_title_history "
+            "(id, client_id, virtual_window_id, title, summary, source) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                history_id,
+                LOCAL_CLIENT_ID.hex,
+                window_id,
+                "Terminal-15:30",
+                "Initial summary.",
+                "summary",
+            ),
+        )
+        row = connection.exec_driver_sql(
+            "SELECT title, summary, source FROM window_title_history WHERE id = ?",
+            (history_id,),
+        ).mappings().one()
+
+    assert row["title"] == "Terminal-15:30"
+    assert row["summary"] == "Initial summary."
+    assert row["source"] == "summary"
 
 
 def test_sqlite_alembic_migrated_schema_scopes_event_fingerprints_by_client(tmp_path, monkeypatch):

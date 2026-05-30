@@ -13,6 +13,7 @@ import websockets
 
 from app.client_agent.agent_tool_watchers import UnifiedAgentToolWatcher
 from app.client_agent.agent_idle import AgentIdleSupervisor
+from app.services import agent_config as agent_config_service
 from app.client_agent.git_worktree import handle_git_worktree_request
 from app.client_agent.config import ClientAgentConfig
 from app.client_agent.outbound import BulkUploadWriter, ControlMessageWriter
@@ -318,6 +319,38 @@ async def _heartbeat_loop(writer: ControlMessageWriter, client_id: UUID) -> None
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
+def _agent_config_selection_from_payload(value: object) -> agent_config_service.AgentConfigSelection | None:
+    if not isinstance(value, dict):
+        return None
+    agent = value.get("agent")
+    if not isinstance(agent, str):
+        return None
+    sections: list[agent_config_service.AgentConfigSectionSelection] = []
+    raw_sections = value.get("sections")
+    if isinstance(raw_sections, list):
+        for raw_section in raw_sections:
+            if not isinstance(raw_section, dict):
+                continue
+            section_id = raw_section.get("id")
+            if section_id not in {"skills", "plugins", "hooks"}:
+                continue
+            items: list[agent_config_service.AgentConfigItemSelection] = []
+            raw_items = raw_section.get("items")
+            if isinstance(raw_items, list):
+                for raw_item in raw_items:
+                    if not isinstance(raw_item, dict):
+                        continue
+                    item_id = raw_item.get("id")
+                    enabled = raw_item.get("enabled")
+                    if isinstance(item_id, str) and item_id and isinstance(enabled, bool):
+                        items.append(agent_config_service.AgentConfigItemSelection(item_id, enabled))
+            sections.append(agent_config_service.AgentConfigSectionSelection(section_id, items))
+    return agent_config_service.AgentConfigSelection(
+        agent=agent_config_service.normalize_agent_kind(agent),
+        sections=sections,
+    )
+
+
 
 async def _handle_agent_message(
     control_writer: ControlMessageWriter,
@@ -354,6 +387,14 @@ async def _handle_agent_message(
             "client-agent create_window started",
             extra={"client_id": str(message.client_id), "window_id": str(window_id)},
         )
+        agent_config_selection = _agent_config_selection_from_payload(
+            message.payload.get("agent_config_selection")
+        )
+        if agent_config_selection is not None:
+            agent_config_service.apply_agent_config_selection(
+                agent_config_selection,
+                window_id=str(window_id),
+            )
         project_path = _optional_payload_string(message, "cwd")
         runtime_window = await runtime.create_window(
             window_id,
@@ -564,7 +605,67 @@ async def _handle_agent_message(
         task.add_done_callback(git_worktree_tasks.discard)
         return False
 
+    if message.type == "agent_config_get":
+        agent = _required_payload_string(message, "agent")
+        await control_writer.send(
+            AgentMessage(
+                type="agent_config_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload=_agent_config_payload(agent_config_service.list_agent_config(agent)),
+            )
+        )
+        return False
+
+    if message.type == "agent_config_set_enabled":
+        agent = _required_payload_string(message, "agent")
+        section_id = _required_payload_string(message, "section_id")
+        item_id = _required_payload_string(message, "item_id")
+        enabled = message.payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("agent config enabled must be a boolean")
+        await control_writer.send(
+            AgentMessage(
+                type="agent_config_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload=_agent_config_payload(
+                    agent_config_service.set_agent_config_item_enabled(
+                        agent,
+                        section_id,
+                        item_id,
+                        enabled,
+                    )
+                ),
+            )
+        )
+        return False
+
     return False
+
+
+def _agent_config_payload(config: agent_config_service.AgentConfig) -> dict[str, object]:
+    return {
+        "agent": config.agent,
+        "sections": [
+            {
+                "id": section.id,
+                "name": section.name,
+                "items": [
+                    {
+                        "id": item.id,
+                        "name": item.name,
+                        "enabled": item.enabled,
+                        "path": item.path,
+                    }
+                    for item in section.items
+                ],
+            }
+            for section in config.sections
+        ],
+    }
 
 
 async def _handle_git_worktree_request_job(

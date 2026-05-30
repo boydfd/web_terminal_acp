@@ -11,9 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 from app.config import get_settings
+from app.auth import AuthMiddleware
 from app.db import SessionLocal
 from app.repositories.clients import ensure_local_client
 from app.routers import (
+    auth,
     client_agent,
     clients,
     folders,
@@ -22,6 +24,7 @@ from app.routers import (
     project_summaries,
     terminal_recents,
     traces,
+    ui_settings,
     ui_events,
     windows,
 )
@@ -116,6 +119,7 @@ app = FastAPI(title="Web Terminal ACP", version=__version__, lifespan=lifespan)
 app.state.client_connections = ClientConnectionRegistry()
 app.state.ui_event_hub = UiEventHub()
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(AuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
@@ -124,6 +128,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(auth.router)
 app.include_router(client_agent.router)
 app.include_router(clients.router)
 app.include_router(folders.router)
@@ -133,6 +138,7 @@ app.include_router(terminal_recents.router)
 app.include_router(terminal.router)
 app.include_router(search.router)
 app.include_router(traces.router)
+app.include_router(ui_settings.router)
 app.include_router(ui_events.router)
 
 

@@ -29,6 +29,7 @@ export function BootstrapClientForm({ isSubmitting, onCancel, onSubmit }: Bootst
   return (
     <form
       className="bootstrap-form"
+      data-onboarding-id="remote-bootstrap-form"
       onSubmit={(event) => {
         event.preventDefault();
         onSubmit({
@@ -43,6 +44,9 @@ export function BootstrapClientForm({ isSubmitting, onCancel, onSubmit }: Bootst
       }}
     >
       <h2>Add client</h2>
+      <p className="muted">
+        SSH bootstrap connects to the target host once, uploads the remote client, and registers it automatically.
+      </p>
       <label htmlFor="bootstrap-client-name">Name</label>
       <input
         id="bootstrap-client-name"

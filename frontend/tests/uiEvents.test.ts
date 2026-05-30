@@ -4,6 +4,7 @@ import {
   applyUiInvalidation,
   nextUiEventReconnectDelay,
   parseUiEvent,
+  reserveWindowActivityRefresh,
   queryKeysForUiInvalidation,
   scheduleWindowActivityRefresh
 } from "../src/uiEvents";
@@ -11,10 +12,10 @@ import {
 const invalidateEvent = {
   type: "invalidate" as const,
   seq: 42,
-  resources: ["window", "tree", "agent_record", "command_history", "git_runs"],
+  resources: ["window", "tree", "agent_record", "command_history", "title_history", "git_runs"],
   client_id: "client-1",
   window_id: "window-1",
-  reason: "ai_event"
+  reason: "window_updated"
 };
 
 describe("parseUiEvent", () => {
@@ -35,9 +36,20 @@ describe("queryKeysForUiInvalidation", () => {
       ["window-activity", "client-1"],
       ["window", "client-1", "window-1"],
       ["command-history", "client-1", "window-1"],
+      ["title-history", "client-1", "window-1"],
       ["agent-record", "chat", "client-1", "window-1"],
       ["agent-record", "detail", "client-1", "window-1"],
       ["git-runs", "client-1", "window-1"]
+    ]);
+  });
+
+  it("does not immediately refetch activity for activity-only window events", () => {
+    expect(queryKeysForUiInvalidation({
+      ...invalidateEvent,
+      resources: ["window"],
+      reason: "terminal_output"
+    })).toEqual([
+      ["window", "client-1", "window-1"]
     ]);
   });
 });
@@ -57,6 +69,23 @@ describe("applyUiInvalidation", () => {
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["clients"] });
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["window-activity", "client-1"] });
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps activity-only invalidations from refetching active activity queries immediately", () => {
+    const queryClient = {
+      invalidateQueries: vi.fn()
+    };
+
+    applyUiInvalidation(queryClient as never, {
+      ...invalidateEvent,
+      resources: ["window"],
+      reason: "ai_event"
+    });
+
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["window", "client-1", "window-1"]
+    });
+    expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -79,6 +108,26 @@ describe("scheduleWindowActivityRefresh", () => {
     });
     expect(onComplete).toHaveBeenCalledWith(timer);
     vi.useRealTimers();
+  });
+});
+
+describe("reserveWindowActivityRefresh", () => {
+  it("rate limits high-frequency activity invalidations by client", () => {
+    const lastRefreshAtByClient = new Map<string, number>();
+
+    expect(reserveWindowActivityRefresh(invalidateEvent, lastRefreshAtByClient, 10_000)).toBe(true);
+    expect(reserveWindowActivityRefresh(invalidateEvent, lastRefreshAtByClient, 11_000)).toBe(false);
+    expect(reserveWindowActivityRefresh(invalidateEvent, lastRefreshAtByClient, 13_000)).toBe(true);
+  });
+
+  it("ignores events that cannot affect window activity", () => {
+    const lastRefreshAtByClient = new Map<string, number>();
+
+    expect(reserveWindowActivityRefresh({
+      ...invalidateEvent,
+      resources: ["clients"],
+    }, lastRefreshAtByClient, 10_000)).toBe(false);
+    expect(lastRefreshAtByClient.size).toBe(0);
   });
 });
 

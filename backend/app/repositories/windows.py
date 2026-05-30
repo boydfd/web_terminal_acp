@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import delete as sa_delete
+from sqlalchemy import desc, func as sa_func
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +18,7 @@ from app.models import (
     TerminalRecentUsage,
     VirtualWindow,
     WindowGitBinding,
+    WindowTitleHistory,
     WindowStatus,
 )
 from app.repositories.folders import ensure_default_folder, prune_empty_folder_branch
@@ -32,6 +34,81 @@ _UNSET = object()
 def fallback_terminal_title(now: datetime | None = None) -> str:
     timestamp = now or datetime.now()
     return f"Terminal-{timestamp:%H:%M}"
+
+
+def _should_record_title_history(
+    window: VirtualWindow,
+    *,
+    title: str | None | object,
+    summary: str | None | object,
+) -> bool:
+    next_title = window.title if title is _UNSET or title is None else title
+    next_summary = window.summary if summary is _UNSET else summary
+    return next_title != window.title or next_summary != window.summary
+
+
+async def record_window_title_history(
+    session: AsyncSession,
+    window: VirtualWindow,
+    *,
+    source: str,
+) -> WindowTitleHistory:
+    history = WindowTitleHistory(
+        client_id=window.client_id,
+        virtual_window_id=window.id,
+        title=window.title,
+        summary=window.summary,
+        source=source,
+        created_at=datetime.now(UTC),
+    )
+    session.add(history)
+    await session.flush()
+    return history
+
+
+async def _window_title_history_exists(session: AsyncSession, window: VirtualWindow) -> bool:
+    history_id = await session.scalar(
+        select(WindowTitleHistory.id)
+        .where(
+            WindowTitleHistory.client_id == window.client_id,
+            WindowTitleHistory.virtual_window_id == window.id,
+        )
+        .limit(1)
+    )
+    return history_id is not None
+
+
+async def _record_baseline_title_history_if_missing(
+    session: AsyncSession,
+    window: VirtualWindow,
+) -> None:
+    if not await _window_title_history_exists(session, window):
+        await record_window_title_history(session, window, source="baseline")
+
+
+async def list_window_title_history(
+    session: AsyncSession,
+    client_id: UUID,
+    window_id: UUID,
+    *,
+    limit: int,
+    offset: int,
+) -> tuple[list[WindowTitleHistory], int]:
+    filters = (
+        WindowTitleHistory.client_id == client_id,
+        WindowTitleHistory.virtual_window_id == window_id,
+    )
+    total = await session.scalar(select(sa_func.count()).select_from(WindowTitleHistory).where(*filters))
+    items = list(
+        await session.scalars(
+            select(WindowTitleHistory)
+            .where(*filters)
+            .order_by(desc(WindowTitleHistory.created_at), desc(WindowTitleHistory.id))
+            .offset(offset)
+            .limit(limit)
+        )
+    )
+    return items, int(total or 0)
 
 
 async def create_window(
@@ -61,6 +138,7 @@ async def create_window(
     )
     session.add(window)
     await session.flush()
+    await record_window_title_history(session, window, source="initial")
     return window
 
 
@@ -105,10 +183,18 @@ async def patch_window(
     status: str | None | object = _UNSET,
     summary: str | None | object = _UNSET,
     title_tags: list[str] | None | object = _UNSET,
+    title_history_source: str = "manual",
 ) -> VirtualWindow | None:
     window = await get_window_for_client(session, client_id, window_id)
     if window is None:
         return None
+    record_history = _should_record_title_history(
+        window,
+        title=title,
+        summary=summary,
+    )
+    if record_history:
+        await _record_baseline_title_history_if_missing(session, window)
 
     if folder_id is not _UNSET:
         if folder_id is None:
@@ -136,6 +222,8 @@ async def patch_window(
         window.title_tags = title_tags
 
     await session.flush()
+    if record_history:
+        await record_window_title_history(session, window, source=title_history_source)
     return window
 
 
@@ -183,6 +271,9 @@ async def delete_window(
     await session.execute(sa_delete(SummaryJob).where(SummaryJob.virtual_window_id == window_id))
     await session.execute(
         sa_delete(TerminalRecentUsage).where(TerminalRecentUsage.window_id == window_id)
+    )
+    await session.execute(
+        sa_delete(WindowTitleHistory).where(WindowTitleHistory.virtual_window_id == window_id)
     )
     await session.execute(
         sa_delete(WindowGitBinding).where(WindowGitBinding.virtual_window_id == window_id)

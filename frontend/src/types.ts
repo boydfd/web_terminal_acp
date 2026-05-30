@@ -34,6 +34,22 @@ export type BootstrapClientResult = {
   reused: boolean;
 };
 
+export type AuthStatus = {
+  enabled: boolean;
+};
+
+export type LoginResult = {
+  token: string;
+  enabled: boolean;
+};
+
+export type ClientRegistrationKeyResult = {
+  id: string;
+  key: string;
+  label: string | null;
+  created_at: string | null;
+};
+
 export type ClientUpdateResult = {
   client_id: string;
   job_id: string;
@@ -42,9 +58,9 @@ export type ClientUpdateResult = {
 };
 
 export type WorkStatus = {
-  state: "LONG_IDLE" | "RECENT_ACTIVE" | "WORKING";
+  state: "LONG_IDLE" | "RECENT_ACTIVE" | "WORKING" | "FINISHED" | "ABORTED";
   label: string;
-  color: "gray" | "green" | "orange";
+  color: "gray" | "green" | "orange" | "red";
   last_activity_at?: string | null;
   last_working_activity_at?: string | null;
 };
@@ -68,6 +84,8 @@ export type WindowActivity = {
   work_status: WorkStatus;
   runtime_tags: string[];
   last_agent_task_completed_at?: string | null;
+  last_agent_task_status?: "FINISHED" | "ABORTED" | null;
+  last_agent_task_status_at?: string | null;
   git_worktree?: GitWorktreeActivity | null;
 };
 
@@ -196,6 +214,9 @@ export type VirtualWindow = {
   command_capture_supported: boolean;
   summary_job: SummaryJob | null;
   created_at: string;
+  last_terminal_command_at: string | null;
+  last_agent_event_at: string | null;
+  last_active_at: string;
 };
 
 export type AgentSession = {
@@ -265,6 +286,48 @@ export type AgentChatRecord = {
   messages_has_more: boolean;
 };
 
+export type AgentConfigItem = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  path: string | null;
+};
+
+export type AgentConfigSection = {
+  id: "skills" | "plugins" | "hooks";
+  name: string;
+  items: AgentConfigItem[];
+};
+
+export type AgentConfig = {
+  agent: "codex" | "claude" | "cursor";
+  sections: AgentConfigSection[];
+};
+
+export type AgentLaunchKind = AgentConfig["agent"];
+
+export type AgentConfigSelectionItem = {
+  id: string;
+  enabled: boolean;
+};
+
+export type AgentConfigSelectionSection = {
+  id: AgentConfigSection["id"];
+  items: AgentConfigSelectionItem[];
+};
+
+export type AgentConfigSelection = {
+  agent: AgentLaunchKind;
+  sections: AgentConfigSelectionSection[];
+};
+
+export type AgentLaunchConfig = {
+  agent: AgentLaunchKind;
+  command?: string | null;
+  config?: AgentConfigSelection | null;
+  template_id?: string | null;
+};
+
 export type CommandHistoryItem = {
   id: string;
   command: string;
@@ -284,6 +347,23 @@ export type CommandHistory = {
   commands_limit: number;
   commands_offset: number;
   commands_has_more: boolean;
+};
+
+export type WindowTitleHistoryItem = {
+  id: string;
+  title: string;
+  summary: string | null;
+  source: string;
+  created_at: string;
+};
+
+export type WindowTitleHistory = {
+  window_id: string;
+  items: WindowTitleHistoryItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
 };
 
 export type SearchResultSource = {

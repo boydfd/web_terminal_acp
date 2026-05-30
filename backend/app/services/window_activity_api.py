@@ -10,6 +10,7 @@ from sqlalchemy.orm import load_only
 from app.models import VirtualWindow
 from app.repositories.git_worktree import list_window_git_bindings, pending_commit_window_ids
 from app.schemas import ClientWindowsActivityOut, GitWorktreeActivityOut, WindowActivityOut
+from app.services import cache_backend
 from app.services.terminal_work_status import (
     load_tree_window_activity,
     long_idle_work_status,
@@ -18,16 +19,23 @@ from app.services.terminal_work_status import (
 from app.services.window_runtime_tags import runtime_tags_for_window
 
 _ACTIVITY_CACHE_TTL_SECONDS = 10.0
+_ACTIVITY_CACHE_REDIS_TTL_SECONDS = 60
 _activity_cache: dict[tuple[UUID, bool, tuple[UUID, ...]], tuple[float, ClientWindowsActivityOut]] = {}
 
 
 def clear_client_windows_activity_cache(client_id: UUID | None = None) -> None:
     if client_id is None:
         _activity_cache.clear()
+        cache_backend.clear_namespace("window-activity")
         return
     stale_keys = [key for key in _activity_cache if key[0] == client_id]
     for key in stale_keys:
         _activity_cache.pop(key, None)
+    cache_backend.delete_indexed(
+        "window-activity",
+        {"client-window-activity"},
+        client_id=str(client_id),
+    )
 
 
 async def load_client_windows_activity(
@@ -54,6 +62,9 @@ async def load_client_windows_activity(
     cached = _activity_cache.get(cache_key)
     if cached is not None and now - cached[0] <= _ACTIVITY_CACHE_TTL_SECONDS:
         return cached[1]
+    redis_cached = _redis_activity_cache(cache_key)
+    if redis_cached is not None and now - redis_cached[0] <= _ACTIVITY_CACHE_TTL_SECONDS:
+        return redis_cached[1]
 
     activity = await load_tree_window_activity(
         session,
@@ -86,6 +97,7 @@ async def load_client_windows_activity(
         else:
             runtime_tags = runtime_tags_for_window(window)
         git_worktree = git_worktrees.get(window_id)
+        agent_task_status = activity.last_agent_task_status.get(window_id)
         items.append(
             WindowActivityOut(
                 window_id=window_id,
@@ -94,11 +106,16 @@ async def load_client_windows_activity(
                 last_agent_task_completed_at=activity.last_agent_task_completed_at.get(
                     window_id
                 ),
+                last_agent_task_status=agent_task_status.state if agent_task_status is not None else None,
+                last_agent_task_status_at=(
+                    agent_task_status.occurred_at if agent_task_status is not None else None
+                ),
                 git_worktree=git_worktree,
             )
         )
     result = ClientWindowsActivityOut(windows=items)
-    _activity_cache[cache_key] = (now, result)
+    if not _store_redis_activity_cache(cache_key, now, result):
+        _activity_cache[cache_key] = (now, result)
     return result
 
 
@@ -123,3 +140,38 @@ async def _load_git_worktree_activity(
         )
         for binding in bindings
     }
+
+
+def _redis_activity_cache(
+    cache_key: tuple[UUID, bool, tuple[UUID, ...]],
+) -> tuple[float, ClientWindowsActivityOut] | None:
+    cached = cache_backend.get_json("window-activity", cache_key)
+    if cached is None:
+        return None
+    try:
+        cached_at = float(cached["created_at"])
+        payload = cached["payload"]
+        return cached_at, ClientWindowsActivityOut.model_validate(payload)
+    except (KeyError, TypeError, ValueError):
+        cache_backend.delete_keys([cache_backend.cache_key("window-activity", cache_key)])
+        return None
+
+
+def _store_redis_activity_cache(
+    cache_key: tuple[UUID, bool, tuple[UUID, ...]],
+    created_at: float,
+    payload: ClientWindowsActivityOut,
+) -> bool:
+    client_id = cache_key[0]
+    return cache_backend.set_indexed_json(
+        "window-activity",
+        cache_key,
+        {
+            "created_at": created_at,
+            "client_id": str(client_id),
+            "payload": payload.model_dump(mode="json"),
+        },
+        resources=frozenset({"client-window-activity"}),
+        client_id=str(client_id),
+        ttl_seconds=_ACTIVITY_CACHE_REDIS_TTL_SECONDS,
+    )

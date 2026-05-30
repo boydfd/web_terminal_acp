@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { fetchProjectSummaries, fetchTerminalRecents, summarizeProject } from "../api";
 import type { SummaryOutputLanguage } from "../userPreferences";
+import { keyboardShortcutMatches, type KeyboardShortcut } from "../keyboardShortcuts";
 import {
   buildTerminalSwitcherTree,
   canCreateWindowAtGroupNode,
@@ -24,10 +25,10 @@ const AGENT_TAG_LABELS: Record<string, string> = {
 };
 
 const TERMINAL_GROUPING_DESCRIPTIONS: Record<TerminalGroupingMode, string> = {
-  "project-topic": "按项目 / 主题浏览 · 项目分组可点击「总结」生成名称 · Alt+W 查看最近",
-  "topic": "按主题浏览 · Alt+W 查看最近使用的终端",
-  "time-topic": "按时间 / 主题 / 子主题浏览 · Alt+W 查看最近使用的终端",
-  "project-time-topic": "按项目 / 时间 / 主题 / 子主题浏览 · 项目分组可点击「总结」生成名称 · Alt+W 查看最近"
+  "project-topic": "按项目 / 主题浏览 · 项目分组可点击「总结」生成名称",
+  "topic": "按主题浏览",
+  "time-topic": "按时间 / 主题 / 子主题浏览",
+  "project-time-topic": "按项目 / 时间 / 主题 / 子主题浏览 · 项目分组可点击「总结」生成名称"
 };
 
 export type TerminalSwitcherMode = "recent" | "tree";
@@ -63,14 +64,12 @@ type TerminalSwitcherProps = {
   onClose: () => void;
   onSelectWindow: (windowId: string) => void;
   onCreateTerminalAtGroup?: (node: SwitcherGroupNode) => void;
+  onConfigureTerminalAtGroup?: (node: SwitcherGroupNode) => void;
   creatingTerminal?: boolean;
   createTerminalDisabled?: boolean;
+  switchShortcut?: KeyboardShortcut | null;
+  switchShortcutLabel?: string;
 };
-
-function isTerminalSwitcherShortcut(event: KeyboardEvent): boolean {
-  const key = event.key.toLocaleLowerCase();
-  return event.altKey && !event.ctrlKey && !event.metaKey && (event.code === "KeyW" || key === "w" || event.keyCode === 87);
-}
 
 function recentItemKey(windowId: string): string {
   return `recent:${windowId}`;
@@ -231,6 +230,7 @@ function SwitcherTreeNode({
   onToggleGroup,
   onSummarizeProject,
   onCreateTerminalAtGroup,
+  onConfigureTerminalAtGroup,
   creatingTerminal,
   createTerminalDisabled
 }: {
@@ -245,6 +245,7 @@ function SwitcherTreeNode({
   onToggleGroup: (key: string) => void;
   onSummarizeProject?: (projectPath: string) => void;
   onCreateTerminalAtGroup?: (node: SwitcherGroupNode) => void;
+  onConfigureTerminalAtGroup?: (node: SwitcherGroupNode) => void;
   creatingTerminal?: boolean;
   createTerminalDisabled?: boolean;
 }) {
@@ -327,6 +328,21 @@ function SwitcherTreeNode({
             +
           </button>
         )}
+        {showCreateTerminal && onConfigureTerminalAtGroup && (
+          <button
+            type="button"
+            className="switcher-configure-terminal-button"
+            disabled={creatingTerminal || createTerminalDisabled}
+            aria-label={`配置 ${createLabel} 新终端`}
+            title={`配置 ${createLabel} 新终端`}
+            onClick={(event) => {
+              event.stopPropagation();
+              onConfigureTerminalAtGroup(node);
+            }}
+          >
+            配置
+          </button>
+        )}
       </div>
       {isExpanded && (
         <ul role="group">
@@ -344,6 +360,7 @@ function SwitcherTreeNode({
               onToggleGroup={onToggleGroup}
               onSummarizeProject={onSummarizeProject}
               onCreateTerminalAtGroup={onCreateTerminalAtGroup}
+              onConfigureTerminalAtGroup={onConfigureTerminalAtGroup}
               creatingTerminal={creatingTerminal}
               createTerminalDisabled={createTerminalDisabled}
             />
@@ -366,8 +383,11 @@ export function TerminalSwitcher({
   onClose,
   onSelectWindow,
   onCreateTerminalAtGroup,
+  onConfigureTerminalAtGroup,
   creatingTerminal,
-  createTerminalDisabled
+  createTerminalDisabled,
+  switchShortcut,
+  switchShortcutLabel = "快捷键"
 }: TerminalSwitcherProps) {
   const queryClient = useQueryClient();
   const [query, setQuery] = useState("");
@@ -504,7 +524,7 @@ export function TerminalSwitcher({
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (isTerminalSwitcherShortcut(event)) {
+      if (keyboardShortcutMatches(event, switchShortcut ?? null)) {
         return;
       }
 
@@ -606,6 +626,7 @@ export function TerminalSwitcher({
     onClose,
     onSelectWindow,
     isRecentMode,
+    switchShortcut,
     visibleTreeItems
   ]);
 
@@ -647,6 +668,7 @@ export function TerminalSwitcher({
       <div
         aria-modal="true"
         className="terminal-switcher"
+        data-onboarding-id="terminal-switcher"
         role="dialog"
       >
         <div className="terminal-switcher-header">
@@ -654,8 +676,8 @@ export function TerminalSwitcher({
             <h2>Switch terminal</h2>
             <p className="muted">
               {isRecentMode
-                ? "最近使用的终端 · Alt+W 按项目/主题浏览"
-                : TERMINAL_GROUPING_DESCRIPTIONS[terminalGroupingMode]}
+                ? `最近使用的终端 · ${switchShortcutLabel} 按项目/主题浏览`
+                : `${TERMINAL_GROUPING_DESCRIPTIONS[terminalGroupingMode]} · ${switchShortcutLabel} 查看最近`}
             </p>
           </div>
           <button type="button" onClick={onClose}>
@@ -773,6 +795,7 @@ export function TerminalSwitcher({
                     : undefined
                 }
                 onCreateTerminalAtGroup={onCreateTerminalAtGroup}
+                onConfigureTerminalAtGroup={onConfigureTerminalAtGroup}
                 creatingTerminal={creatingTerminal}
                 createTerminalDisabled={createTerminalDisabled}
               />

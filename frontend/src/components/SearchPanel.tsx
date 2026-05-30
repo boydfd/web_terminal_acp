@@ -37,7 +37,7 @@ export function SearchPanel({ clientId, onSelectWindowId }: SearchPanelProps) {
 
   if (clientId === null) {
     return (
-      <section className="search-panel" aria-labelledby="artifact-search-heading">
+      <section className="search-panel" aria-labelledby="artifact-search-heading" data-onboarding-id="artifact-search">
         <h2 id="artifact-search-heading">Artifact search</h2>
         <p className="muted">Select a client to search artifacts.</p>
       </section>
@@ -45,7 +45,7 @@ export function SearchPanel({ clientId, onSelectWindowId }: SearchPanelProps) {
   }
 
   return (
-    <section className="search-panel" aria-labelledby="artifact-search-heading">
+    <section className="search-panel" aria-labelledby="artifact-search-heading" data-onboarding-id="artifact-search">
       <h2 id="artifact-search-heading">Artifact search</h2>
       <form
         className="search-form"

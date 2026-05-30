@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.models import Client
+from app.routers.ui_events import ui_event_hub_from_state
 from app.repositories.clients import get_client
 from app.repositories.terminal_recents import (
     DEFAULT_TERMINAL_RECENTS_PAGE_SIZE,
@@ -60,6 +61,7 @@ async def get_terminal_recents(
 
 @router.post("/{client_id}/terminal-recents", response_model=TerminalRecentOut)
 async def record_terminal_recent(
+    request: Request,
     client_id: UUID,
     payload: TerminalRecentTouchIn,
     session: AsyncSession = Depends(get_session),
@@ -74,6 +76,12 @@ async def record_terminal_recent(
     if usage is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="window not found")
     await session.commit()
+    await ui_event_hub_from_state(request.app.state).publish_invalidation(
+        ["window"],
+        client_id=client_id,
+        window_id=payload.window_id,
+        reason="terminal_recent",
+    )
     return TerminalRecentOut(
         window_id=usage.window_id,
         title=usage.title,

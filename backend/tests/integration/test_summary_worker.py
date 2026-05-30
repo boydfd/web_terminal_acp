@@ -19,6 +19,7 @@ from app.models import (
     SummaryJob,
     SummaryJobStatus,
     VirtualWindow,
+    WindowTitleHistory,
 )
 from app.repositories.clients import ensure_local_client
 from app.repositories.folders import get_or_create_folder_by_path
@@ -131,6 +132,20 @@ async def test_process_summary_job_moves_window_to_llm_folder(session_factory):
         assert job.status == SummaryJobStatus.succeeded
         assert job.attempts == 1
         assert window.folder.path == "/2026-05/生产排障"
+        title_history = (
+            await session.execute(
+                select(WindowTitleHistory).order_by(WindowTitleHistory.created_at)
+            )
+        ).scalars().all()
+        assert len(title_history) == 2
+        assert title_history[0].title.startswith("Terminal-")
+        assert title_history[0].summary is None
+        assert title_history[0].source == "initial"
+        assert (title_history[1].title, title_history[1].summary, title_history[1].source) == (
+            "[Claude] 修复 Nginx 403",
+            "Fixed an nginx permission issue.",
+            "summary",
+        )
 
     assert summarizer.seen_context is not None
     assert len(summarizer.seen_context) == 1

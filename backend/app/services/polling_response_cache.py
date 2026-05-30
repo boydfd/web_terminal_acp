@@ -9,7 +9,10 @@ from fastapi import Response
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 
+from app.services import cache_backend
+
 _CACHE_TTL_SECONDS = 10.0
+_CACHE_REDIS_TTL_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -33,7 +36,9 @@ _refreshing_cache_keys: set[tuple[object, ...]] = set()
 def cached_json_response(cache_key: tuple[object, ...]) -> Response | None:
     cached = _response_cache.get(cache_key)
     if cached is None:
-        return None
+        cached = _redis_cache_entry(cache_key)
+        if cached is None:
+            return None
     if monotonic() - cached.created_at > _CACHE_TTL_SECONDS:
         _response_cache.pop(cache_key, None)
         return None
@@ -43,7 +48,9 @@ def cached_json_response(cache_key: tuple[object, ...]) -> Response | None:
 def cached_or_stale_json_response(cache_key: tuple[object, ...]) -> CachedJsonResponse | None:
     cached = _response_cache.get(cache_key)
     if cached is None:
-        return None
+        cached = _redis_cache_entry(cache_key)
+        if cached is None:
+            return None
     return CachedJsonResponse(
         response=Response(content=cached.content, media_type="application/json"),
         expired=monotonic() - cached.created_at > _CACHE_TTL_SECONDS,
@@ -58,12 +65,14 @@ def store_json_response(
     client_id: UUID | None = None,
 ) -> Response:
     content = json.dumps(_response_payload(payload), separators=(",", ":"))
-    _response_cache[cache_key] = _CacheEntry(
+    entry = _CacheEntry(
         created_at=monotonic(),
         content=content,
         resources=frozenset(resources),
         client_id=client_id,
     )
+    if not _store_redis_cache_entry(cache_key, entry):
+        _response_cache[cache_key] = entry
     return Response(content=content, media_type="application/json")
 
 
@@ -94,6 +103,11 @@ def invalidate_polling_response_cache(
     ]
     for key in stale_keys:
         _response_cache.pop(key, None)
+    cache_backend.delete_indexed(
+        "polling-response",
+        resource_set,
+        client_id=str(client_id) if client_id is not None else None,
+    )
 
 
 def expire_polling_response_cache(
@@ -119,11 +133,19 @@ def expire_polling_response_cache(
             resources=entry.resources,
             client_id=entry.client_id,
         )
+    cache_backend.expire_indexed_json(
+        "polling-response",
+        resource_set,
+        client_id=str(client_id) if client_id is not None else None,
+        created_at=expired_at,
+        ttl_seconds=_CACHE_REDIS_TTL_SECONDS,
+    )
 
 
 def clear_polling_response_cache() -> None:
     _response_cache.clear()
     _refreshing_cache_keys.clear()
+    cache_backend.clear_namespace("polling-response")
 
 
 def response_cache_scope(session: object) -> tuple[int, str]:
@@ -141,3 +163,37 @@ def _response_payload(payload: object) -> object:
     if isinstance(payload, BaseModel):
         return jsonable_encoder(payload.model_dump())
     return jsonable_encoder(payload)
+
+
+def _redis_cache_entry(cache_key: tuple[object, ...]) -> _CacheEntry | None:
+    cached = cache_backend.get_json("polling-response", cache_key)
+    if cached is None:
+        return None
+    try:
+        resources = cached["resources"]
+        client_id = cached.get("client_id")
+        return _CacheEntry(
+            created_at=float(cached["created_at"]),
+            content=str(cached["content"]),
+            resources=frozenset(str(resource) for resource in resources),
+            client_id=UUID(str(client_id)) if client_id is not None else None,
+        )
+    except (KeyError, TypeError, ValueError):
+        cache_backend.delete_keys([cache_backend.cache_key("polling-response", cache_key)])
+        return None
+
+
+def _store_redis_cache_entry(cache_key: tuple[object, ...], entry: _CacheEntry) -> bool:
+    return cache_backend.set_indexed_json(
+        "polling-response",
+        cache_key,
+        {
+            "created_at": entry.created_at,
+            "content": entry.content,
+            "resources": sorted(entry.resources),
+            "client_id": str(entry.client_id) if entry.client_id is not None else None,
+        },
+        resources=entry.resources,
+        client_id=str(entry.client_id) if entry.client_id is not None else None,
+        ttl_seconds=_CACHE_REDIS_TTL_SECONDS,
+    )

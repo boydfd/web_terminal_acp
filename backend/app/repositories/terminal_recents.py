@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from math import ceil
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import delete, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import TerminalRecentUsage, VirtualWindow
@@ -25,6 +28,100 @@ async def touch_terminal_recent(
         return None
 
     now = datetime.now(UTC)
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        usage = await _upsert_terminal_recent_postgresql(
+            session,
+            client_id=client_id,
+            window_id=window_id,
+            title=title,
+            last_used_at=now,
+        )
+    elif dialect_name == "sqlite":
+        usage = await _upsert_terminal_recent_sqlite(
+            session,
+            client_id=client_id,
+            window_id=window_id,
+            title=title,
+            last_used_at=now,
+        )
+    else:
+        usage = await _upsert_terminal_recent_fallback(
+            session,
+            client_id=client_id,
+            window_id=window_id,
+            title=title,
+            last_used_at=now,
+        )
+
+    await _trim_terminal_recents(session, client_id)
+    return usage
+
+
+async def _upsert_terminal_recent_postgresql(
+    session: AsyncSession,
+    *,
+    client_id: UUID,
+    window_id: UUID,
+    title: str,
+    last_used_at: datetime,
+) -> TerminalRecentUsage:
+    stmt = (
+        postgresql_insert(TerminalRecentUsage)
+        .values(
+            id=uuid4(),
+            client_id=client_id,
+            window_id=window_id,
+            title=title,
+            last_used_at=last_used_at,
+        )
+        .on_conflict_do_update(
+            constraint="uq_terminal_recent_usages_client_window",
+            set_={"title": title, "last_used_at": last_used_at},
+        )
+        .returning(TerminalRecentUsage.id)
+    )
+    usage_id = (await session.execute(stmt)).scalar_one()
+    usage = await session.get(TerminalRecentUsage, usage_id)
+    if usage is None:
+        raise RuntimeError("terminal recent upsert did not return a persisted row")
+    return usage
+
+
+async def _upsert_terminal_recent_sqlite(
+    session: AsyncSession,
+    *,
+    client_id: UUID,
+    window_id: UUID,
+    title: str,
+    last_used_at: datetime,
+) -> TerminalRecentUsage:
+    stmt = (
+        sqlite_insert(TerminalRecentUsage)
+        .values(
+            id=uuid4(),
+            client_id=client_id,
+            window_id=window_id,
+            title=title,
+            last_used_at=last_used_at,
+        )
+        .on_conflict_do_update(
+            index_elements=["client_id", "window_id"],
+            set_={"title": title, "last_used_at": last_used_at},
+        )
+    )
+    await session.execute(stmt)
+    return await _get_terminal_recent(session, client_id=client_id, window_id=window_id)
+
+
+async def _upsert_terminal_recent_fallback(
+    session: AsyncSession,
+    *,
+    client_id: UUID,
+    window_id: UUID,
+    title: str,
+    last_used_at: datetime,
+) -> TerminalRecentUsage:
     existing = await session.scalar(
         select(TerminalRecentUsage).where(
             TerminalRecentUsage.client_id == client_id,
@@ -36,16 +133,39 @@ async def touch_terminal_recent(
             client_id=client_id,
             window_id=window_id,
             title=title,
-            last_used_at=now,
+            last_used_at=last_used_at,
         )
         session.add(usage)
     else:
         existing.title = title
-        existing.last_used_at = now
+        existing.last_used_at = last_used_at
         usage = existing
 
-    await session.flush()
-    await _trim_terminal_recents(session, client_id)
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        usage = await _get_terminal_recent(session, client_id=client_id, window_id=window_id)
+        usage.title = title
+        usage.last_used_at = last_used_at
+        await session.flush()
+    return usage
+
+
+async def _get_terminal_recent(
+    session: AsyncSession,
+    *,
+    client_id: UUID,
+    window_id: UUID,
+) -> TerminalRecentUsage:
+    usage = await session.scalar(
+        select(TerminalRecentUsage).where(
+            TerminalRecentUsage.client_id == client_id,
+            TerminalRecentUsage.window_id == window_id,
+        )
+    )
+    if usage is None:
+        raise RuntimeError("terminal recent upsert did not return a persisted row")
     return usage
 
 

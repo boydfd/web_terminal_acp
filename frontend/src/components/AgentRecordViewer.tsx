@@ -45,6 +45,7 @@ type AgentRecordViewProps = {
 };
 type AgentRecordViewerProps = AgentRecordViewProps & {
   onExpand: () => void;
+  expandShortcutLabel?: string;
 };
 type AgentRecordModalProps = AgentRecordViewProps & {
   open: boolean;
@@ -583,7 +584,8 @@ export function AgentRecordViewer({
   onSessionChange,
   onPreviousPage,
   onNextPage,
-  onExpand
+  onExpand,
+  expandShortcutLabel = "Expand"
 }: AgentRecordViewerProps) {
   const activeRecord = mode === "chat" ? chatRecord : detailRecord;
   const canExpand = activeRecord !== null && !isLoading && !isError;
@@ -617,7 +619,7 @@ export function AgentRecordViewer({
               disabled={isLoading}
             />
           )}
-          <button type="button" disabled={!canExpand} onClick={openExpanded} title="Alt+R">Expand</button>
+          <button type="button" disabled={!canExpand} onClick={openExpanded} title={expandShortcutLabel}>Expand</button>
         </div>
       </div>
       <AgentRecordPagination info={activePageInfo} isFetching={isFetching && !isLoading} onPreviousPage={onPreviousPage} onNextPage={onNextPage} />

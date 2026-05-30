@@ -7,6 +7,7 @@ import pytest
 from app.models import LOCAL_CLIENT_ID, ClientRuntime, VirtualWindow, WindowStatus
 from app.routers import windows
 from app.schemas import WindowCreateIn
+from app.services import agent_config as agent_config_service
 from app.services.tmux_manager import TmuxTarget
 
 
@@ -81,3 +82,61 @@ async def test_local_window_creation_runs_tmux_before_database_insert(monkeypatc
     assert events[1] == ("db", events[0][1])
     assert created.tmux_session == "web-terminal"
     assert created.tmux_window_id == "@2"
+
+
+@pytest.mark.asyncio
+async def test_local_agent_window_applies_config_before_tmux_create(monkeypatch) -> None:
+    events: list[tuple[str, object]] = []
+
+    class FakeTmuxManager:
+        async def create_window(self, cwd, shell_command, *, client_id, window_id):
+            events.append(("tmux", shell_command))
+            return TmuxTarget(session="web-terminal", window_id="@2", cwd=cwd, shell_command=shell_command)
+
+    async def fake_create_window(session, client_id, cwd, shell_command, **kwargs):
+        window_id = kwargs["window_id"]
+        events.append(("db", shell_command))
+        return VirtualWindow(
+            id=window_id,
+            client_id=client_id,
+            title="Terminal",
+            folder_id=None,
+            status=WindowStatus.active,
+            tmux_session=kwargs["tmux_session"],
+            tmux_window_id=kwargs["tmux_window_id"],
+            remote_session_id=None,
+            remote_window_id=None,
+            cwd=cwd,
+            shell_command=shell_command,
+            title_manually_overridden=False,
+            folder_manually_overridden=False,
+            created_at=datetime.now(UTC),
+        )
+
+    def fake_apply(selection, *, window_id, home=None):
+        events.append(("config", (selection.agent, window_id)))
+        return agent_config_service.AgentConfig(agent="codex", sections=[])
+
+    monkeypatch.setattr(windows, "create_window", fake_create_window)
+    monkeypatch.setattr(windows.agent_config_service, "apply_agent_config_selection", fake_apply)
+
+    client = SimpleNamespace(id=LOCAL_CLIENT_ID, runtime=ClientRuntime.local)
+    created = await windows._create_virtual_window_for_client(
+        client,
+        WindowCreateIn.model_validate(
+            {
+                "cwd": "/workspace",
+                "agent_launch": {
+                    "agent": "codex",
+                    "command": "codex",
+                    "config": {"agent": "codex", "sections": [{"id": "skills", "items": [{"id": "docker", "enabled": False}]}]},
+                },
+            }
+        ),
+        FakeSession(),
+        FakeTmuxManager(),
+    )
+
+    assert [event[0] for event in events] == ["config", "tmux", "db"]
+    assert created.shell_command == "codex"
+    assert "codex" in created.runtime_tags

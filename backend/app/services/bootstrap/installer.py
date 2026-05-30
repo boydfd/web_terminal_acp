@@ -91,16 +91,31 @@ fi
 
 def build_client_config(client: Client, *, token: str, server_url: str, install_path: str) -> str:
     return json.dumps(
-        {
-            "client_id": str(client.id),
-            "token": token,
-            "server_url": server_url,
-            "name": client.name,
-            "install_path": install_path,
-        },
+        build_client_config_payload(
+            client,
+            token=token,
+            server_url=server_url,
+            install_path=install_path,
+        ),
         indent=2,
         sort_keys=True,
     )
+
+
+def build_client_config_payload(
+    client: Client,
+    *,
+    token: str,
+    server_url: str,
+    install_path: str,
+) -> dict[str, str]:
+    return {
+        "client_id": str(client.id),
+        "token": token,
+        "server_url": server_url,
+        "name": client.name,
+        "install_path": install_path,
+    }
 
 
 async def bootstrap_client(
@@ -287,6 +302,7 @@ def client_app_file_contents() -> dict[str, str]:
         "client_agent/tmux_runtime.py",
         "client_agent/updater.py",
         "services/__init__.py",
+        "services/agent_config.py",
         "services/terminal_command_marker.py",
         "services/runtime/__init__.py",
         "services/runtime/protocol.py",

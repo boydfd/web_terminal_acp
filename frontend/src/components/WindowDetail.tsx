@@ -1,13 +1,16 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
-import { fetchCommandHistory, fetchWindow, retrySummary, updateWindowTitle } from "../api";
+import { fetchCommandHistory, fetchWindow, fetchWindowTitleHistory, retrySummary, updateWindowTitle } from "../api";
+import { useAgentConfigData } from "../hooks/useAgentConfigData";
 import { useAgentRecordData } from "../hooks/useAgentRecordData";
 import type { GitWorktreeActivity, SummaryJob, TreeFolderCore, VirtualWindow } from "../types";
+import { AgentConfigViewer } from "./AgentConfigViewer";
 import { AgentRecordModal, AgentRecordViewer } from "./AgentRecordViewer";
 import { CommandHistoryViewer } from "./CommandHistoryViewer";
 import { DetailPanelTabs, type DetailPanelTab } from "./DetailPanelTabs";
 import { GitRunViewer } from "./GitRunViewer";
+import { TitleHistoryViewer } from "./TitleHistoryViewer";
 import { WorkStatusBadge } from "./WorkStatusBadge";
 
 type WindowDetailProps = {
@@ -18,6 +21,7 @@ type WindowDetailProps = {
   terminalStatusTone?: "connected" | "connecting" | "reconnecting" | "unavailable" | "error";
   quickInputDraft?: string;
   canSendQuickInput?: boolean;
+  agentRecordShortcutLabel?: string;
   onQuickInputDraftChange?: (draft: string) => void;
   onQuickInputSubmit?: (draft: string) => boolean;
 };
@@ -26,8 +30,11 @@ type SummaryStatus = {
   label: string;
   tone?: "muted" | "error";
 };
+type AgentDetailTab = "record" | "config";
+type HistoryDetailTab = "commands" | "title";
 
 const COMMAND_HISTORY_PAGE_SIZE = 100;
+const TITLE_HISTORY_PAGE_SIZE = 100;
 const MAX_TITLE_LENGTH = 255;
 
 function formatDateTime(value: string): string {
@@ -121,12 +128,16 @@ export function WindowDetail({
   terminalStatusTone,
   quickInputDraft,
   canSendQuickInput,
+  agentRecordShortcutLabel = "Expand",
   onQuickInputDraftChange,
   onQuickInputSubmit
 }: WindowDetailProps) {
   const [allowTitleFolderOverride, setAllowTitleFolderOverride] = useState(false);
   const [detailTab, setDetailTab] = useState<DetailPanelTab>("overview");
+  const [agentDetailTab, setAgentDetailTab] = useState<AgentDetailTab>("record");
+  const [historyDetailTab, setHistoryDetailTab] = useState<HistoryDetailTab>("commands");
   const [commandHistoryPage, setCommandHistoryPage] = useState(0);
+  const [titleHistoryPage, setTitleHistoryPage] = useState(0);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const queryClient = useQueryClient();
@@ -134,12 +145,20 @@ export function WindowDetail({
   const agentRecord = useAgentRecordData({
     clientId,
     windowId,
-    enabled: detailTab === "agent"
+    enabled: detailTab === "agent" && agentDetailTab === "record"
+  });
+  const agentConfig = useAgentConfigData({
+    clientId,
+    windowId,
+    enabled: detailTab === "agent" && agentDetailTab === "config"
   });
 
   useEffect(() => {
     setDetailTab("overview");
+    setAgentDetailTab("record");
+    setHistoryDetailTab("commands");
     setCommandHistoryPage(0);
+    setTitleHistoryPage(0);
     setIsEditingTitle(false);
     setTitleDraft("");
   }, [clientId, windowId]);
@@ -164,7 +183,19 @@ export function WindowDetail({
       COMMAND_HISTORY_PAGE_SIZE,
       commandHistoryPage * COMMAND_HISTORY_PAGE_SIZE
     ),
-    enabled: clientId !== null && windowId !== null && detailTab === "history",
+    enabled: clientId !== null && windowId !== null && detailTab === "history" && historyDetailTab === "commands",
+    placeholderData: keepPreviousData,
+    refetchInterval: 10000
+  });
+  const titleHistoryQuery = useQuery({
+    queryKey: ["title-history", clientId, windowId, titleHistoryPage, TITLE_HISTORY_PAGE_SIZE],
+    queryFn: () => fetchWindowTitleHistory(
+      clientId as string,
+      windowId as string,
+      TITLE_HISTORY_PAGE_SIZE,
+      titleHistoryPage * TITLE_HISTORY_PAGE_SIZE
+    ),
+    enabled: clientId !== null && windowId !== null && detailTab === "history" && historyDetailTab === "title",
     placeholderData: keepPreviousData,
     refetchInterval: 10000
   });
@@ -203,6 +234,7 @@ export function WindowDetail({
       queryClient.invalidateQueries({ queryKey: ["window", variables.clientId, variables.windowId] });
       queryClient.invalidateQueries({ queryKey: ["tree", variables.clientId] });
       queryClient.invalidateQueries({ queryKey: ["window-activity", variables.clientId] });
+      queryClient.invalidateQueries({ queryKey: ["title-history", variables.clientId, variables.windowId] });
       queryClient.invalidateQueries({ queryKey: ["terminal-recents", variables.clientId] });
       setTitleDraft(updated.title);
       setIsEditingTitle(false);
@@ -300,6 +332,14 @@ export function WindowDetail({
           <dl className="detail-list">
             <dt>Status</dt>
             <dd>{item.status}</dd>
+            <dt>Created</dt>
+            <dd>{formatDateTime(item.created_at)}</dd>
+            <dt>Last shell command</dt>
+            <dd>{item.last_terminal_command_at ? formatDateTime(item.last_terminal_command_at) : "-"}</dd>
+            <dt>Last agent event</dt>
+            <dd>{item.last_agent_event_at ? formatDateTime(item.last_agent_event_at) : "-"}</dd>
+            <dt>Last active</dt>
+            <dd>{formatDateTime(item.last_active_at)}</dd>
             <dt>Work status</dt>
             <dd>
               <span className="detail-work-status">
@@ -395,57 +435,126 @@ export function WindowDetail({
 
       {detailTab === "agent" && (
         <>
-          <AgentRecordViewer
-            mode={agentRecord.mode}
-            chatRoleFilter={agentRecord.chatRoleFilter}
-            chatRecord={agentRecord.chatRecord}
-            detailRecord={agentRecord.detailRecord}
-            sessions={agentRecord.sessions}
-            isLoading={agentRecord.isLoading}
-            isError={agentRecord.isError}
-            isFetching={agentRecord.isFetching}
-            onModeChange={agentRecord.setMode}
-            onChatRoleFilterChange={agentRecord.setChatRoleFilter}
-            onExpand={() => agentRecord.setExpanded(true)}
-            onSessionChange={agentRecord.resetPages}
-            onPreviousPage={agentRecord.previousPage}
-            onNextPage={agentRecord.nextPage}
-          />
-          <AgentRecordModal
-            open={agentRecord.expanded}
-            mode={agentRecord.mode}
-            chatRoleFilter={agentRecord.chatRoleFilter}
-            chatRecord={agentRecord.chatRecord}
-            detailRecord={agentRecord.detailRecord}
-            sessions={agentRecord.sessions}
-            isLoading={agentRecord.isLoading}
-            isError={agentRecord.isError}
-            isFetching={agentRecord.isFetching}
-            terminalStatusLabel={terminalStatusLabel}
-            terminalStatusTone={terminalStatusTone}
-            quickInputDraft={quickInputDraft}
-            canSendQuickInput={canSendQuickInput}
-            onQuickInputDraftChange={onQuickInputDraftChange}
-            onQuickInputSubmit={onQuickInputSubmit}
-            onModeChange={agentRecord.setMode}
-            onChatRoleFilterChange={agentRecord.setChatRoleFilter}
-            onClose={() => agentRecord.setExpanded(false)}
-            onSessionChange={agentRecord.resetPages}
-            onPreviousPage={agentRecord.previousPage}
-            onNextPage={agentRecord.nextPage}
-          />
+          <div className="agent-detail-tabs" role="tablist" aria-label="Agent detail">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={agentDetailTab === "record"}
+              className={agentDetailTab === "record" ? "selected" : undefined}
+              onClick={() => setAgentDetailTab("record")}
+            >
+              Record
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={agentDetailTab === "config"}
+              className={agentDetailTab === "config" ? "selected" : undefined}
+              onClick={() => setAgentDetailTab("config")}
+            >
+              Config
+            </button>
+          </div>
+          {agentDetailTab === "record" ? (
+            <>
+              <AgentRecordViewer
+                mode={agentRecord.mode}
+                chatRoleFilter={agentRecord.chatRoleFilter}
+                chatRecord={agentRecord.chatRecord}
+                detailRecord={agentRecord.detailRecord}
+                sessions={agentRecord.sessions}
+                isLoading={agentRecord.isLoading}
+                isError={agentRecord.isError}
+                isFetching={agentRecord.isFetching}
+                onModeChange={agentRecord.setMode}
+                onChatRoleFilterChange={agentRecord.setChatRoleFilter}
+                onExpand={() => agentRecord.setExpanded(true)}
+                expandShortcutLabel={agentRecordShortcutLabel}
+                onSessionChange={agentRecord.resetPages}
+                onPreviousPage={agentRecord.previousPage}
+                onNextPage={agentRecord.nextPage}
+              />
+              <AgentRecordModal
+                open={agentRecord.expanded}
+                mode={agentRecord.mode}
+                chatRoleFilter={agentRecord.chatRoleFilter}
+                chatRecord={agentRecord.chatRecord}
+                detailRecord={agentRecord.detailRecord}
+                sessions={agentRecord.sessions}
+                isLoading={agentRecord.isLoading}
+                isError={agentRecord.isError}
+                isFetching={agentRecord.isFetching}
+                terminalStatusLabel={terminalStatusLabel}
+                terminalStatusTone={terminalStatusTone}
+                quickInputDraft={quickInputDraft}
+                canSendQuickInput={canSendQuickInput}
+                onQuickInputDraftChange={onQuickInputDraftChange}
+                onQuickInputSubmit={onQuickInputSubmit}
+                onModeChange={agentRecord.setMode}
+                onChatRoleFilterChange={agentRecord.setChatRoleFilter}
+                onClose={() => agentRecord.setExpanded(false)}
+                onSessionChange={agentRecord.resetPages}
+                onPreviousPage={agentRecord.previousPage}
+                onNextPage={agentRecord.nextPage}
+              />
+            </>
+          ) : (
+            <AgentConfigViewer
+              config={agentConfig.config}
+              isLoading={agentConfig.isLoading}
+              isError={agentConfig.isError}
+              isFetching={agentConfig.isFetching}
+              pendingItemId={agentConfig.pendingItemId}
+              isToggling={agentConfig.isToggling}
+              toggleError={agentConfig.toggleError}
+              onToggleItem={agentConfig.toggleItem}
+            />
+          )}
         </>
       )}
 
       {detailTab === "history" && (
-        <CommandHistoryViewer
-          history={commandHistoryQuery.data ?? null}
-          isLoading={commandHistoryQuery.isLoading}
-          isError={commandHistoryQuery.isError}
-          isFetching={commandHistoryQuery.isFetching}
-          onPreviousPage={() => setCommandHistoryPage((page) => Math.max(0, page - 1))}
-          onNextPage={() => setCommandHistoryPage((page) => page + 1)}
-        />
+        <>
+          <div className="history-detail-tabs" role="tablist" aria-label="History detail">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={historyDetailTab === "commands"}
+              className={historyDetailTab === "commands" ? "selected" : undefined}
+              onClick={() => setHistoryDetailTab("commands")}
+            >
+              Commands
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={historyDetailTab === "title"}
+              className={historyDetailTab === "title" ? "selected" : undefined}
+              onClick={() => setHistoryDetailTab("title")}
+            >
+              Title
+            </button>
+          </div>
+          {historyDetailTab === "commands" ? (
+            <CommandHistoryViewer
+              history={commandHistoryQuery.data ?? null}
+              isLoading={commandHistoryQuery.isLoading}
+              isError={commandHistoryQuery.isError}
+              isFetching={commandHistoryQuery.isFetching}
+              onPreviousPage={() => setCommandHistoryPage((page) => Math.max(0, page - 1))}
+              onNextPage={() => setCommandHistoryPage((page) => page + 1)}
+            />
+          ) : (
+            <TitleHistoryViewer
+              history={titleHistoryQuery.data ?? null}
+              isLoading={titleHistoryQuery.isLoading}
+              isError={titleHistoryQuery.isError}
+              isFetching={titleHistoryQuery.isFetching}
+              onPreviousPage={() => setTitleHistoryPage((page) => Math.max(0, page - 1))}
+              onNextPage={() => setTitleHistoryPage((page) => page + 1)}
+            />
+          )}
+        </>
       )}
 
       {detailTab === "git" && showGitTab && <GitRunViewer clientId={clientId} windowId={windowId} />}

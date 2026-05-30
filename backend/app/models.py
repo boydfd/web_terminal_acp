@@ -30,6 +30,11 @@ class ClientRuntime(Enum):
     remote = "remote"
 
 
+class ClientRegistrationKeyStatus(Enum):
+    active = "ACTIVE"
+    used = "USED"
+
+
 class WindowStatus(Enum):
     active = "ACTIVE"
     archived = "ARCHIVED"
@@ -114,6 +119,9 @@ class Client(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
 
     folders: Mapped[list[Folder]] = relationship("Folder", back_populates="client")
     windows: Mapped[list[VirtualWindow]] = relationship("VirtualWindow", back_populates="client")
@@ -121,6 +129,37 @@ class Client(Base):
     events: Mapped[list[Event]] = relationship("Event", back_populates="client")
     folder_split_jobs: Mapped[list[FolderSplitJob]] = relationship(
         "FolderSplitJob", back_populates="client"
+    )
+
+
+class ClientRegistrationKey(Base):
+    __tablename__ = "client_registration_keys"
+    __table_args__ = (
+        Index("ix_client_registration_keys_status", "status"),
+        Index("ix_client_registration_keys_key_hash", "key_hash"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key_hash: Mapped[str] = mapped_column(String(71), nullable=False, unique=True)
+    status: Mapped[ClientRegistrationKeyStatus] = mapped_column(
+        SAEnum(
+            ClientRegistrationKeyStatus,
+            name="clientregistrationkeystatus",
+            values_callable=_enum_values,
+            create_constraint=True,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=ClientRegistrationKeyStatus.active,
+        server_default=ClientRegistrationKeyStatus.active.value,
+    )
+    label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    used_client_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("clients.id", ondelete="SET NULL"), nullable=True
+    )
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 
@@ -222,6 +261,9 @@ class VirtualWindow(Base):
     agent_activity_latest_event_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), nullable=True
     )
+    agent_activity_latest_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     agent_activity_burst_start_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -242,6 +284,37 @@ class VirtualWindow(Base):
     events: Mapped[list[Event]] = relationship("Event", back_populates="virtual_window")
     summary_jobs: Mapped[list[SummaryJob]] = relationship(
         "SummaryJob", back_populates="virtual_window"
+    )
+    title_history: Mapped[list[WindowTitleHistory]] = relationship(
+        "WindowTitleHistory", back_populates="virtual_window"
+    )
+
+
+class WindowTitleHistory(Base):
+    __tablename__ = "window_title_history"
+    __table_args__ = (
+        Index("ix_window_title_history_client_window_created", "client_id", "virtual_window_id", "created_at", "id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    client_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("clients.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    virtual_window_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("virtual_windows.id", ondelete="CASCADE"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    client: Mapped[Client] = relationship("Client")
+    virtual_window: Mapped[VirtualWindow] = relationship(
+        "VirtualWindow", back_populates="title_history"
     )
 
 
@@ -295,8 +368,8 @@ class Event(Base):
         Index("ix_events_ai_session_id", "ai_session_id"),
         Index("ix_events_source_type_source_id", "source_type", "source_id"),
         Index("ix_events_agent_record_window", "client_id", "virtual_window_id", "created_at", "id"),
-        Index("ix_events_client_window_kind_created", "client_id", "virtual_window_id", "kind", "created_at"),
-        Index("ix_events_client_window_source_created", "client_id", "virtual_window_id", "source_type", "created_at"),
+        Index("ix_events_client_window_kind_created_id", "client_id", "virtual_window_id", "kind", "created_at", "id"),
+        Index("ix_events_client_window_source_created_id", "client_id", "virtual_window_id", "source_type", "created_at", "id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -356,6 +429,28 @@ Index(
     Event.id,
     postgresql_where=Event.kind != "terminal_output",
     sqlite_where=Event.kind != "terminal_output",
+)
+
+Index(
+    "ix_events_agent_activity_window_created",
+    Event.client_id,
+    Event.virtual_window_id,
+    Event.created_at,
+    Event.id,
+    postgresql_where=Event.source_type.in_(
+        [
+            EventSourceType.agent_tool_record,
+            EventSourceType.codex_trace,
+            EventSourceType.claude_jsonl,
+        ]
+    ),
+    sqlite_where=Event.source_type.in_(
+        [
+            EventSourceType.agent_tool_record,
+            EventSourceType.codex_trace,
+            EventSourceType.claude_jsonl,
+        ]
+    ),
 )
 
 
@@ -480,6 +575,19 @@ class ProjectSummary(Base):
         server_default=ProjectSummaryStatus.succeeded.value,
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class UiSetting(Base):
+    __tablename__ = "ui_settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

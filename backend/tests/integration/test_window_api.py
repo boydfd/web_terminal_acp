@@ -21,6 +21,7 @@ from app.models import (
     GitWorktreeRun,
     SummaryJob,
     SummaryJobStatus,
+    TerminalRecentUsage,
     VirtualWindow,
     WindowGitBinding,
 )
@@ -39,6 +40,34 @@ try:
     from app.db import Base
 except ImportError:  # pragma: no cover - compatibility with alternate app layout
     from app.model_base import Base
+
+
+def codex_message_payload(text: str, *, timestamp: datetime | None = None) -> dict:
+    payload = {
+        "provider": "codex",
+        "raw_type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        },
+    }
+    if timestamp is not None:
+        payload["timestamp"] = timestamp.isoformat()
+    return payload
+
+
+def codex_completion_payload(
+    *, event_type: str = "task_completed", timestamp: datetime | None = None
+) -> dict:
+    payload = {
+        "provider": "codex",
+        "raw_type": "event_msg",
+        "payload": {"type": event_type},
+    }
+    if timestamp is not None:
+        payload["timestamp"] = timestamp.isoformat()
+    return payload
 
 
 class FakeTmuxManager:
@@ -119,6 +148,53 @@ class FakeRemoteConnection:
         )
 
 
+class AgentConfigRemoteConnection(FakeRemoteConnection):
+    async def request(self, message: AgentMessage, *, timeout: float) -> AgentMessage:
+        self.requests.append(message)
+        if message.type == "agent_config_get":
+            return AgentMessage(
+                type="agent_config_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload={
+                    "agent": "claude",
+                    "sections": [
+                        {
+                            "id": "skills",
+                            "name": "Skills",
+                            "items": [
+                                {
+                                    "id": "review",
+                                    "name": "review",
+                                    "enabled": True,
+                                    "path": "/home/test/.claude/skills/review",
+                                }
+                            ],
+                        },
+                        {"id": "plugins", "name": "Plugins", "items": []},
+                        {"id": "hooks", "name": "Hooks", "items": []},
+                    ],
+                },
+            )
+        if message.type == "agent_config_set_enabled":
+            return AgentMessage(
+                type="agent_config_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload={
+                    "agent": "claude",
+                    "sections": [
+                        {"id": "skills", "name": "Skills", "items": []},
+                        {"id": "plugins", "name": "Plugins", "items": []},
+                        {"id": "hooks", "name": "Hooks", "items": []},
+                    ],
+                },
+            )
+        return await super().request(message, timeout=timeout)
+
+
 class FailingRemoteConnection(FakeRemoteConnection):
     def __init__(self, exc: Exception) -> None:
         super().__init__()
@@ -127,6 +203,18 @@ class FailingRemoteConnection(FakeRemoteConnection):
     async def request(self, message: AgentMessage, *, timeout: float) -> AgentMessage:
         self.requests.append(message)
         raise self.exc
+
+
+class TerminalErrorRemoteConnection(FakeRemoteConnection):
+    async def request(self, message: AgentMessage, *, timeout: float) -> AgentMessage:
+        self.requests.append(message)
+        return AgentMessage(
+            type="terminal_error",
+            client_id=message.client_id,
+            window_id=message.window_id,
+            request_id=message.request_id,
+            payload={"message": "tmux command failed"},
+        )
 
 
 class ObservingRemoteConnection(FakeRemoteConnection):
@@ -243,6 +331,13 @@ def worktree_marker(
 def tracking_sequence(worktree_root: str) -> str:
     digest = sha256(worktree_root.encode("utf-8")).hexdigest()[:16]
     return f"worktree:{digest}"
+
+
+def parse_response_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 @pytest.mark.asyncio
@@ -404,6 +499,8 @@ async def test_create_window_creates_remote_window_when_client_connection_exists
 
     assert response.status_code == 200
     created = response.json()
+    create_payload = connection.requests[0].payload
+    create_payload.pop("agent_config_selection", None)
     assert created["client_id"] == remote_client_id
     assert created["tmux_session"] is None
     assert created["tmux_window_id"] is None
@@ -413,10 +510,56 @@ async def test_create_window_creates_remote_window_when_client_connection_exists
     assert connection.requests[0].type == "create_window"
     assert connection.requests[0].client_id == UUID(remote_client_id)
     assert connection.requests[0].window_id == UUID(created["id"])
-    assert connection.requests[0].payload == {"cwd": "/tmp/ignored", "shell_command": "/bin/bash"}
+    assert create_payload == {"cwd": "/tmp/ignored", "shell_command": "/bin/bash"}
     assert created["cwd"] == "/tmp/ignored"
     assert created["shell_command"] == "/bin/bash"
     assert FakeTmuxManager.killed_targets == []
+
+
+@pytest.mark.asyncio
+async def test_create_agent_window_sends_remote_config_selection(db_client):
+    remote_client_id = await create_remote_client_id(db_client)
+    connection = FakeRemoteConnection()
+    app.state.client_connections = FakeConnectionRegistry(connection)
+
+    response = await db_client.post(
+        f"/api/clients/{remote_client_id}/windows",
+        json={
+            "cwd": "/tmp/project",
+            "agent_launch": {
+                "agent": "claude",
+                "command": "claude",
+                "config": {
+                    "agent": "claude",
+                    "sections": [
+                        {
+                            "id": "skills",
+                            "items": [{"id": "review", "enabled": True}],
+                        }
+                    ],
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    created = response.json()
+    assert created["shell_command"] == "claude"
+    assert created["command_capture_supported"] is True
+    assert "claude_code" in created["runtime_tags"]
+    assert connection.requests[0].payload == {
+        "cwd": "/tmp/project",
+        "shell_command": "claude",
+        "agent_config_selection": {
+            "agent": "claude",
+            "sections": [
+                {
+                    "id": "skills",
+                    "items": [{"id": "review", "enabled": True}],
+                }
+            ],
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -485,6 +628,24 @@ async def test_create_window_returns_503_when_remote_create_request_becomes_unav
 
 
 @pytest.mark.asyncio
+async def test_create_window_returns_502_when_remote_runtime_reports_terminal_error(db_client):
+    remote_client_id = await create_remote_client_id(db_client)
+    app.state.client_connections = FakeConnectionRegistry(TerminalErrorRemoteConnection())
+
+    response = await db_client.post(
+        f"/api/clients/{remote_client_id}/windows",
+        json={"cwd": "/tmp", "shell_command": "/bin/bash"},
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "tmux command failed"}
+
+    async with db_client.session_factory() as session:
+        windows = (await session.execute(select(VirtualWindow))).scalars().all()
+    assert windows == []
+
+
+@pytest.mark.asyncio
 async def test_get_window_returns_window_metadata(db_client):
     client_id = await get_local_client_id(db_client)
     create_response = await db_client.post(
@@ -499,6 +660,72 @@ async def test_get_window_returns_window_metadata(db_client):
     assert get_response.json()["client_id"] == client_id
     assert get_response.json()["cwd"] == "/tmp/project"
     assert get_response.json()["shell_command"] == "/bin/zsh"
+    assert get_response.json()["created_at"] == created["created_at"]
+    assert get_response.json()["last_terminal_command_at"] is None
+    assert get_response.json()["last_agent_event_at"] is None
+    assert parse_response_datetime(get_response.json()["last_active_at"]) == parse_response_datetime(
+        created["created_at"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_window_returns_overview_timestamps(db_client):
+    client_id = await get_local_client_id(db_client)
+    create_response = await db_client.post(
+        f"/api/clients/{client_id}/windows", json={"cwd": "/tmp/project", "shell_command": "/bin/bash"}
+    )
+    window_id = UUID(create_response.json()["id"])
+    created_at = datetime(2026, 5, 29, 10, 0, tzinfo=timezone.utc)
+    command_at = created_at + timedelta(minutes=5)
+    agent_at = created_at + timedelta(minutes=9)
+    output_at = created_at + timedelta(minutes=10)
+    recent_at = created_at + timedelta(minutes=12)
+
+    async with db_client.session_factory() as session:
+        window = await session.get(VirtualWindow, window_id)
+        assert window is not None
+        window.created_at = created_at
+        window.terminal_last_output_at = output_at
+        session.add_all(
+            [
+                Event(
+                    client_id=UUID(client_id),
+                    source_type=EventSourceType.terminal,
+                    source_id=str(window_id),
+                    kind="terminal_input_command",
+                    virtual_window_id=window_id,
+                    payload_json={"command": "pytest", "sequence": 1},
+                    fingerprint=f"test-command:{window_id}",
+                    created_at=command_at,
+                ),
+                Event(
+                    client_id=UUID(client_id),
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="codex-session",
+                    kind="assistant_message",
+                    virtual_window_id=window_id,
+                    payload_json=codex_message_payload("done"),
+                    fingerprint=f"test-agent:{window_id}",
+                    created_at=agent_at,
+                ),
+                TerminalRecentUsage(
+                    client_id=UUID(client_id),
+                    window_id=window_id,
+                    title="Terminal selected",
+                    last_used_at=recent_at,
+                ),
+            ]
+        )
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/windows/{window_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert parse_response_datetime(body["created_at"]) == created_at
+    assert parse_response_datetime(body["last_terminal_command_at"]) == command_at
+    assert parse_response_datetime(body["last_agent_event_at"]) == agent_at
+    assert parse_response_datetime(body["last_active_at"]) == recent_at
 
 
 @pytest.mark.asyncio
@@ -562,6 +789,54 @@ async def test_patch_window_summary_and_tags_do_not_set_manual_lock_flags(db_cli
     assert patch_response.status_code == 200
     assert patch_response.json()["title_manually_overridden"] is False
     assert patch_response.json()["folder_manually_overridden"] is False
+
+
+@pytest.mark.asyncio
+async def test_patch_window_records_title_history_with_summary_snapshot(db_client):
+    client_id = await get_local_client_id(db_client)
+    window_response = await db_client.post(
+        f"/api/clients/{client_id}/windows", json={"cwd": "/tmp", "shell_command": "/bin/bash"}
+    )
+    window_id = window_response.json()["id"]
+
+    summary_response = await db_client.patch(
+        f"/api/clients/{client_id}/windows/{window_id}",
+        json={"summary": "First summary."},
+    )
+    title_response = await db_client.patch(
+        f"/api/clients/{client_id}/windows/{window_id}",
+        json={"title": "Manual title"},
+    )
+    history_response = await db_client.get(
+        f"/api/clients/{client_id}/windows/{window_id}/title-history"
+    )
+
+    assert summary_response.status_code == 200
+    assert title_response.status_code == 200
+    assert history_response.status_code == 200
+    body = history_response.json()
+    assert body["total"] == 3
+    assert body["has_more"] is False
+    assert [(item["title"], item["summary"], item["source"]) for item in body["items"]] == [
+        ("Manual title", "First summary.", "manual"),
+        (window_response.json()["title"], "First summary.", "manual"),
+        (window_response.json()["title"], None, "initial"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_title_history_endpoint_is_client_scoped(db_client):
+    local_client_id = await get_local_client_id(db_client)
+    remote_client_id = await create_remote_client_id(db_client)
+    async with db_client.session_factory() as session:
+        remote_window = await create_window(session, UUID(remote_client_id), cwd="/tmp", shell_command="/bin/bash")
+        await session.commit()
+
+    response = await db_client.get(
+        f"/api/clients/{local_client_id}/windows/{remote_window.id}/title-history"
+    )
+
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -901,6 +1176,131 @@ async def test_get_window_agent_record_returns_sessions_and_non_output_events(db
     assert body["events_limit"] == 100
     assert body["events_offset"] == 0
     assert body["events_has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_window_agent_config_detects_local_agent_from_terminal_command(
+    db_client,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(windows_router.agent_config_service.Path, "home", lambda: tmp_path)
+    codex_home = tmp_path / ".codex"
+    skill_dir = codex_home / "skills" / "docker"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: docker\n---\n", encoding="utf-8")
+    (codex_home / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {
+                            "matcher": "",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "hooks/preflight.sh",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    client_id = await get_local_client_id(db_client)
+    window_response = await db_client.post(
+        f"/api/clients/{client_id}/windows",
+        json={"cwd": "/workspace/project", "shell_command": "/bin/bash"},
+    )
+    assert window_response.status_code == 200
+    window_id = window_response.json()["id"]
+
+    async with db_client.session_factory() as session:
+        session.add(
+            Event(
+                client_id=UUID(client_id),
+                virtual_window_id=UUID(window_id),
+                source_type=EventSourceType.terminal,
+                source_id="terminal",
+                kind="terminal_input_command",
+                payload_json={"command": "codex exec 'fix tests'"},
+                fingerprint="agent-config-codex-command",
+            )
+        )
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/windows/{window_id}/agent-config")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["agent"] == "codex"
+    skills = next(section for section in body["sections"] if section["id"] == "skills")
+    assert skills["items"][0]["id"] == "docker"
+
+    patch_response = await db_client.patch(
+        f"/api/clients/{client_id}/windows/{window_id}/agent-config/hooks/UserPromptSubmit:hooks%2Fpreflight.sh",
+        json={"enabled": False},
+    )
+    assert patch_response.status_code == 200
+    updated_hooks = next(section for section in patch_response.json()["sections"] if section["id"] == "hooks")
+    assert updated_hooks["items"][0]["id"] == "UserPromptSubmit:hooks/preflight.sh"
+    assert updated_hooks["items"][0]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_remote_window_agent_config_uses_client_agent_request(db_client):
+    remote_client_id = await create_remote_client_id(db_client)
+    connection = AgentConfigRemoteConnection()
+    app.state.client_connections = FakeConnectionRegistry(connection)
+    create_response = await db_client.post(
+        f"/api/clients/{remote_client_id}/windows",
+        json={"cwd": "/workspace/project", "shell_command": "claude"},
+    )
+    assert create_response.status_code == 200
+    window_id = create_response.json()["id"]
+
+    get_response = await db_client.get(
+        f"/api/clients/{remote_client_id}/windows/{window_id}/agent-config"
+    )
+    assert get_response.status_code == 200
+    assert get_response.json()["agent"] == "claude"
+
+    patch_response = await db_client.patch(
+        f"/api/clients/{remote_client_id}/windows/{window_id}/agent-config/skills/review",
+        json={"enabled": False},
+    )
+    assert patch_response.status_code == 200
+
+    config_requests = [request for request in connection.requests if request.type.startswith("agent_config")]
+    assert [request.type for request in config_requests] == [
+        "agent_config_get",
+        "agent_config_set_enabled",
+    ]
+    assert config_requests[0].payload["agent"] == "claude_code"
+    assert config_requests[1].payload == {
+        "agent": "claude_code",
+        "section_id": "skills",
+        "item_id": "review",
+        "enabled": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_client_agent_config_endpoint_uses_remote_agent_config_request(db_client):
+    remote_client_id = await create_remote_client_id(db_client)
+    connection = AgentConfigRemoteConnection()
+    app.state.client_connections = FakeConnectionRegistry(connection)
+
+    response = await db_client.get(f"/api/clients/{remote_client_id}/agent-config/claude")
+
+    assert response.status_code == 200
+    assert response.json()["agent"] == "claude"
+    assert connection.requests[0].type == "agent_config_get"
+    assert connection.requests[0].window_id is None
+    assert connection.requests[0].payload == {"agent": "claude_code"}
 
 
 @pytest.mark.asyncio
@@ -1911,7 +2311,7 @@ async def test_get_window_returns_recent_active_for_recent_shell_command(db_clie
     assert response.status_code == 200
     work_status = response.json()["work_status"]
     assert work_status["state"] == "RECENT_ACTIVE"
-    assert work_status["label"] == "最近刚活跃过"
+    assert work_status["label"] == "Terminal 活跃"
     assert work_status["color"] == "green"
     assert work_status["last_activity_at"] is not None
     assert work_status["last_working_activity_at"] is None
@@ -1953,10 +2353,65 @@ async def test_get_window_returns_working_for_recent_agent_activity(db_client):
     assert response.status_code == 200
     work_status = response.json()["work_status"]
     assert work_status["state"] == "WORKING"
-    assert work_status["label"] == "正在工作中"
+    assert work_status["label"] == "Agent 工作中"
     assert work_status["color"] == "orange"
     assert work_status["last_activity_at"] is not None
     assert work_status["last_working_activity_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_get_window_ignores_old_agent_output_written_after_shell_exit(db_client):
+    client_id = await get_local_client_id(db_client)
+    now = datetime.now(timezone.utc)
+    async with db_client.session_factory() as session:
+        client = await ensure_local_client(session)
+        window = await create_window(session, client.id, cwd="/tmp", shell_command="/bin/bash")
+        session.add_all([
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.terminal,
+                source_id=str(window.id),
+                kind="terminal_input_command",
+                virtual_window_id=window.id,
+                payload_json={"command": "codex exec 'done'", "sequence": 43},
+                fingerprint=f"terminal_input_command:{window.id}:codex-old-output",
+                created_at=now - timedelta(seconds=80),
+            ),
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.terminal,
+                source_id=str(window.id),
+                kind="terminal_command_finished",
+                virtual_window_id=window.id,
+                payload_json={"command": "", "sequence": 43, "exit_status": 0},
+                fingerprint=f"terminal_command_finished:{window.id}:codex-old-output",
+                created_at=now - timedelta(seconds=20),
+            ),
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session",
+                kind="response_item",
+                virtual_window_id=window.id,
+                payload_json=codex_message_payload(
+                    "old output inserted late",
+                    timestamp=now - timedelta(seconds=40),
+                ),
+                fingerprint=f"agent_tool_record:{window.id}:codex-old-output",
+                created_at=now - timedelta(seconds=5),
+            ),
+        ])
+        window_id = window.id
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/windows/{window_id}")
+
+    assert response.status_code == 200
+    work_status = response.json()["work_status"]
+    assert work_status["state"] == "RECENT_ACTIVE"
+    assert work_status["label"] == "Terminal 活跃"
+    assert work_status["last_activity_at"] is not None
+    assert work_status["last_working_activity_at"] is None
 
 
 @pytest.mark.asyncio
@@ -2098,6 +2553,32 @@ async def test_get_window_hot_cache_skips_detail_queries(db_client, monkeypatch)
 
     assert second_response.status_code == 200
     assert second_response.json() == first_response.json()
+
+
+@pytest.mark.asyncio
+async def test_record_terminal_recent_invalidates_window_hot_cache(db_client):
+    client_id = await get_local_client_id(db_client)
+    window_response = await db_client.post(
+        f"/api/clients/{client_id}/windows",
+        json={"cwd": "/tmp", "shell_command": "/bin/bash"},
+    )
+    window_id = window_response.json()["id"]
+
+    first_response = await db_client.get(f"/api/clients/{client_id}/windows/{window_id}")
+    assert first_response.status_code == 200
+
+    recent_response = await db_client.post(
+        f"/api/clients/{client_id}/terminal-recents",
+        json={"window_id": window_id, "title": window_response.json()["title"]},
+    )
+    assert recent_response.status_code == 200
+
+    second_response = await db_client.get(f"/api/clients/{client_id}/windows/{window_id}")
+    assert second_response.status_code == 200
+    assert parse_response_datetime(second_response.json()["last_active_at"]) >= parse_response_datetime(
+        recent_response.json()["last_used_at"]
+    )
+    assert second_response.json()["last_active_at"] != first_response.json()["last_active_at"]
 
 
 @pytest.mark.asyncio
@@ -2318,18 +2799,28 @@ async def test_windows_activity_returns_work_status_for_windows(db_client):
     async with db_client.session_factory() as session:
         client = await ensure_local_client(session)
         window = await create_window(session, client.id, cwd="/tmp", shell_command="/bin/bash")
-        session.add(
+        session.add_all([
             Event(
                 client_id=client.id,
-                source_type=EventSourceType.codex_trace,
+                source_type=EventSourceType.terminal,
+                source_id=str(window.id),
+                kind="terminal_input_command",
+                virtual_window_id=window.id,
+                payload_json={"command": "codex exec 'fix tests'", "sequence": 42},
+                fingerprint=f"terminal_input_command:{window.id}:codex",
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+            ),
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.agent_tool_record,
                 source_id="codex-session",
                 kind="event_msg",
                 virtual_window_id=window.id,
-                payload_json={"type": "agent_message", "message": "Working"},
-                fingerprint=f"codex_trace:{window.id}:recent",
+                payload_json={"provider": "codex", "raw_type": "event_msg", "payload": {"type": "agent_message", "message": "Working"}},
+                fingerprint=f"agent_tool_record:{window.id}:recent",
                 created_at=datetime.now(timezone.utc) - timedelta(seconds=5),
-            )
-        )
+            ),
+        ])
         window_id = str(window.id)
         await session.commit()
 
@@ -2340,6 +2831,118 @@ async def test_windows_activity_returns_work_status_for_windows(db_client):
         item for item in response.json()["windows"] if item["window_id"] == window_id
     )
     assert activity_window["work_status"]["state"] == "WORKING"
+
+
+@pytest.mark.asyncio
+async def test_windows_activity_ignores_old_agent_output_written_after_shell_exit(db_client):
+    client_id = await get_local_client_id(db_client)
+    now = datetime.now(timezone.utc)
+    async with db_client.session_factory() as session:
+        client = await ensure_local_client(session)
+        window = await create_window(session, client.id, cwd="/tmp", shell_command="/bin/bash")
+        session.add_all([
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.terminal,
+                source_id=str(window.id),
+                kind="terminal_input_command",
+                virtual_window_id=window.id,
+                payload_json={"command": "codex exec 'done'", "sequence": 44},
+                fingerprint=f"terminal_input_command:{window.id}:codex-old-output-activity",
+                created_at=now - timedelta(seconds=80),
+            ),
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.terminal,
+                source_id=str(window.id),
+                kind="terminal_command_finished",
+                virtual_window_id=window.id,
+                payload_json={"command": "", "sequence": 44, "exit_status": 0},
+                fingerprint=f"terminal_command_finished:{window.id}:codex-old-output-activity",
+                created_at=now - timedelta(seconds=20),
+            ),
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session",
+                kind="response_item",
+                virtual_window_id=window.id,
+                payload_json=codex_message_payload(
+                    "old output inserted late",
+                    timestamp=now - timedelta(seconds=40),
+                ),
+                fingerprint=f"agent_tool_record:{window.id}:codex-old-output-activity",
+                created_at=now - timedelta(seconds=5),
+            ),
+        ])
+        window_id = str(window.id)
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/windows/activity")
+
+    assert response.status_code == 200
+    activity_window = next(
+        item for item in response.json()["windows"] if item["window_id"] == window_id
+    )
+    assert activity_window["work_status"]["state"] == "RECENT_ACTIVE"
+    assert activity_window["work_status"]["last_working_activity_at"] is None
+    assert activity_window["last_agent_task_status"] is None
+
+
+@pytest.mark.asyncio
+async def test_windows_activity_returns_to_working_after_completion_in_same_running_session(db_client):
+    client_id = await get_local_client_id(db_client)
+    now = datetime.now(timezone.utc)
+    async with db_client.session_factory() as session:
+        client = await ensure_local_client(session)
+        window = await create_window(session, client.id, cwd="/tmp", shell_command="/bin/bash")
+        session.add_all([
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.terminal,
+                source_id=str(window.id),
+                kind="terminal_input_command",
+                virtual_window_id=window.id,
+                payload_json={"command": "codex", "sequence": 45},
+                fingerprint=f"terminal_input_command:{window.id}:codex-multi-turn",
+                created_at=now - timedelta(minutes=3),
+            ),
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session",
+                kind="event_msg",
+                virtual_window_id=window.id,
+                payload_json=codex_completion_payload(timestamp=now - timedelta(seconds=40)),
+                fingerprint=f"agent_tool_record:{window.id}:codex-first-turn-complete",
+                created_at=now - timedelta(seconds=40),
+            ),
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session",
+                kind="response_item",
+                virtual_window_id=window.id,
+                payload_json=codex_message_payload(
+                    "second turn started",
+                    timestamp=now - timedelta(seconds=10),
+                ),
+                fingerprint=f"agent_tool_record:{window.id}:codex-second-turn-output",
+                created_at=now - timedelta(seconds=10),
+            ),
+        ])
+        window_id = str(window.id)
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/windows/activity")
+
+    assert response.status_code == 200
+    activity_window = next(
+        item for item in response.json()["windows"] if item["window_id"] == window_id
+    )
+    assert activity_window["work_status"]["state"] == "WORKING"
+    assert activity_window["work_status"]["last_working_activity_at"] is not None
+    assert activity_window["last_agent_task_status"] is None
 
 
 @pytest.mark.asyncio
@@ -2382,3 +2985,145 @@ async def test_windows_activity_does_not_notify_for_agent_open_close_without_res
         item for item in response.json()["windows"] if item["window_id"] == window_id
     )
     assert activity_window["last_agent_task_completed_at"] is None
+    assert activity_window["last_agent_task_status"] is None
+
+
+@pytest.mark.asyncio
+async def test_windows_activity_notifies_for_explicit_agent_completion(db_client):
+    client_id = await get_local_client_id(db_client)
+    async with db_client.session_factory() as session:
+        client = await ensure_local_client(session)
+        window = await create_window(session, client.id, cwd="/tmp", shell_command="/bin/bash")
+        completed_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+        session.add(
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session",
+                kind="event_msg",
+                virtual_window_id=window.id,
+                payload_json={
+                    "provider": "codex",
+                    "raw_type": "event_msg",
+                    "payload": {"type": "task_completed"},
+                },
+                fingerprint=f"agent_tool_record:{window.id}:codex-complete",
+                created_at=completed_at,
+            )
+        )
+        window_id = str(window.id)
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/windows/activity")
+
+    assert response.status_code == 200
+    activity_window = next(
+        item for item in response.json()["windows"] if item["window_id"] == window_id
+    )
+    assert activity_window["work_status"]["state"] == "FINISHED"
+    assert activity_window["last_agent_task_status"] == "FINISHED"
+    assert activity_window["last_agent_task_status_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_windows_activity_notifies_for_codex_task_complete_event(db_client):
+    client_id = await get_local_client_id(db_client)
+    now = datetime.now(timezone.utc)
+    async with db_client.session_factory() as session:
+        client = await ensure_local_client(session)
+        window = await create_window(session, client.id, cwd="/tmp", shell_command="/bin/bash")
+        completed_at = now - timedelta(seconds=30)
+        session.add_all(
+            [
+                Event(
+                    client_id=client.id,
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="codex-session",
+                    kind="response_item",
+                    virtual_window_id=window.id,
+                    payload_json=codex_message_payload(
+                        "finished",
+                        timestamp=completed_at - timedelta(milliseconds=45),
+                    ),
+                    fingerprint=f"agent_tool_record:{window.id}:codex-final-message",
+                    created_at=completed_at - timedelta(milliseconds=45),
+                ),
+                Event(
+                    client_id=client.id,
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="codex-session",
+                    kind="event_msg",
+                    virtual_window_id=window.id,
+                    payload_json=codex_completion_payload(
+                        event_type="task_complete",
+                        timestamp=completed_at,
+                    ),
+                    fingerprint=f"agent_tool_record:{window.id}:codex-task-complete",
+                    created_at=completed_at,
+                ),
+            ]
+        )
+        window_id = str(window.id)
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/windows/activity")
+
+    assert response.status_code == 200
+    activity_window = next(
+        item for item in response.json()["windows"] if item["window_id"] == window_id
+    )
+    assert activity_window["work_status"]["state"] == "FINISHED"
+    assert activity_window["last_agent_task_status"] == "FINISHED"
+    assert activity_window["last_agent_task_status_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_windows_activity_notifies_for_agent_abort(db_client):
+    client_id = await get_local_client_id(db_client)
+    async with db_client.session_factory() as session:
+        client = await ensure_local_client(session)
+        window = await create_window(session, client.id, cwd="/tmp", shell_command="/bin/bash")
+        now = datetime.now(timezone.utc)
+        output_at = now - timedelta(minutes=61)
+        session.add_all([
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.terminal,
+                source_id=str(window.id),
+                kind="terminal_input_command",
+                virtual_window_id=window.id,
+                payload_json={"command": "codex exec 'hang'", "sequence": 10},
+                fingerprint=f"terminal_input_command:{window.id}:codex-hang",
+                created_at=now - timedelta(minutes=62),
+            ),
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session",
+                kind="response_item",
+                virtual_window_id=window.id,
+                payload_json={
+                    "provider": "codex",
+                    "raw_type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "still running"}],
+                    },
+                },
+                fingerprint=f"agent_tool_record:{window.id}:codex-hang-output",
+                created_at=output_at,
+            ),
+        ])
+        window_id = str(window.id)
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/windows/activity")
+
+    assert response.status_code == 200
+    activity_window = next(
+        item for item in response.json()["windows"] if item["window_id"] == window_id
+    )
+    assert activity_window["work_status"]["state"] == "ABORTED"
+    assert activity_window["last_agent_task_status"] == "ABORTED"
+    assert activity_window["last_agent_task_status_at"] is not None

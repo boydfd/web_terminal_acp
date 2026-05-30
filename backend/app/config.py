@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     openai_compat_api_key: str = "dev-local-key"
     openai_compat_model: str = "local-summarizer"
     openai_compat_timeout_seconds: float = 60.0
+    redis_url: str | None = None
+    web_terminal_auth_secret: str | None = None
+    web_terminal_auth_session_ttl_seconds: int = 604800
+    web_terminal_disable_auth_for_tests: bool = False
     terminal_summary_idle_seconds: int = 20
     terminal_summary_initial_max_wait_seconds: int = 120
     terminal_summary_repeat_seconds: int = 600

@@ -375,6 +375,8 @@ class ClientTerminalMultiplexer:
             )
         with contextlib.suppress(RuntimeError):
             await self._run(["tmux", "set-option", "-t", target.shadow_session, "window-size", "manual"])
+        with contextlib.suppress(RuntimeError):
+            await self._run(["tmux", "set-option", "-t", target.shadow_session, "mouse", "on"])
         await self._run(["tmux", "select-window", "-t", f"{target.shadow_session}:{target.remote_window_id}"])
         with contextlib.suppress(RuntimeError):
             await self._run(

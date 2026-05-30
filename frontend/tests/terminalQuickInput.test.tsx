@@ -186,6 +186,25 @@ describe("TerminalQuickInput", () => {
     expect(onCustomQuickKeySubmit).toHaveBeenCalledWith({ id: "interrupt", label: "Interrupt", input: "{Ctrl-C}" });
   });
 
+  it("shows the quick key drawer even before quick keys exist", () => {
+    renderQuickInput({
+      customQuickKeys: [],
+      onCustomQuickKeySubmit: vi.fn(() => true)
+    });
+
+    const toggle = container?.querySelector("button[aria-expanded]");
+    if (!(toggle instanceof HTMLButtonElement)) {
+      throw new Error("Quick key toggle was not rendered");
+    }
+
+    act(() => {
+      toggle.click();
+    });
+
+    expect(container?.querySelector(".terminal-quick-key-drawer")).not.toBeNull();
+    expect(container?.textContent).toContain("没有匹配的快捷按键");
+  });
+
   it("keeps quick key search Enter from submitting the freeform input", () => {
     const onSubmit = vi.fn();
     renderQuickInput({

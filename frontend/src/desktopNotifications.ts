@@ -55,7 +55,7 @@ export function showAgentTaskDesktopNotification(notification: TerminalNotificat
     }
   }
 
-  const body = "Agent 任务已完成";
+  const body = notification.status === "ABORTED" ? "Agent 可能已中断" : "Agent 任务已完成";
   const desktopNotification = new Notification(notification.windowTitle, {
     body,
     tag: notification.id

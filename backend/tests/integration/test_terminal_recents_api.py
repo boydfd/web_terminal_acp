@@ -1,3 +1,4 @@
+import asyncio
 from uuid import UUID
 
 import pytest
@@ -88,6 +89,37 @@ async def test_record_and_list_terminal_recents(db_client):
     assert body["total_pages"] == 1
     assert [item["window_id"] for item in body["items"]] == [str(first.id), str(second.id)]
     assert body["items"][0]["title"] == "Alpha"
+
+
+@pytest.mark.asyncio
+async def test_record_terminal_recent_is_idempotent_under_concurrent_posts(db_client):
+    client_id = str(LOCAL_CLIENT_ID)
+    async with db_client.session_factory() as session:
+        window = await create_window(session, LOCAL_CLIENT_ID, None, None)
+        window.title = "Concurrent"
+        await session.commit()
+
+    responses = await asyncio.gather(
+        *[
+            db_client.post(
+                f"/api/clients/{client_id}/terminal-recents",
+                json={"window_id": str(window.id), "title": f"Concurrent {index}"},
+            )
+            for index in range(12)
+        ]
+    )
+
+    assert {response.status_code for response in responses} == {200}
+    async with db_client.session_factory() as session:
+        total = await session.scalar(
+            select(func.count())
+            .select_from(TerminalRecentUsage)
+            .where(
+                TerminalRecentUsage.client_id == LOCAL_CLIENT_ID,
+                TerminalRecentUsage.window_id == window.id,
+            )
+        )
+        assert total == 1
 
 
 @pytest.mark.asyncio

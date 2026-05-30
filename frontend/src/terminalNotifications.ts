@@ -6,6 +6,7 @@ export type TerminalNotification = {
   windowId: string;
   windowTitle: string;
   completedAt: string;
+  status: "FINISHED" | "ABORTED";
   read: boolean;
 };
 
@@ -100,7 +101,7 @@ export function loadStoredNotifications(clientId: string): TerminalNotification[
       return [];
     }
 
-    return parsedValue.filter(isTerminalNotification);
+    return parsedValue.filter(isTerminalNotification).map(normalizeTerminalNotification);
   } catch {
     return [];
   }
@@ -128,12 +129,15 @@ export function syncTerminalNotifications(
   const next: TerminalNotification[] = [];
 
   for (const treeWindow of windows) {
-    const completedAt = treeWindow.last_agent_task_completed_at;
-    if (!completedAt) {
+    const status = treeWindow.last_agent_task_status ?? (
+      treeWindow.last_agent_task_completed_at ? "FINISHED" : null
+    );
+    const completedAt = treeWindow.last_agent_task_status_at ?? treeWindow.last_agent_task_completed_at;
+    if (!status || !completedAt) {
       continue;
     }
 
-    const id = `${clientId}:${treeWindow.id}:${completedAt}`;
+    const id = `${clientId}:${treeWindow.id}:${status}:${completedAt}`;
     const previous = existingById.get(id);
     const acknowledgedAt = readAcknowledgedCompletionAt(clientId, treeWindow.id);
     if (previous === undefined && acknowledgedAtOrAfter(acknowledgedAt, completedAt)) {
@@ -147,6 +151,7 @@ export function syncTerminalNotifications(
       windowId: treeWindow.id,
       windowTitle: treeWindow.title,
       completedAt,
+      status,
       read: previous?.read ?? read
     });
   }
@@ -240,6 +245,14 @@ function isTerminalNotification(value: unknown): value is TerminalNotification {
     typeof candidate.windowId === "string" &&
     typeof candidate.windowTitle === "string" &&
     typeof candidate.completedAt === "string" &&
+    (candidate.status === undefined || candidate.status === "FINISHED" || candidate.status === "ABORTED") &&
     typeof candidate.read === "boolean"
   );
+}
+
+function normalizeTerminalNotification(notification: TerminalNotification): TerminalNotification {
+  return {
+    ...notification,
+    status: notification.status ?? "FINISHED"
+  };
 }

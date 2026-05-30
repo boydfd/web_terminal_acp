@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  clearLegacyCustomQuickKeys,
   decodeQuickKeyInput,
   filterCustomQuickKeys,
   normalizeCustomQuickKeys,
-  readCustomQuickKeys,
-  writeCustomQuickKeys
+  readLegacyCustomQuickKeys
 } from "../src/terminalQuickKeys";
 
 afterEach(() => {
@@ -32,16 +32,27 @@ describe("terminalQuickKeys", () => {
   it("normalizes stored quick keys", () => {
     expect(normalizeCustomQuickKeys([
       { id: "one", label: "  One  ", input: "{Enter}" },
+      { id: "two", label: "Two", input: "pwd", shortcut: { key: "K", alt: true } },
       { id: "empty-input", label: "Empty", input: "" },
       { id: "empty-label", label: "", input: "ls" },
       null
-    ])).toEqual([{ id: "one", label: "One", input: "{Enter}" }]);
+    ])).toEqual([
+      { id: "one", label: "One", input: "{Enter}" },
+      { id: "two", label: "Two", input: "pwd", shortcut: { key: "k", alt: true, ctrl: false, meta: false, shift: false } }
+    ]);
   });
 
-  it("persists quick keys in local storage", () => {
-    writeCustomQuickKeys([{ id: "one", label: "One", input: "pwd{Enter}" }]);
+  it("reads and clears legacy local storage quick keys for migration", () => {
+    window.localStorage.setItem(
+      "web-terminal-acp:custom-quick-keys",
+      JSON.stringify([{ id: "one", label: "One", input: "pwd{Enter}" }])
+    );
 
-    expect(readCustomQuickKeys()).toEqual([{ id: "one", label: "One", input: "pwd{Enter}" }]);
+    expect(readLegacyCustomQuickKeys()).toEqual([{ id: "one", label: "One", input: "pwd{Enter}" }]);
+
+    clearLegacyCustomQuickKeys();
+
+    expect(readLegacyCustomQuickKeys()).toEqual([]);
   });
 
   it("filters quick keys by label and input", () => {
