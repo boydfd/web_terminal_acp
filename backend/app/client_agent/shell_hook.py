@@ -44,6 +44,8 @@ def build_managed_shell_command(
         "WEB_TERMINAL_CODEX_HOME": codex_home,
         "WEB_TERMINAL_CLAUDE_CODE_HOME": claude_code_home,
         "WEB_TERMINAL_CURSOR_HOME": cursor_home,
+        "WEB_TERMINAL_ORIGINAL_CODEX_HOME": "~/.codex",
+        "WEB_TERMINAL_ORIGINAL_CLAUDE_CODE_HOME": "~/.claude",
         "WEB_TERMINAL_ORIGINAL_CURSOR_DIR": "~/.cursor",
         **storage_env,
     }
@@ -126,6 +128,9 @@ def _agent_environment_script() -> str:
     return r'''__web_terminal_prepare_codex_home() {
   [ -n "$WEB_TERMINAL_CODEX_HOME" ] || return 0
   __web_terminal_source_codex_home="${WEB_TERMINAL_ORIGINAL_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}"
+  case "$__web_terminal_source_codex_home" in
+    "~/"*) __web_terminal_source_codex_home="$HOME/${__web_terminal_source_codex_home#"~/"}" ;;
+  esac
   case "$WEB_TERMINAL_CODEX_HOME" in
     "~/"*) WEB_TERMINAL_CODEX_HOME="$HOME/${WEB_TERMINAL_CODEX_HOME#"~/"}" ;;
   esac
@@ -134,6 +139,11 @@ def _agent_environment_script() -> str:
     [ -e "$__web_terminal_source_codex_home/$__web_terminal_codex_item" ] || continue
     [ -e "$WEB_TERMINAL_CODEX_HOME/$__web_terminal_codex_item" ] && continue
     ln -s "$__web_terminal_source_codex_home/$__web_terminal_codex_item" "$WEB_TERMINAL_CODEX_HOME/$__web_terminal_codex_item" 2>/dev/null || true
+  done
+  for __web_terminal_codex_history_item in history.json history.jsonl; do
+    [ -e "$__web_terminal_source_codex_home/$__web_terminal_codex_history_item" ] || continue
+    [ -e "$WEB_TERMINAL_CODEX_HOME/$__web_terminal_codex_history_item" ] && continue
+    ln -s "$__web_terminal_source_codex_home/$__web_terminal_codex_history_item" "$WEB_TERMINAL_CODEX_HOME/$__web_terminal_codex_history_item" 2>/dev/null || true
   done
   export CODEX_HOME="$WEB_TERMINAL_CODEX_HOME"
 }
@@ -183,6 +193,9 @@ WEB_TERMINAL_CLAUDE_SETTINGS_ENV
 __web_terminal_prepare_claude_code_home() {
   [ -n "$WEB_TERMINAL_CLAUDE_CODE_HOME" ] || return 0
   __web_terminal_source_claude_home="${WEB_TERMINAL_ORIGINAL_CLAUDE_CODE_HOME:-$HOME/.claude}"
+  case "$__web_terminal_source_claude_home" in
+    "~/"*) __web_terminal_source_claude_home="$HOME/${__web_terminal_source_claude_home#"~/"}" ;;
+  esac
   case "$WEB_TERMINAL_CLAUDE_CODE_HOME" in
     "~/"*) WEB_TERMINAL_CLAUDE_CODE_HOME="$HOME/${WEB_TERMINAL_CLAUDE_CODE_HOME#"~/"}" ;;
   esac
@@ -195,6 +208,11 @@ __web_terminal_prepare_claude_code_home() {
     [ -e "$__web_terminal_source_claude_home/$__web_terminal_claude_item" ] || continue
     [ -e "$WEB_TERMINAL_CLAUDE_CODE_HOME/$__web_terminal_claude_item" ] && continue
     ln -s "$__web_terminal_source_claude_home/$__web_terminal_claude_item" "$WEB_TERMINAL_CLAUDE_CODE_HOME/$__web_terminal_claude_item" 2>/dev/null || true
+  done
+  for __web_terminal_claude_history_item in history.json history.jsonl file-history; do
+    [ -e "$__web_terminal_source_claude_home/$__web_terminal_claude_history_item" ] || continue
+    [ -e "$WEB_TERMINAL_CLAUDE_CODE_HOME/$__web_terminal_claude_history_item" ] && continue
+    ln -s "$__web_terminal_source_claude_home/$__web_terminal_claude_history_item" "$WEB_TERMINAL_CLAUDE_CODE_HOME/$__web_terminal_claude_history_item" 2>/dev/null || true
   done
   __web_terminal_load_claude_settings_env "$__web_terminal_source_claude_home/settings.json"
   export CLAUDE_CONFIG_DIR="$WEB_TERMINAL_CLAUDE_CODE_HOME"
@@ -259,11 +277,9 @@ __web_terminal_prepare_cursor_home() {
     "~/"*) source_cursor="$HOME/${WEB_TERMINAL_ORIGINAL_CURSOR_DIR#"~/"}" ;;
     *) source_cursor="${WEB_TERMINAL_ORIGINAL_CURSOR_DIR:-$HOME/.cursor}" ;;
   esac
-  mkdir -p "$managed_cursor/chats" 2>/dev/null || true
   for item in "$source_cursor"/*; do
     [ -e "$item" ] || continue
     base="${item##*/}"
-    [ "$base" = "chats" ] && continue
     [ -e "$managed_cursor/$base" ] && continue
     ln -sf "$item" "$managed_cursor/$base" 2>/dev/null || true
   done
@@ -388,18 +404,18 @@ __web_terminal_emit_command_marker() {
     WEB_TERMINAL_CAPTURED_CWD="$PWD" \
     WEB_TERMINAL_CAPTURED_SEQUENCE="$__web_terminal_sequence_value" \
     WEB_TERMINAL_CAPTURED_EXIT_STATUS="$__web_terminal_exit_status" \
-    python3 - <<'WEB_TERMINAL_PAYLOAD_PY'
+    python3 - <<'WEB_TERMINAL_PAYLOAD_PY' 2>/dev/null
 import base64
 import json
 import os
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 payload = {
     "phase": os.environ["WEB_TERMINAL_CAPTURED_PHASE"],
     "command": os.environ["WEB_TERMINAL_CAPTURED_COMMAND"],
     "shell": os.environ["WEB_TERMINAL_CAPTURED_SHELL"],
     "cwd": os.environ.get("WEB_TERMINAL_CAPTURED_CWD") or None,
-    "captured_at": datetime.now(UTC).isoformat(),
+    "captured_at": datetime.now(timezone.utc).isoformat(),
     "sequence": int(os.environ["WEB_TERMINAL_CAPTURED_SEQUENCE"]),
 }
 exit_status = os.environ.get("WEB_TERMINAL_CAPTURED_EXIT_STATUS")

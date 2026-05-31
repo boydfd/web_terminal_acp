@@ -48,7 +48,7 @@ async def consume_registration_key(
     session: AsyncSession,
     *,
     registration_key: str,
-    client_id: UUID,
+    client_id: UUID | None,
 ) -> ClientRegistrationKey | None:
     key_hash = hash_registration_key(registration_key)
     statement: Select[tuple[ClientRegistrationKey]] = select(ClientRegistrationKey).where(

@@ -57,11 +57,20 @@ afterEach(() => {
     root?.unmount();
   });
   container?.remove();
+  delete (window as Window & { __WEB_TERMINAL_API_BASE?: string }).__WEB_TERMINAL_API_BASE;
   root = null;
   container = null;
   window.localStorage.clear();
   vi.restoreAllMocks();
 });
+
+function changeInputValue(target: HTMLInputElement, value: string): void {
+  const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+  act(() => {
+    descriptor?.set?.call(target, value);
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
 
 describe("SettingsModal", () => {
   it("closes when Escape is pressed", () => {
@@ -101,6 +110,7 @@ describe("SettingsModal", () => {
 
   it("opens client registration controls and requests a one-time key", () => {
     const onGenerateRegistrationKey = vi.fn();
+    (window as Window & { __WEB_TERMINAL_API_BASE?: string }).__WEB_TERMINAL_API_BASE = "http://control.example.com:5173";
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -143,17 +153,23 @@ describe("SettingsModal", () => {
 
     expect(container?.textContent).toContain("一次性注册 Key");
     expect(container?.textContent).toContain("wtr_test_key");
+    const clientNameInput = Array.from(container?.querySelectorAll("input") ?? [])
+      .find((input) => input.placeholder === "例如：office-mac-mini");
+    expect(clientNameInput).toBeInstanceOf(HTMLInputElement);
+    changeInputValue(clientNameInput as HTMLInputElement, "office-mac-mini");
     const scriptTextarea = Array.from(container?.querySelectorAll("textarea") ?? [])
       .find((textarea) => textarea.value.includes("register-client-direct.sh"));
-    expect(scriptTextarea?.value).toContain("/api/clients/register-script");
+    expect(scriptTextarea?.value).toContain("http://control.example.com:5173/api/clients/register-script");
+    expect(scriptTextarea?.value).toContain("WEB_TERMINAL_SERVER_URL='http://control.example.com:5173'");
     expect(scriptTextarea?.value).toContain("WEB_TERMINAL_REGISTRATION_KEY='wtr_test_key'");
+    expect(scriptTextarea?.value).toContain("WEB_TERMINAL_CLIENT_NAME='office-mac-mini'");
     expect(scriptTextarea?.value).not.toContain("raw.githubusercontent.com");
     const generateButton = Array.from(container?.querySelectorAll("button") ?? [])
       .find((button) => button.textContent?.includes("生成一次性注册 Key"));
     act(() => {
       generateButton?.click();
     });
-    expect(onGenerateRegistrationKey).toHaveBeenCalledTimes(1);
+    expect(onGenerateRegistrationKey).toHaveBeenCalledWith("office-mac-mini");
   });
 
   it("can open directly to client registration controls", () => {

@@ -5,7 +5,9 @@ type ClientListProps = {
   selectedClientId: string | null;
   onSelectClient: (clientId: string) => void;
   onUpdateClient: (clientId: string) => void;
+  onDeleteClient: (client: Client) => void;
   updatingClientId: string | null;
+  deletingClientId: string | null;
 };
 
 function formatHostname(client: Client): string {
@@ -41,7 +43,9 @@ export function ClientList({
   selectedClientId,
   onSelectClient,
   onUpdateClient,
-  updatingClientId
+  onDeleteClient,
+  updatingClientId,
+  deletingClientId
 }: ClientListProps) {
   if (clients.length === 0) {
     return <p className="muted client-empty">No clients registered.</p>;
@@ -51,6 +55,7 @@ export function ClientList({
     <div className="client-cards">
       {clients.map((client) => {
         const isSelected = client.id === selectedClientId;
+        const isDeleting = deletingClientId === client.id;
         return (
           <div
             key={client.id}
@@ -74,15 +79,25 @@ export function ClientList({
               )}
             </button>
             {isSelected && client.runtime === "remote" && (
-              <button
-                type="button"
-                className="client-card-action"
-                data-onboarding-id="remote-client-update"
-                disabled={client.status !== "ONLINE" || updatingClientId === client.id}
-                onClick={() => onUpdateClient(client.id)}
-              >
-                {updatingClientId === client.id ? "Starting..." : "Update"}
-              </button>
+              <span className="client-card-actions">
+                <button
+                  type="button"
+                  className="client-card-action"
+                  data-onboarding-id="remote-client-update"
+                  disabled={client.status !== "ONLINE" || updatingClientId === client.id || isDeleting}
+                  onClick={() => onUpdateClient(client.id)}
+                >
+                  {updatingClientId === client.id ? "Starting..." : "Update"}
+                </button>
+                <button
+                  type="button"
+                  className="client-card-action client-card-delete"
+                  disabled={isDeleting}
+                  onClick={() => onDeleteClient(client)}
+                >
+                  {isDeleting ? "Deleting..." : "Delete"}
+                </button>
+              </span>
             )}
           </div>
         );

@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { readApiBase } from "../apiBase";
+import { readClientAgentServerUrl } from "../apiBase";
 import type { BootstrapClientInput } from "../types";
 
 type BootstrapClientFormProps = {
@@ -10,11 +10,7 @@ type BootstrapClientFormProps = {
 };
 
 function defaultServerUrl(): string {
-  const configured = import.meta.env.VITE_CLIENT_AGENT_SERVER_URL;
-  if (typeof configured === "string" && configured.trim() !== "") {
-    return configured.trim();
-  }
-  return readApiBase();
+  return readClientAgentServerUrl();
 }
 
 export function BootstrapClientForm({ isSubmitting, onCancel, onSubmit }: BootstrapClientFormProps) {

@@ -17,6 +17,7 @@ import type {
   ProjectSummary,
   TerminalRecent,
   TerminalRecentPage,
+  TerminalNotificationList,
   ClientWindowsActivity,
   GitWorktreeRunList,
   TreeFolderCore,
@@ -161,6 +162,30 @@ export function updateClient(clientId: string): Promise<ClientUpdateResult> {
   });
 }
 
+export async function deleteClient(clientId: string): Promise<void> {
+  const headers = new Headers();
+  const authToken = readAuthToken();
+  if (authToken !== null) {
+    headers.set("Authorization", `Bearer ${authToken}`);
+  }
+  const response = await fetch(apiUrl(`/api/clients/${pathSegment(clientId)}`), {
+    method: "DELETE",
+    headers
+  });
+  if (!response.ok) {
+    let detail: string | null = null;
+    try {
+      const body = await response.json() as { detail?: unknown };
+      if (typeof body.detail === "string") {
+        detail = body.detail;
+      }
+    } catch {
+      detail = null;
+    }
+    throw new Error(detail ? `${response.status} ${detail}` : `${response.status} ${response.statusText}`);
+  }
+}
+
 export function fetchTree(clientId: string): Promise<TreeFolderCore[]> {
   return request<TreeFolderCore[]>(`/api/clients/${pathSegment(clientId)}/tree`);
 }
@@ -177,6 +202,55 @@ export function fetchWindowActivity(
   const suffix = query ? `?${query}` : "";
   return request<ClientWindowsActivity>(
     `/api/clients/${pathSegment(clientId)}/windows/activity${suffix}`
+  );
+}
+
+export function fetchTerminalNotifications(clientId: string): Promise<TerminalNotificationList> {
+  return request<TerminalNotificationList>(
+    `/api/clients/${pathSegment(clientId)}/terminal-notifications`
+  );
+}
+
+export function markTerminalNotificationRead(
+  clientId: string,
+  windowId: string,
+  completedAt: string
+): Promise<TerminalNotificationList> {
+  return request<TerminalNotificationList>(
+    `/api/clients/${pathSegment(clientId)}/terminal-notifications/read`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        window_id: windowId,
+        completed_at: completedAt
+      })
+    }
+  );
+}
+
+export function dismissTerminalNotification(
+  clientId: string,
+  windowId: string,
+  completedAt: string
+): Promise<TerminalNotificationList> {
+  return request<TerminalNotificationList>(
+    `/api/clients/${pathSegment(clientId)}/terminal-notifications/dismiss`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        window_id: windowId,
+        completed_at: completedAt
+      })
+    }
+  );
+}
+
+export function clearTerminalNotifications(clientId: string): Promise<TerminalNotificationList> {
+  return request<TerminalNotificationList>(
+    `/api/clients/${pathSegment(clientId)}/terminal-notifications`,
+    {
+      method: "DELETE"
+    }
   );
 }
 

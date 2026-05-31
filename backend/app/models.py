@@ -74,6 +74,7 @@ class ProjectSummaryStatus(Enum):
 class Client(Base):
     __tablename__ = "clients"
     __table_args__ = (
+        UniqueConstraint("name", name="uq_clients_name"),
         Index("ix_clients_status", "status"),
         Index("ix_clients_runtime", "runtime"),
     )
@@ -115,9 +116,6 @@ class Client(Base):
     connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
@@ -617,6 +615,30 @@ class TerminalRecentUsage(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     last_used_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class TerminalNotificationState(Base):
+    __tablename__ = "terminal_notification_states"
+    __table_args__ = (
+        UniqueConstraint("client_id", "window_id", name="uq_terminal_notification_states_client_window"),
+        Index("ix_terminal_notification_states_client_id", "client_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    client_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("clients.id", ondelete="CASCADE"), nullable=False
+    )
+    window_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("virtual_windows.id", ondelete="CASCADE"), nullable=False
+    )
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
 

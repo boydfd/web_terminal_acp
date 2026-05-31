@@ -3127,3 +3127,104 @@ async def test_windows_activity_notifies_for_agent_abort(db_client):
     assert activity_window["work_status"]["state"] == "ABORTED"
     assert activity_window["last_agent_task_status"] == "ABORTED"
     assert activity_window["last_agent_task_status_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_terminal_notifications_are_backend_stateful(db_client):
+    client_id = await get_local_client_id(db_client)
+    now = datetime.now(timezone.utc)
+    async with db_client.session_factory() as session:
+        client = await ensure_local_client(session)
+        window = await create_window(session, client.id, cwd="/tmp", shell_command="/bin/bash")
+        completed_at = now - timedelta(seconds=30)
+        session.add(
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session",
+                kind="event_msg",
+                virtual_window_id=window.id,
+                payload_json=codex_completion_payload(timestamp=completed_at),
+                fingerprint=f"agent_tool_record:{window.id}:codex-notification-complete",
+                created_at=completed_at,
+            )
+        )
+        window_id = str(window.id)
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/terminal-notifications")
+
+    assert response.status_code == 200
+    [notification] = response.json()["notifications"]
+    assert notification["window_id"] == window_id
+    assert notification["status"] == "FINISHED"
+    assert notification["read"] is False
+
+    read_response = await db_client.post(
+        f"/api/clients/{client_id}/terminal-notifications/read",
+        json={
+            "window_id": window_id,
+            "completed_at": notification["completed_at"],
+        },
+    )
+
+    assert read_response.status_code == 200
+    [read_notification] = read_response.json()["notifications"]
+    assert read_notification["id"] == notification["id"]
+    assert read_notification["read"] is True
+
+    dismiss_response = await db_client.post(
+        f"/api/clients/{client_id}/terminal-notifications/dismiss",
+        json={
+            "window_id": window_id,
+            "completed_at": notification["completed_at"],
+        },
+    )
+
+    assert dismiss_response.status_code == 200
+    assert dismiss_response.json()["notifications"] == []
+    assert (await db_client.get(f"/api/clients/{client_id}/terminal-notifications")).json()["notifications"] == []
+
+    stale_response = await db_client.post(
+        f"/api/clients/{client_id}/terminal-notifications/read",
+        json={
+            "window_id": window_id,
+            "completed_at": (now + timedelta(days=1)).isoformat(),
+        },
+    )
+    assert stale_response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_terminal_notifications_clear_hides_current_notifications(db_client):
+    client_id = await get_local_client_id(db_client)
+    now = datetime.now(timezone.utc)
+    async with db_client.session_factory() as session:
+        client = await ensure_local_client(session)
+        first = await create_window(session, client.id, cwd="/tmp/one", shell_command="/bin/bash")
+        second = await create_window(session, client.id, cwd="/tmp/two", shell_command="/bin/bash")
+        for index, window in enumerate((first, second)):
+            completed_at = now - timedelta(seconds=30 + index)
+            session.add(
+                Event(
+                    client_id=client.id,
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id=f"codex-session-{index}",
+                    kind="event_msg",
+                    virtual_window_id=window.id,
+                    payload_json=codex_completion_payload(timestamp=completed_at),
+                    fingerprint=f"agent_tool_record:{window.id}:codex-clear-complete",
+                    created_at=completed_at,
+                )
+            )
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/terminal-notifications")
+    assert response.status_code == 200
+    assert len(response.json()["notifications"]) == 2
+
+    clear_response = await db_client.delete(f"/api/clients/{client_id}/terminal-notifications")
+
+    assert clear_response.status_code == 200
+    assert clear_response.json()["notifications"] == []
+    assert (await db_client.get(f"/api/clients/{client_id}/terminal-notifications")).json()["notifications"] == []

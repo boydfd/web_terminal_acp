@@ -1238,6 +1238,25 @@ h2 {
   white-space: nowrap;
 }
 
+.client-card-actions {
+  display: flex;
+  align-items: stretch;
+}
+
+.client-card-actions .client-card-action {
+  min-width: 66px;
+}
+
+.client-card-delete {
+  color: #fecaca;
+}
+
+.client-card-delete:hover:not(:disabled) {
+  border-color: #7f1d1d;
+  background: #450a0a;
+  color: #fecaca;
+}
+
 .client-details {
   display: grid;
   gap: 5px;

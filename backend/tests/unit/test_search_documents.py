@@ -18,6 +18,7 @@ from app.services.search_index import (
     index_ai_event,
     index_terminal_chunk,
     index_terminal_chunk_without_event,
+    is_flood_stage_index_block,
     search_all,
     summary_doc,
     terminal_chunk_doc,
@@ -118,6 +119,19 @@ def test_summary_doc_combines_fields_into_searchable_text():
     assert doc["folder_path"] == "/ops/web"
     assert doc["summary"] == "Fixed permissions on static directory."
     assert doc["text"] == "Nginx incident prod 403 /ops/web Fixed permissions on static directory."
+
+
+def test_flood_stage_index_block_detects_elasticsearch_disk_watermark_error():
+    assert is_flood_stage_index_block(
+        "ApiError(429, 'cluster_block_exception', "
+        "'index [summaries] blocked by: "
+        "[TOO_MANY_REQUESTS/12/disk usage exceeded flood-stage watermark, "
+        "index has read-only-allow-delete block];')"
+    )
+
+
+def test_flood_stage_index_block_does_not_match_generic_search_failure():
+    assert not is_flood_stage_index_block("Elasticsearch unavailable")
 
 
 class FakeIndices:

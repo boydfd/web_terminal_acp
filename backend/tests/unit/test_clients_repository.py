@@ -10,6 +10,7 @@ from app.models import Client, ClientRuntime, ClientStatus, LOCAL_CLIENT_ID
 from app.repositories.clients import (
     LOCAL_CLIENT_NAME,
     authenticate_client,
+    create_or_rotate_remote_client_by_name,
     create_client,
     ensure_local_client,
     generate_client_token,
@@ -147,3 +148,36 @@ async def test_ensure_local_client_recovers_from_concurrent_insert(session, monk
     assert client.connected_at is not None
     assert client.last_seen_at is not None
     assert len(list(await session.scalars(select(Client)))) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_or_rotate_remote_client_by_name_reuses_existing_client_and_rotates_token(session):
+    first, first_token, first_reused = await create_or_rotate_remote_client_by_name(
+        session,
+        name="office-mac-mini",
+        hostname="old-host",
+        install_path="/old/path",
+    )
+    first_id = first.id
+    first_hash = first.token_hash
+    await session.commit()
+
+    second, second_token, reused = await create_or_rotate_remote_client_by_name(
+        session,
+        name="office-mac-mini",
+        hostname="new-host",
+        install_path="/new/path",
+    )
+    await session.commit()
+
+    clients = list(await session.scalars(select(Client)))
+    assert first_reused is False
+    assert reused is True
+    assert second.id == first_id
+    assert second_token != first_token
+    assert second.token_hash != first_hash
+    assert verify_client_token(second_token, second.token_hash) is True
+    assert second.hostname == "new-host"
+    assert second.install_path == "/new/path"
+    assert second.status is ClientStatus.OFFLINE
+    assert len(clients) == 1

@@ -16,6 +16,10 @@ _SYNTHETIC_PREFIXES = (
     "<system-reminder>",
     "<system_reminder>",
     "<conversation_summary>",
+    "<local-command-caveat>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
 )
 
 _SENSITIVE_PREFIXES = (

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable
@@ -46,7 +47,29 @@ def cursor_store_paths_for_window(window_id: UUID | str) -> list[Path]:
     root = Path.home() / ".web-terminal-acp" / "cursor-homes" / str(window_id)
     if not root.exists():
         return []
-    return sorted(path for path in root.rglob("store.db") if path.is_file())
+    return _find_files_following_directory_symlinks(root, "store.db")
+
+
+def _find_files_following_directory_symlinks(root: Path, file_name: str) -> list[Path]:
+    paths: list[Path] = []
+    visited_dirs: set[tuple[int, int]] = set()
+    for current_root, dir_names, file_names in os.walk(root, followlinks=True):
+        current_path = Path(current_root)
+        try:
+            stat = current_path.stat()
+        except OSError:
+            dir_names[:] = []
+            continue
+        dir_key = (stat.st_dev, stat.st_ino)
+        if dir_key in visited_dirs:
+            dir_names[:] = []
+            continue
+        visited_dirs.add(dir_key)
+        if file_name in file_names:
+            path = current_path / file_name
+            if path.is_file():
+                paths.append(path)
+    return sorted(paths)
 
 
 def claude_code_home_for_window(window_id: UUID | str) -> Path:
@@ -352,15 +375,6 @@ def initialize_agent_tool_watcher_state(state: AgentToolWatcherState, *, window_
     history_file = claude_code_history_file(window_id)
     try:
         state.claude_code_history_offset = history_file.stat().st_size
-        session_ids = read_all_claude_history_session_ids(history_file)
-        found_session_ids = _add_claude_code_history_transcripts(
-            state,
-            window_id=window_id,
-            session_ids=session_ids,
-            start_at_eof=True,
-        )
-        state.claude_code_history_session_ids.update(found_session_ids)
-        state.claude_code_pending_history_session_ids.update(session_ids - found_session_ids)
     except FileNotFoundError:
         state.claude_code_history_offset = 0
 

@@ -16,7 +16,7 @@ import {
   writeThemeSkin
 } from "../userPreferences";
 import { ensureDesktopNotificationPermission } from "../desktopNotifications";
-import { readApiBase, readConfiguredApiBase, writeConfiguredApiBase } from "../apiBase";
+import { readApiBase, readClientAgentServerUrl, readConfiguredApiBase, writeConfiguredApiBase } from "../apiBase";
 import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   createCustomQuickKey,
@@ -63,7 +63,7 @@ type SettingsModalProps = {
   registrationKeyPending: boolean;
   registrationKeyError: string | null;
   initialView?: SettingsView;
-  onGenerateRegistrationKey: () => void;
+  onGenerateRegistrationKey: (label?: string | null) => void;
   onboardingEnabled: boolean;
   onStartOnboarding: () => void;
   onLogout: () => void;
@@ -198,7 +198,9 @@ export function SettingsModal({
   const [agentCommandDraft, setAgentCommandDraft] = useState<AgentCommandSettings>(() => readAgentCommandSettings());
   const [view, setView] = useState<SettingsView>("general");
   const [quickKeyDraft, setQuickKeyDraft] = useState<CustomQuickKey>(() => createCustomQuickKey());
+  const [registrationClientName, setRegistrationClientName] = useState("");
   const [recordingShortcutTarget, setRecordingShortcutTarget] = useState<ShortcutBindingTarget | null>(null);
+  const effectiveRegistrationClientName = registrationClientName.trim() || "<唯一 client 名称>";
   const quickKeyDraftValid = quickKeyDraft.label.trim().length > 0 && quickKeyDraft.input.length > 0;
   const shortcutRows: Array<{
     target: ShortcutBindingTarget;
@@ -367,8 +369,9 @@ export function SettingsModal({
   const registrationScript = [
     `curl -fsSL ${shellSingleQuote(apiPath("/api/clients/register-script"))} -o register-client-direct.sh`,
     "chmod +x register-client-direct.sh",
-    `WEB_TERMINAL_SERVER_URL=${shellSingleQuote(readApiBase())} \\`,
+    `WEB_TERMINAL_SERVER_URL=${shellSingleQuote(readClientAgentServerUrl())} \\`,
     `WEB_TERMINAL_REGISTRATION_KEY=${shellSingleQuote(registrationKey ?? "<先生成 key>")} \\`,
+    `WEB_TERMINAL_CLIENT_NAME=${shellSingleQuote(effectiveRegistrationClientName)} \\`,
     "./register-client-direct.sh"
   ].join("\n");
 
@@ -681,10 +684,18 @@ export function SettingsModal({
               <p className="muted">
                 一次性注册 Key 适合在目标机器上主动运行脚本接入 remote client；不用从本机 SSH 登录目标机器。
               </p>
+              <label className="settings-field">
+                <span>Client 唯一名称</span>
+                <input
+                  value={registrationClientName}
+                  onChange={(event) => setRegistrationClientName(event.target.value)}
+                  placeholder="例如：office-mac-mini"
+                />
+              </label>
               <button
                 type="button"
-                disabled={registrationKeyPending}
-                onClick={onGenerateRegistrationKey}
+                disabled={registrationKeyPending || registrationClientName.trim().length === 0}
+                onClick={() => onGenerateRegistrationKey(registrationClientName.trim() || null)}
               >
                 生成一次性注册 Key
               </button>

@@ -100,6 +100,7 @@ Important `.env` values:
 | `OPENAI_COMPAT_API_KEY` | API key for summary generation | `dev-local-key` |
 | `OPENAI_COMPAT_MODEL` | Model used for generated summaries | `local-summarizer` |
 | `VITE_API_BASE` | Frontend build-time fallback API origin; leave empty for Docker nginx proxying | empty |
+| `VITE_CLIENT_AGENT_SERVER_URL` | Optional override for the URL written into SSH/direct remote client configs | empty |
 | `VITE_ENABLE_ONBOARDING` | Frontend build-time switch for the new-user guide; set `true` to enable | empty |
 
 Do not commit `.env`. Before exposing the app beyond localhost, set `WEB_TERMINAL_AUTH_SECRET`, use strong database passwords, and put a TLS reverse proxy in front of the UI/backend.
@@ -138,6 +139,8 @@ WEB_TERMINAL_SERVER_URL=http://your-server:8001 \
 WEB_TERMINAL_REGISTRATION_KEY=wtr_xxx \
 ./register-client-direct.sh
 ```
+
+`WEB_TERMINAL_SERVER_URL` is the HTTP origin the installed client keeps using for API calls and WebSocket reconnects. It can be the backend URL directly, or a frontend/reverse-proxy URL such as `:5173` when that proxy forwards `/api` and WebSocket upgrades.
 
 What the script does:
 

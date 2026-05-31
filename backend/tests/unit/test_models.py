@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -128,6 +129,45 @@ def _assert_invalid_metadata_values_rejected(engine) -> None:
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
                 connection.exec_driver_sql(statement, parameters)
+
+
+def test_alembic_revision_graph_has_unique_single_head():
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    script = ScriptDirectory.from_config(config)
+    revisions = [revision.revision for revision in script.walk_revisions()]
+
+    assert len(revisions) == len(set(revisions))
+    assert script.get_heads() == ["20260531_0029"]
+
+
+def test_sqlite_alembic_upgrade_from_ambiguous_0028_creates_terminal_notifications(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "ambiguous-0028.db"
+    database_url = f"sqlite+aiosqlite:///{database_path}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+
+    try:
+        get_settings.cache_clear()
+        command.upgrade(config, "20260530_0027")
+        command.stamp(config, "20260531_0028")
+        command.upgrade(config, "head")
+    finally:
+        get_settings.cache_clear()
+
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    with engine.connect() as connection:
+        tables = {
+            row[0]
+            for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+    assert "terminal_notification_states" in tables
 
 
 def test_folder_has_materialized_path():

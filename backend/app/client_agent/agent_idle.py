@@ -53,6 +53,12 @@ _PROVIDER_COMMANDS = {
     "codex": {"codex"},
     "cursor_cli": _CURSOR_COMMANDS,
 }
+_CLAUDE_LOCAL_COMMAND_PREFIXES = (
+    "<local-command-caveat>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,8 @@ class AgentSessionRef:
     session_id: str
     source_path: str | None
     last_output_at: float
+    claude_worktree_name: str | None = None
+    claude_worktree_original_cwd: str | None = None
 
 
 @dataclass
@@ -79,6 +87,8 @@ class SuspendedAgent:
     source_path: str | None
     last_output_at: float
     suspended_at: float
+    claude_worktree_name: str | None = None
+    claude_worktree_original_cwd: str | None = None
 
 
 ProcessDetector = Callable[
@@ -147,6 +157,7 @@ class AgentIdleSupervisor:
                 continue
             state = self._state_for(event.window_id, event.provider)
             state.project_path = event.project_path or state.project_path
+            session = _merge_session_metadata(state.session, session)
             if state.last_output_at is None or session.last_output_at >= state.last_output_at:
                 state.last_output_at = session.last_output_at
                 state.session = session
@@ -321,16 +332,25 @@ class AgentIdleSupervisor:
 
 
 def session_ref_from_event(event: ManagedAiEvent) -> AgentSessionRef | None:
+    if event.provider == "claude_code" and _claude_local_command_payload(event.payload):
+        return None
+
     session_id = session_id_from_payload(event.provider, event.payload, event.source_path)
     if session_id is None:
         return None
 
+    claude_worktree_name, claude_worktree_original_cwd = claude_worktree_metadata_from_payload(
+        event.provider,
+        event.payload,
+    )
     last_output_at = _event_output_time(event.source_path)
     return AgentSessionRef(
         provider=event.provider,
         session_id=session_id,
         source_path=event.source_path,
         last_output_at=last_output_at,
+        claude_worktree_name=claude_worktree_name,
+        claude_worktree_original_cwd=claude_worktree_original_cwd,
     )
 
 
@@ -365,6 +385,8 @@ def latest_resume_command(window_id: UUID, *, project_path: str | None = None) -
             source_path=session.source_path,
             last_output_at=session.last_output_at,
             suspended_at=time.time(),
+            claude_worktree_name=session.claude_worktree_name,
+            claude_worktree_original_cwd=session.claude_worktree_original_cwd,
         )
     )
 
@@ -375,11 +397,17 @@ def latest_claude_session_ref(window_id: UUID) -> AgentSessionRef | None:
         session_id = _latest_claude_session_id(path)
         if session_id is None:
             continue
+        claude_worktree_name, claude_worktree_original_cwd = _latest_claude_worktree_metadata(
+            path,
+            session_id=session_id,
+        )
         candidate = AgentSessionRef(
             provider="claude_code",
             session_id=session_id,
             source_path=str(path),
             last_output_at=_path_mtime(path),
+            claude_worktree_name=claude_worktree_name,
+            claude_worktree_original_cwd=claude_worktree_original_cwd,
         )
         best = _newer_session(best, candidate)
     return best
@@ -435,13 +463,23 @@ def session_id_from_payload(
     return None
 
 
+def claude_worktree_metadata_from_payload(
+    provider: str,
+    payload: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    if provider != "claude_code":
+        return None, None
+    return _claude_worktree_metadata_from_payload(payload)
+
+
 def resume_command(record: SuspendedAgent) -> str | None:
     command_name = _resume_command_name(record.provider, record.command_name)
     if command_name is None:
         return None
 
     if record.provider == "claude_code":
-        provider_command = format_agent_command(command_name, "--resume", record.session_id)
+        args = _claude_resume_args(record)
+        provider_command = format_agent_command(command_name, *args)
     elif record.provider == "codex":
         provider_command = format_agent_command(command_name, "resume", record.session_id)
     elif record.provider == "cursor_cli":
@@ -449,8 +487,9 @@ def resume_command(record: SuspendedAgent) -> str | None:
     else:
         return None
 
-    if record.cwd:
-        return f"cd {shlex.quote(record.cwd)} && WEB_TERMINAL_AUTO_RESUME=1 {provider_command}"
+    cwd = _resume_cwd(record)
+    if cwd:
+        return f"cd {shlex.quote(cwd)} && WEB_TERMINAL_AUTO_RESUME=1 {provider_command}"
     return f"WEB_TERMINAL_AUTO_RESUME=1 {provider_command}"
 
 
@@ -477,6 +516,8 @@ def suspended_agent_from_process(
         source_path=session.source_path,
         last_output_at=session.last_output_at,
         suspended_at=suspended_at,
+        claude_worktree_name=session.claude_worktree_name,
+        claude_worktree_original_cwd=session.claude_worktree_original_cwd,
     )
 
 
@@ -516,6 +557,34 @@ def _latest_claude_session_id(path: Path) -> str | None:
     return latest
 
 
+def _latest_claude_worktree_metadata(
+    path: Path,
+    *,
+    session_id: str | None = None,
+) -> tuple[str | None, str | None]:
+    latest_name: str | None = None
+    latest_original_cwd: str | None = None
+    try:
+        with path.open("rb") as handle:
+            for raw_line in handle:
+                try:
+                    payload = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                payload_session_id = session_id_from_payload("claude_code", payload, str(path))
+                if session_id is not None and payload_session_id not in {None, session_id}:
+                    continue
+                worktree_name, original_cwd = _claude_worktree_metadata_from_payload(payload)
+                if worktree_name is not None:
+                    latest_name = worktree_name
+                    latest_original_cwd = original_cwd
+    except OSError:
+        return None, None
+    return latest_name, latest_original_cwd
+
+
 def _latest_codex_session_id(path: Path) -> str | None:
     latest: str | None = None
     try:
@@ -542,6 +611,34 @@ def _codex_session_id_from_payload(payload: dict[str, Any]) -> str | None:
         if raw_id:
             return raw_id
     return None
+
+
+def _claude_resume_args(record: SuspendedAgent) -> tuple[str, ...]:
+    return ("--resume", record.session_id)
+
+
+def _resume_cwd(record: SuspendedAgent) -> str | None:
+    if record.provider == "claude_code" and record.claude_worktree_name is not None:
+        return record.claude_worktree_original_cwd or record.cwd
+    return record.cwd
+
+
+def _claude_worktree_metadata_from_payload(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    worktree_session = payload.get("worktreeSession")
+    if not isinstance(worktree_session, dict):
+        return None, None
+    worktree_name = _valid_claude_worktree_name(
+        _string_value(worktree_session.get("worktreeName"))
+    )
+    if worktree_name is None:
+        return None, None
+    return worktree_name, _string_value(worktree_session.get("originalCwd"))
+
+
+def _valid_claude_worktree_name(value: str | None) -> str | None:
+    if value is None or "/" in value or "\\" in value:
+        return None
+    return value
 
 
 def _cursor_session_id(path: Path) -> str | None:
@@ -609,6 +706,35 @@ def _newer_session(
     return current
 
 
+def _merge_session_metadata(
+    current: AgentSessionRef | None,
+    candidate: AgentSessionRef,
+) -> AgentSessionRef:
+    if (
+        current is None
+        or current.provider != candidate.provider
+        or current.session_id != candidate.session_id
+    ):
+        return candidate
+    claude_worktree_name = candidate.claude_worktree_name or current.claude_worktree_name
+    claude_worktree_original_cwd = (
+        candidate.claude_worktree_original_cwd or current.claude_worktree_original_cwd
+    )
+    if (
+        claude_worktree_name == candidate.claude_worktree_name
+        and claude_worktree_original_cwd == candidate.claude_worktree_original_cwd
+    ):
+        return candidate
+    return AgentSessionRef(
+        provider=candidate.provider,
+        session_id=candidate.session_id,
+        source_path=candidate.source_path,
+        last_output_at=candidate.last_output_at,
+        claude_worktree_name=claude_worktree_name,
+        claude_worktree_original_cwd=claude_worktree_original_cwd,
+    )
+
+
 def _string_value(value: Any) -> str | None:
     if isinstance(value, str):
         value = value.strip()
@@ -616,6 +742,27 @@ def _string_value(value: Any) -> str | None:
     if isinstance(value, (int, float, bool)):
         return str(value)
     return None
+
+
+def _claude_local_command_payload(payload: dict[str, Any]) -> bool:
+    if _string_value(payload.get("type")) != "user":
+        return False
+
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return False
+    role = _string_value(message.get("role"))
+    if role not in {None, "user"}:
+        return False
+
+    content = _string_value(message.get("content"))
+    if content is None:
+        return payload.get("isMeta") is True
+
+    stripped = content.lstrip()
+    return payload.get("isMeta") is True or any(
+        stripped.startswith(prefix) for prefix in _CLAUDE_LOCAL_COMMAND_PREFIXES
+    )
 
 
 def _root_agent_process(processes: tuple[AgentProcess, ...]) -> AgentProcess | None:
@@ -643,6 +790,10 @@ def _suspended_agent_from_dict(value: dict[str, Any]) -> SuspendedAgent | None:
         source_path=_string_value(value.get("source_path")),
         last_output_at=float(value.get("last_output_at") or 0),
         suspended_at=float(value.get("suspended_at") or 0),
+        claude_worktree_name=_valid_claude_worktree_name(
+            _string_value(value.get("claude_worktree_name"))
+        ),
+        claude_worktree_original_cwd=_string_value(value.get("claude_worktree_original_cwd")),
     )
 
 

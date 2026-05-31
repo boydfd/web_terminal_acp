@@ -15,6 +15,7 @@ from app.models import (
     Folder,
     GitWorktreeRun,
     SummaryJob,
+    TerminalNotificationState,
     TerminalRecentUsage,
     VirtualWindow,
     WindowGitBinding,
@@ -271,6 +272,12 @@ async def delete_window(
     await session.execute(sa_delete(SummaryJob).where(SummaryJob.virtual_window_id == window_id))
     await session.execute(
         sa_delete(TerminalRecentUsage).where(TerminalRecentUsage.window_id == window_id)
+    )
+    await session.execute(
+        sa_delete(TerminalNotificationState).where(
+            TerminalNotificationState.client_id == client_id,
+            TerminalNotificationState.window_id == window_id,
+        )
     )
     await session.execute(
         sa_delete(WindowTitleHistory).where(WindowTitleHistory.virtual_window_id == window_id)

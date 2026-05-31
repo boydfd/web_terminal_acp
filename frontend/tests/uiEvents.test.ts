@@ -12,7 +12,7 @@ import {
 const invalidateEvent = {
   type: "invalidate" as const,
   seq: 42,
-  resources: ["window", "tree", "agent_record", "command_history", "title_history", "git_runs"],
+  resources: ["window", "tree", "terminal_notifications", "agent_record", "command_history", "title_history", "git_runs"],
   client_id: "client-1",
   window_id: "window-1",
   reason: "window_updated"
@@ -33,6 +33,7 @@ describe("queryKeysForUiInvalidation", () => {
   it("maps backend resources to the queries that drive terminal notifications", () => {
     expect(queryKeysForUiInvalidation(invalidateEvent)).toEqual([
       ["tree", "client-1"],
+      ["terminal-notifications", "client-1"],
       ["window-activity", "client-1"],
       ["window", "client-1", "window-1"],
       ["command-history", "client-1", "window-1"],

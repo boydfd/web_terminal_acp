@@ -56,6 +56,31 @@ def claude_completion_payload() -> dict:
     }
 
 
+def claude_turn_duration_payload(*, timestamp: datetime | None = None) -> dict:
+    payload = {
+        "provider": "claude_code",
+        "type": "system",
+        "subtype": "turn_duration",
+        "durationMs": 166049,
+        "messageCount": 37,
+    }
+    if timestamp is not None:
+        payload["timestamp"] = timestamp.isoformat()
+    return payload
+
+
+def claude_local_command_payload(text: str = "<bash-stdout>done</bash-stdout>") -> dict:
+    return {
+        "provider": "claude_code",
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": text,
+        },
+        "isMeta": True,
+    }
+
+
 @pytest.fixture
 async def db_session():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -905,6 +930,92 @@ async def test_load_last_agent_task_completed_uses_codex_task_complete_event(db_
 
     assert status.state == "FINISHED"
     assert latest[window.id] == completed_at
+    task_status = activity.last_agent_task_status[window.id]
+    assert task_status.state == "FINISHED"
+    assert task_status.occurred_at == completed_at
+
+
+@pytest.mark.asyncio
+async def test_load_last_agent_task_completed_uses_claude_turn_duration_event(db_session) -> None:
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    window = VirtualWindow(id=uuid4(), client_id=client_id, title="Terminal", status=WindowStatus.active)
+    db_session.add(window)
+    await db_session.flush()
+    completed_at = now - timedelta(seconds=5)
+    window.agent_activity_latest_at = completed_at
+    window.agent_activity_latest_completed_at = completed_at
+    db_session.add(
+        Event(
+            client_id=client_id,
+            source_type=EventSourceType.agent_tool_record,
+            source_id="claude-session-1",
+            kind="system",
+            virtual_window_id=window.id,
+            payload_json=claude_turn_duration_payload(timestamp=completed_at),
+            fingerprint="claude-agent-turn-duration-complete",
+            created_at=completed_at,
+        )
+    )
+    await db_session.flush()
+
+    status = await load_work_status(db_session, client_id, window.id, now=now)
+    latest = await load_last_agent_task_completed_at_by_window(
+        db_session,
+        client_id,
+        [window.id],
+        now=now,
+    )
+    activity = await load_tree_window_activity(db_session, client_id, [window.id], now=now)
+
+    assert status.state == "FINISHED"
+    assert latest[window.id] == completed_at
+    task_status = activity.last_agent_task_status[window.id]
+    assert task_status.state == "FINISHED"
+    assert task_status.occurred_at == completed_at
+
+
+@pytest.mark.asyncio
+async def test_claude_local_command_events_do_not_override_turn_completion(db_session) -> None:
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    window = VirtualWindow(id=uuid4(), client_id=client_id, title="Terminal", status=WindowStatus.active)
+    db_session.add(window)
+    await db_session.flush()
+    completed_at = now - timedelta(minutes=2)
+    local_command_at = now - timedelta(seconds=10)
+    window.agent_activity_latest_at = local_command_at
+    window.agent_activity_latest_completed_at = completed_at
+    db_session.add_all(
+        [
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="claude-session-1",
+                kind="system",
+                virtual_window_id=window.id,
+                payload_json=claude_turn_duration_payload(timestamp=completed_at),
+                fingerprint="claude-agent-turn-duration-before-local-command",
+                created_at=completed_at,
+            ),
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="claude-session-1",
+                kind="user_message",
+                virtual_window_id=window.id,
+                payload_json=claude_local_command_payload("<bash-stdout>WEB_TERMINAL_CLAUDE_CODE_HOME=...</bash-stdout>"),
+                fingerprint="claude-local-command-after-finish",
+                created_at=local_command_at,
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    activity = await load_tree_window_activity(db_session, client_id, [window.id], now=now)
+
+    assert activity.work_statuses[window.id].state == "FINISHED"
+    assert activity.work_statuses[window.id].last_working_activity_at == completed_at
     task_status = activity.last_agent_task_status[window.id]
     assert task_status.state == "FINISHED"
     assert task_status.occurred_at == completed_at

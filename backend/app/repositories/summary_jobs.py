@@ -159,9 +159,13 @@ async def claim_next_summary_job(session: AsyncSession) -> SummaryJob | None:
     return job
 
 
-async def mark_summary_job_succeeded(session: AsyncSession, job: SummaryJob) -> None:
+async def mark_summary_job_succeeded(
+    session: AsyncSession,
+    job: SummaryJob,
+    warning: BaseException | str | None = None,
+) -> None:
     job.status = SummaryJobStatus.succeeded
-    job.last_error = None
+    job.last_error = _bounded_error_message(warning) if warning is not None else None
     job.run_after = None
     await session.flush()
 

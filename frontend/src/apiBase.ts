@@ -9,6 +9,11 @@ function readEnvApiBase(): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function readEnvClientAgentServerUrl(): string {
+  const value = import.meta.env.VITE_CLIENT_AGENT_SERVER_URL;
+  return typeof value === "string" ? value.trim() : "";
+}
+
 function defaultApiBase(): string {
   if (typeof window === "undefined") {
     return "http://127.0.0.1:8001";
@@ -103,4 +108,17 @@ export function readApiBase(): string {
   }
 
   return defaultApiBase();
+}
+
+export function readClientAgentServerUrl(): string {
+  const configured = readEnvClientAgentServerUrl();
+  if (configured !== "") {
+    try {
+      return normalizeApiBaseInput(configured);
+    } catch {
+      return readApiBase();
+    }
+  }
+
+  return readApiBase();
 }

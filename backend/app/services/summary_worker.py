@@ -27,7 +27,12 @@ from app.repositories.summary_jobs import (
     mark_summary_job_succeeded,
 )
 from app.repositories.windows import patch_window
-from app.services.search_index import get_es_client, index_summary
+from app.services.search_index import (
+    flood_stage_index_block_warning,
+    get_es_client,
+    index_summary,
+    is_flood_stage_index_block,
+)
 from app.services.summarizer import OpenAICompatibleSummarizer
 from app.services.ui_events import UiEventHub
 
@@ -175,6 +180,20 @@ async def process_next_summary_job(
         raise
     except Exception as exc:
         logger.exception("failed to index summary document", extra={"window_id": str(updated_window.id)})
+        if is_flood_stage_index_block(exc):
+            await mark_summary_job_succeeded(
+                session,
+                job,
+                flood_stage_index_block_warning(exc),
+            )
+            _queue_ui_invalidation(
+                session,
+                ["window", "tree", "title_history"],
+                client_id=updated_window.client_id,
+                window_id=updated_window.id,
+                reason="summary_succeeded_search_index_blocked",
+            )
+            return True
         await mark_summary_job_retryable(session, job, f"summary indexing failed: {exc}")
         _queue_ui_invalidation(
             session,

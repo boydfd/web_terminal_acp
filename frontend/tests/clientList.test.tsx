@@ -48,8 +48,10 @@ function renderClientList(selectedClientId: string | null): void {
         ]}
         selectedClientId={selectedClientId}
         updatingClientId={null}
+        deletingClientId={null}
         onSelectClient={() => {}}
         onUpdateClient={() => {}}
+        onDeleteClient={() => {}}
       />
     );
   });
@@ -83,7 +85,16 @@ describe("ClientList", () => {
     const selectedCard = container?.querySelector(".client-card.selected");
     expect(selectedCard?.textContent).toContain("remote-host");
     expect(selectedCard?.textContent).toContain("Update");
+    expect(selectedCard?.textContent).toContain("Delete");
     expect(selectedCard?.textContent).not.toContain("Updated");
     expect(selectedCard?.textContent).not.toMatch(/\b(?:AM|PM)\b/);
+  });
+
+  it("does not show a delete action for the local client", () => {
+    renderClientList("client-1");
+
+    const selectedCard = container?.querySelector(".client-card.selected");
+    expect(selectedCard?.textContent).toContain("Local client");
+    expect(selectedCard?.textContent).not.toContain("Delete");
   });
 });

@@ -86,6 +86,7 @@ def test_apply_agent_config_selection_materializes_per_window_home(tmp_path: Pat
         '[plugins."superpowers@openai-curated"]\nenabled = true\n',
         encoding="utf-8",
     )
+    (codex_home / "history.jsonl").write_text('{"prompt":"fix"}\n', encoding="utf-8")
 
     config = apply_agent_config_selection(
         AgentConfigSelection(
@@ -115,8 +116,37 @@ def test_apply_agent_config_selection_materializes_per_window_home(tmp_path: Pat
     assert (managed / "skills.disabled" / "docker" / "SKILL.md").is_file()
     assert (managed / "skills" / "sleepy" / "SKILL.md").is_file()
     assert 'enabled = false' in (managed / "config.toml").read_text(encoding="utf-8")
+    assert (managed / "history.jsonl").resolve() == codex_home / "history.jsonl"
     assert (codex_home / "skills" / "docker" / "SKILL.md").is_file()
     assert (codex_home / "skills.disabled" / "sleepy" / "SKILL.md").is_file()
+
+
+def test_apply_agent_config_selection_links_history_for_claude_and_cursor(tmp_path: Path) -> None:
+    claude_home = tmp_path / ".claude"
+    cursor_home = tmp_path / ".cursor"
+    claude_home.mkdir()
+    cursor_home.mkdir()
+    (claude_home / "history.jsonl").write_text('{"display":"fix"}\n', encoding="utf-8")
+    (claude_home / "file-history").mkdir()
+    (cursor_home / "chats").mkdir()
+    (cursor_home / "chats" / "marker").write_text("cursor chat", encoding="utf-8")
+
+    apply_agent_config_selection(
+        AgentConfigSelection(agent="claude", sections=[]),
+        window_id="window-1",
+        home=tmp_path,
+    )
+    apply_agent_config_selection(
+        AgentConfigSelection(agent="cursor", sections=[]),
+        window_id="window-1",
+        home=tmp_path,
+    )
+
+    managed_claude = tmp_path / ".web-terminal-acp" / "claude-code-homes" / "window-1"
+    managed_cursor = tmp_path / ".web-terminal-acp" / "cursor-homes" / "window-1"
+    assert (managed_claude / "history.jsonl").resolve() == claude_home / "history.jsonl"
+    assert (managed_claude / "file-history").resolve() == claude_home / "file-history"
+    assert (managed_cursor / "chats").resolve() == cursor_home / "chats"
 
 
 def test_directory_config_rejects_path_traversal_item_id(tmp_path: Path) -> None:

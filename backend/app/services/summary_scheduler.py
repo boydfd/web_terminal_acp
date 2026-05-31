@@ -10,7 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent_tools import agent_activity_source_types, get_agent_tool_registry
 from app.config import get_settings
 from app.models import Event, SummaryJob, SummaryJobStatus, VirtualWindow
-from app.services.agent_activity_projection import event_activity_time, event_is_agent_completion
+from app.services.agent_activity_projection import (
+    event_activity_time,
+    event_is_agent_activity,
+    event_is_agent_completion,
+)
 from app.services.window_runtime_tags import agent_from_command
 
 INPUT_IDLE_REASON = "input_idle"
@@ -283,7 +287,7 @@ def _agent_activity_time_from_event(event: Event | None) -> datetime | None:
         return None
     if event.kind == AGENT_WORK_PRESENCE_KIND:
         return _ensure_aware(event.created_at)
-    if event.source_type in agent_activity_source_types():
+    if event.source_type in agent_activity_source_types() and event_is_agent_activity(event):
         return event_activity_time(event)
     if event.kind == TERMINAL_INPUT_COMMAND_KIND and _command_agent(event) is not None:
         return _event_input_time(event)
@@ -372,13 +376,13 @@ async def _agent_activity_times_before(
     ]
     if current_event_id is not None:
         filters.append(Event.id != current_event_id)
-    created_at = await session.scalar(
-        select(Event.created_at)
+    events = await session.scalars(
+        select(Event)
         .where(*filters)
         .order_by(desc(Event.created_at), desc(Event.id))
-        .limit(1)
+        .limit(100)
     )
-    return [_ensure_aware(created_at)] if created_at is not None else []
+    return [_ensure_aware(event_activity_time(event)) for event in events if event_is_agent_activity(event)]
 
 
 async def _last_summary_at(session: AsyncSession, window_id: UUID) -> datetime | None:

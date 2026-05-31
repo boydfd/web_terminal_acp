@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import Base
 from app.models import Client
+from app.repositories.clients import create_client
 from app.schemas import BootstrapClientIn
 from app.services.bootstrap.installer import (
     BootstrapConnectionError,
@@ -65,6 +66,8 @@ def test_dependency_check_script_checks_required_bins_without_sudo():
     assert "command -v python3" in script
     assert "command -v tmux" in script
     assert "command -v bash" in script
+    assert "sys.version_info >= (3, 10)" in script
+    assert "python3>=3.10" in script
     assert "python3 -m venv" in script
     assert "-m pip --version" in script
     assert "mktemp -d" in script
@@ -250,6 +253,100 @@ async def test_bootstrap_client_reuses_existing_remote_config(db_session_factory
     assert db_client is not None
     assert db_client.last_update_at is not None
     assert json.loads(ssh.uploads["~/.web-terminal-acp/config.json"])["token"] == TOKEN
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_client_reuses_existing_remote_name_without_config(db_session_factory):
+    ssh = FakeSsh()
+    payload = BootstrapClientIn(
+        name="Named Dev",
+        host="dev.example.com",
+        port=22,
+        username="alice",
+        private_key=PRIVATE_KEY,
+        passphrase=None,
+        server_url="https://control.example.com",
+    )
+
+    async with db_session_factory() as session:
+        existing_client, old_token = await create_client(
+            session,
+            name="Named Dev",
+            hostname="old-host",
+            install_path="/old/path",
+        )
+        existing_id = existing_client.id
+        old_hash = existing_client.token_hash
+        await session.flush()
+
+        result = await bootstrap_client(session, payload, ssh_client_factory=lambda _info: ssh)
+        db_client = await session.get(Client, existing_id)
+        await session.commit()
+
+    uploaded_config = json.loads(ssh.uploads["~/.web-terminal-acp/config.json"])
+    assert result.reused is True
+    assert result.client_id == existing_id
+    assert db_client is not None
+    assert db_client.token_hash != old_hash
+    assert uploaded_config["client_id"] == str(existing_id)
+    assert uploaded_config["token"] != old_token
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_client_prefers_requested_name_when_existing_config_points_elsewhere(
+    db_session_factory,
+):
+    existing_config_id = uuid4()
+    existing_config = json.dumps(
+        {
+            "client_id": str(existing_config_id),
+            "token": TOKEN,
+            "server_url": "https://control.example.com",
+            "name": "Old Config",
+            "install_path": "~/.web-terminal-acp",
+        }
+    )
+    ssh = FakeSsh(existing_config=existing_config)
+    payload = BootstrapClientIn(
+        name="Named Dev",
+        host="dev.example.com",
+        port=22,
+        username="alice",
+        private_key=PRIVATE_KEY,
+        passphrase=None,
+        server_url="https://control.example.com",
+    )
+
+    async with db_session_factory() as session:
+        configured_client, _old_config_token = await create_client(
+            session,
+            name="Old Config",
+            token=TOKEN,
+            hostname="old-host",
+            install_path="/old/path",
+        )
+        configured_client.id = existing_config_id
+        named_client, named_old_token = await create_client(
+            session,
+            name="Named Dev",
+            hostname="named-old-host",
+            install_path="/named/old/path",
+        )
+        named_id = named_client.id
+        named_old_hash = named_client.token_hash
+        await session.flush()
+
+        result = await bootstrap_client(session, payload, ssh_client_factory=lambda _info: ssh)
+        db_named_client = await session.get(Client, named_id)
+        await session.commit()
+
+    uploaded_config = json.loads(ssh.uploads["~/.web-terminal-acp/config.json"])
+    assert result.reused is True
+    assert result.client_id == named_id
+    assert db_named_client is not None
+    assert db_named_client.token_hash != named_old_hash
+    assert uploaded_config["client_id"] == str(named_id)
+    assert uploaded_config["token"] not in {TOKEN, named_old_token}
 
 
 @pytest.mark.asyncio

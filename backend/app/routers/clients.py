@@ -8,11 +8,18 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import PlainTextResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import SessionLocal, get_session
 from app.models import Client, ClientRuntime
-from app.repositories.clients import authenticate_client, get_client, list_clients
+from app.repositories.clients import (
+    authenticate_client,
+    delete_remote_client,
+    get_client,
+    get_client_by_name,
+    list_clients,
+)
 from app.repositories.client_registration_keys import create_registration_key
 from app.routers.ui_events import ui_event_hub_from_state
 from app.schemas import (
@@ -40,7 +47,11 @@ from app.services.client_update import (
     build_client_update_package,
     start_client_update,
 )
-from app.services.direct_registration import ClientRegistrationKeyInvalid, register_direct_client
+from app.services.direct_registration import (
+    ClientRegistrationKeyInvalid,
+    ClientRegistrationNameUnavailable,
+    register_direct_client,
+)
 from app.services.direct_registration_script import read_direct_registration_script
 from app.services.polling_response_cache import (
     begin_response_cache_refresh,
@@ -83,6 +94,15 @@ def _connection_registry(request: Request) -> ClientConnectionRegistry:
         registry = ClientConnectionRegistry()
         request.app.state.client_connections = registry
     return registry
+
+
+async def _close_client_connection(request: Request, client_id: UUID) -> None:
+    registry = _connection_registry(request)
+    connection = registry.get(client_id)
+    if connection is None:
+        return
+    await connection.close()
+    await registry.unregister(client_id, connection)
 
 
 def _bootstrap_error_detail(payload: BootstrapClientIn, exc: Exception) -> str:
@@ -245,6 +265,8 @@ async def register_client_directly(
         )
     except ClientRegistrationKeyInvalid as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from None
+    except ClientRegistrationNameUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
     await session.commit()
     await ui_event_hub_from_state(request.app.state).publish_invalidation(
         ["clients"],
@@ -356,9 +378,16 @@ async def update_client(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="client not found")
 
     if "name" in payload.model_fields_set and payload.name is not None:
+        existing_named_client = await get_client_by_name(session, payload.name)
+        if existing_named_client is not None and existing_named_client.id != client_id:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="client name already exists")
         client.name = payload.name
 
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="client name already exists") from None
     await session.refresh(client)
     await ui_event_hub_from_state(request.app.state).publish_invalidation(
         ["clients"],
@@ -366,3 +395,27 @@ async def update_client(
         reason="client_updated",
     )
     return to_client_out(client)
+
+
+@router.delete("/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_client(
+    request: Request,
+    client_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    client = await get_client(session, client_id)
+    if client is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="client not found")
+    if client.runtime == ClientRuntime.local:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="local client deletion unsupported")
+
+    deleted = await delete_remote_client(session, client_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="client not found")
+    await session.commit()
+    await _close_client_connection(request, client_id)
+    await ui_event_hub_from_state(request.app.state).publish_invalidation(
+        ["clients", "tree", "window", "search"],
+        client_id=client_id,
+        reason="client_deleted",
+    )

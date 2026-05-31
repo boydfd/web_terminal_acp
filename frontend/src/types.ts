@@ -164,6 +164,20 @@ export type ClientWindowsActivity = {
   windows: Array<WindowActivity & { window_id: string }>;
 };
 
+export type TerminalNotification = {
+  id: string;
+  client_id: string;
+  window_id: string;
+  window_title: string;
+  completed_at: string;
+  status: "FINISHED" | "ABORTED";
+  read: boolean;
+};
+
+export type TerminalNotificationList = {
+  notifications: TerminalNotification[];
+};
+
 export type TreeFolderCore = {
   id: string;
   name: string;

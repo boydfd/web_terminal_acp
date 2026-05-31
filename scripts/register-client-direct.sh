@@ -16,7 +16,7 @@ Usage:
 Options:
   --server-url URL       Web Terminal backend URL
   --registration-key KEY One-time registration key generated in Settings
-  --name NAME            Client display name
+  --name NAME            Unique client name
   --install-path PATH    Install path, default ~/.web-terminal-acp
 USAGE
 }
@@ -60,6 +60,14 @@ missing=""
 command -v python3 >/dev/null 2>&1 || missing="$missing python3"
 command -v tmux >/dev/null 2>&1 || missing="$missing tmux"
 command -v bash >/dev/null 2>&1 || missing="$missing bash"
+if command -v python3 >/dev/null 2>&1 && ! python3 - <<'PY' >/dev/null 2>&1
+import sys
+
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+then
+  missing="$missing python3>=3.10"
+fi
 venv_test="$(mktemp -d 2>/dev/null || true)"
 if [ -z "$venv_test" ] || ! python3 -m venv "$venv_test/venv" >/dev/null 2>&1 || ! "$venv_test/venv/bin/python" -m pip --version >/dev/null 2>&1; then
   missing="$missing python3-venv"

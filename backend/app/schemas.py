@@ -145,6 +145,25 @@ class ClientWindowsActivityOut(BaseModel):
     windows: list[WindowActivityOut] = Field(default_factory=list)
 
 
+class TerminalNotificationOut(BaseModel):
+    id: str
+    client_id: UUID
+    window_id: UUID
+    window_title: str
+    completed_at: datetime
+    status: Literal["FINISHED", "ABORTED"]
+    read: bool
+
+
+class TerminalNotificationListOut(BaseModel):
+    notifications: list[TerminalNotificationOut] = Field(default_factory=list)
+
+
+class TerminalNotificationAckIn(BaseModel):
+    window_id: UUID
+    completed_at: datetime
+
+
 class TreeFolderOut(BaseModel):
     id: UUID
     name: str

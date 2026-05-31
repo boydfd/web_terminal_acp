@@ -5,14 +5,19 @@ import {
   bootstrapClient,
   createClientRegistrationKey,
   createWindow,
+  clearTerminalNotifications,
+  deleteClient,
   deleteWindow,
+  dismissTerminalNotification,
   fetchAuthStatus,
   fetchClients,
   fetchCustomQuickKeys,
   fetchProjectSummaries,
+  fetchTerminalNotifications,
   fetchTree,
   fetchWindowActivity,
   login,
+  markTerminalNotificationRead,
   recordTerminalRecent,
   uiEventsWebSocketUrl,
   updateClient,
@@ -66,13 +71,8 @@ import {
 } from "./terminalQuickKeys";
 import { ensureDesktopNotificationPermission, showAgentTaskDesktopNotification } from "./desktopNotifications";
 import {
-  clearTerminalNotifications,
-  deleteTerminalNotification,
   findNewUnreadNotifications,
-  flattenTreeWindows,
-  markTerminalNotificationRead,
-  markTerminalViewed,
-  syncTerminalNotifications,
+  normalizeTerminalNotifications,
   type TerminalNotification
 } from "./terminalNotifications";
 import {
@@ -250,6 +250,10 @@ type DeleteWindowVariables = {
   nextWindowId: string | null;
 };
 
+type DeleteClientVariables = {
+  clientId: string;
+};
+
 type CreateWindowVariables = {
   clientId: string;
   cwd?: string | null;
@@ -344,6 +348,24 @@ function findWindowTitle(folders: TreeFolder[] | undefined, windowId: string | n
   }
 
   return findTreeWindow(folders, windowId)?.title ?? null;
+}
+
+function flattenTreeWindows(folders: TreeFolder[] | undefined): TreeFolder["windows"][number][] {
+  if (!folders) {
+    return [];
+  }
+
+  const windows: TreeFolder["windows"][number][] = [];
+  const visit = (folder: TreeFolder) => {
+    windows.push(...folder.windows);
+    for (const child of folder.folders) {
+      visit(child);
+    }
+  };
+  for (const folder of folders) {
+    visit(folder);
+  }
+  return windows;
 }
 
 function pickWindowAfterDelete(folders: TreeFolder[] | undefined, deletedWindowId: string): string | null {
@@ -608,13 +630,14 @@ function AuthenticatedApp({
   const [terminalListLocateSignal, setTerminalListLocateSignal] = useState(0);
   const [terminalNotifications, setTerminalNotifications] = useState<TerminalNotification[]>([]);
   const notificationPreviousRef = useRef<TerminalNotification[]>([]);
+  const notificationHydratedClientRef = useRef<string | null>(null);
   const virtualKeysPreferenceTouchedRef = useRef(false);
   const terminalControlsRef = useRef<HTMLDivElement | null>(null);
   const terminalPaneRef = useRef<TerminalPaneHandle | null>(null);
   const queryClient = useQueryClient();
 
   const registrationKeyMutation = useMutation({
-    mutationFn: () => createClientRegistrationKey(),
+    mutationFn: (label?: string | null) => createClientRegistrationKey(label),
   });
 
   const agentRecordModal = useAgentRecordData({
@@ -860,6 +883,26 @@ function AuthenticatedApp({
     enabled: selectedClientId !== null && treeQuery.isSuccess,
     refetchInterval: (query) => (activityHasWorkingTerminal(query.state.data) ? 3000 : 10000)
   });
+  const lastNotificationActivitySignature = useMemo(() => {
+    if (!windowActivityQuery.data) {
+      return "";
+    }
+
+    return windowActivityQuery.data.windows
+      .map((window) => [
+        window.window_id,
+        window.last_agent_task_status ?? "",
+        window.last_agent_task_status_at ?? window.last_agent_task_completed_at ?? ""
+      ].join(":"))
+      .sort()
+      .join("|");
+  }, [windowActivityQuery.data]);
+  const terminalNotificationsQuery = useQuery({
+    queryKey: ["terminal-notifications", selectedClientId, lastNotificationActivitySignature],
+    queryFn: () => fetchTerminalNotifications(selectedClientId as string),
+    enabled: selectedClientId !== null && windowActivityQuery.isSuccess,
+    refetchInterval: 10000
+  });
   const treeFolders = useMemo(
     () => mergeTreeWithActivity(treeQuery.data, windowActivityMap(windowActivityQuery.data)),
     [treeQuery.data, windowActivityQuery.data]
@@ -920,6 +963,33 @@ function AuthenticatedApp({
         }
         return nextWindowId;
       });
+    }
+  });
+  const deleteClientMutation = useMutation({
+    mutationFn: ({ clientId }: DeleteClientVariables) => deleteClient(clientId),
+    onSuccess: (_result, { clientId }) => {
+      queryClient.removeQueries({ queryKey: ["tree", clientId] });
+      queryClient.removeQueries({ queryKey: ["window-activity", clientId] });
+      queryClient.removeQueries({ queryKey: ["terminal-notifications", clientId] });
+      queryClient.removeQueries({ queryKey: ["terminal-recents", clientId] });
+      queryClient.removeQueries({ queryKey: ["project-summaries", clientId] });
+      queryClient.invalidateQueries({ queryKey: ["clients"] });
+      setTerminalNotifications((current) => current.filter((notification) => notification.clientId !== clientId));
+      notificationPreviousRef.current = notificationPreviousRef.current.filter(
+        (notification) => notification.clientId !== clientId
+      );
+      if (selectedClientId !== clientId) {
+        return;
+      }
+
+      setRouteSelectionRequest(null);
+      setSelectedClientId(null);
+      setSelectedWindowId(null);
+      setMobileTerminalActive(false);
+      setDetailPanelOpen(false);
+      setTerminalImmersive(false);
+      setAgentRecordModalOpen(false);
+      writeTerminalRoute(null, null, "replace");
     }
   });
   const bootstrapMutation = useMutation({
@@ -1330,11 +1400,22 @@ function AuthenticatedApp({
     if (selectedClientId === null) {
       setTerminalNotifications([]);
       notificationPreviousRef.current = [];
+      notificationHydratedClientRef.current = null;
+      return;
+    }
+    if (!terminalNotificationsQuery.isSuccess) {
+      if (notificationHydratedClientRef.current !== selectedClientId) {
+        setTerminalNotifications([]);
+        notificationPreviousRef.current = [];
+      }
       return;
     }
 
-    const next = syncTerminalNotifications(selectedClientId, treeFolders);
-    const newlyUnread = findNewUnreadNotifications(notificationPreviousRef.current, next);
+    const next = normalizeTerminalNotifications(terminalNotificationsQuery.data?.notifications);
+    const previous = notificationPreviousRef.current;
+    const hydrated = notificationHydratedClientRef.current === selectedClientId;
+    const newlyUnread = hydrated ? findNewUnreadNotifications(previous, next) : [];
+    notificationHydratedClientRef.current = selectedClientId;
     notificationPreviousRef.current = next;
     setTerminalNotifications(next);
 
@@ -1351,10 +1432,15 @@ function AuthenticatedApp({
         showAgentTaskDesktopNotification(notification);
       }
     });
-  }, [desktopNotificationsEnabled, selectedClientId, treeFolders]);
+  }, [
+    desktopNotificationsEnabled,
+    selectedClientId,
+    terminalNotificationsQuery.data,
+    terminalNotificationsQuery.isSuccess
+  ]);
 
   useEffect(() => {
-    if (selectedClientId === null || selectedWindowId === null || treeFolders === undefined) {
+    if (selectedClientId === null || selectedWindowId === null) {
       return;
     }
 
@@ -1362,20 +1448,24 @@ function AuthenticatedApp({
       return;
     }
 
-    const treeWindow = flattenTreeWindows(treeFolders).find((window) => window.id === selectedWindowId);
-    const taskStatusAt = treeWindow?.last_agent_task_status_at ?? treeWindow?.last_agent_task_completed_at;
-    if (!taskStatusAt) {
+    const notification = terminalNotifications.find(
+      (item) => item.windowId === selectedWindowId && !item.read
+    );
+    if (notification === undefined) {
       return;
     }
 
-    const next = markTerminalViewed(
+    void markTerminalNotificationRead(
       selectedClientId,
-      selectedWindowId,
-      taskStatusAt
-    );
-    notificationPreviousRef.current = next;
-    setTerminalNotifications(next);
-  }, [selectedClientId, selectedWindowId, treeFolders]);
+      notification.windowId,
+      notification.completedAt
+    ).then((result) => {
+      const next = normalizeTerminalNotifications(result.notifications);
+      notificationPreviousRef.current = next;
+      setTerminalNotifications(next);
+      queryClient.setQueriesData({ queryKey: ["terminal-notifications", selectedClientId] }, () => result);
+    }).catch(() => {});
+  }, [queryClient, selectedClientId, selectedWindowId, terminalNotifications]);
 
   useEffect(() => {
     if (
@@ -1513,6 +1603,9 @@ function AuthenticatedApp({
   const deleteErrorMessage = deleteMutation.error instanceof Error
     ? deleteMutation.error.message
     : "Failed to delete terminal.";
+  const deleteClientErrorMessage = deleteClientMutation.error instanceof Error
+    ? deleteClientMutation.error.message
+    : "Failed to delete client.";
   const switchTerminalShortcut = effectiveKeyboardShortcut("switch-terminal", keyboardShortcutBindings);
   const newTerminalShortcutLabel = keyboardShortcutLabel(effectiveKeyboardShortcut("new-terminal", keyboardShortcutBindings));
   const quickInputShortcutLabel = keyboardShortcutLabel(effectiveKeyboardShortcut("quick-input", keyboardShortcutBindings));
@@ -1535,6 +1628,21 @@ function AuthenticatedApp({
   );
 
   const deletingWindowId = deleteMutation.isPending ? deleteMutation.variables?.windowId ?? null : null;
+  const deletingClientId = deleteClientMutation.isPending ? deleteClientMutation.variables?.clientId ?? null : null;
+
+  const requestDeleteClient = (client: Client) => {
+    if (client.runtime !== "remote" || deleteClientMutation.isPending) {
+      return;
+    }
+
+    if (!window.confirm(`Delete client "${client.name}"? This removes its terminals, history, and saved metadata.`)) {
+      return;
+    }
+
+    setUpdateFailed(false);
+    setUpdateMessage(null);
+    deleteClientMutation.mutate({ clientId: client.id });
+  };
 
   const requestDeleteWindow = (windowId: string, title: string) => {
     if (selectedClientId === null || deleteMutation.isPending) {
@@ -1562,9 +1670,16 @@ function AuthenticatedApp({
   };
 
   const handleSelectNotification = useCallback((notification: TerminalNotification) => {
-    const next = markTerminalNotificationRead(notification.clientId, notification);
-    notificationPreviousRef.current = next;
-    setTerminalNotifications(next);
+    void markTerminalNotificationRead(
+      notification.clientId,
+      notification.windowId,
+      notification.completedAt
+    ).then((result) => {
+      const next = normalizeTerminalNotifications(result.notifications);
+      notificationPreviousRef.current = next;
+      setTerminalNotifications(next);
+      queryClient.setQueriesData({ queryKey: ["terminal-notifications", notification.clientId] }, () => result);
+    }).catch(() => {});
     setNotificationCenterOpen(false);
     if (notification.clientId !== selectedClientId) {
       setRouteSelectionRequest(null);
@@ -1576,23 +1691,35 @@ function AuthenticatedApp({
     setMobileTerminalActive(true);
     writeTerminalRoute(notification.clientId, notification.windowId, "push");
     focusSelectedTerminal();
-  }, [focusSelectedTerminal, selectedClientId]);
+  }, [focusSelectedTerminal, queryClient, selectedClientId]);
 
   const handleDeleteNotification = useCallback((notification: TerminalNotification) => {
-    const next = deleteTerminalNotification(notification.clientId, notification);
-    notificationPreviousRef.current = next;
-    setTerminalNotifications(next);
-  }, []);
+    void dismissTerminalNotification(
+      notification.clientId,
+      notification.windowId,
+      notification.completedAt
+    ).then((result) => {
+      const next = normalizeTerminalNotifications(result.notifications);
+      notificationPreviousRef.current = next;
+      setTerminalNotifications(next);
+      queryClient.setQueriesData({ queryKey: ["terminal-notifications", notification.clientId] }, () => result);
+    }).catch(() => {});
+  }, [queryClient]);
 
   const handleClearNotifications = useCallback(() => {
     if (selectedClientId === null) {
       return;
     }
 
-    const next = clearTerminalNotifications(selectedClientId);
-    notificationPreviousRef.current = next;
-    setTerminalNotifications(next);
-  }, [selectedClientId]);
+    void clearTerminalNotifications(selectedClientId)
+      .then((result) => {
+        const next = normalizeTerminalNotifications(result.notifications);
+        notificationPreviousRef.current = next;
+        setTerminalNotifications(next);
+        queryClient.setQueriesData({ queryKey: ["terminal-notifications", selectedClientId] }, () => result);
+      })
+      .catch(() => {});
+  }, [queryClient, selectedClientId]);
 
   const startOnboardingFromSettings = useCallback(() => {
     setSettingsOpen(false);
@@ -1873,13 +2000,16 @@ function AuthenticatedApp({
               clients={clientsQuery.data}
               selectedClientId={selectedClientId}
               updatingClientId={updateMutation.isPending ? updateMutation.variables ?? null : null}
+              deletingClientId={deletingClientId}
               onSelectClient={selectClient}
               onUpdateClient={(clientId) => updateMutation.mutate(clientId)}
+              onDeleteClient={requestDeleteClient}
             />
           </section>
         )}
         {updateMessage && <p className="muted">{updateMessage}</p>}
         {updateFailed && <p className="error" role="alert">Client update failed to start.</p>}
+        {deleteClientMutation.isError && <p className="error" role="alert">{deleteClientErrorMessage}</p>}
         {selectedClientOffline && <p className="muted">Client agent offline, waiting for reconnect.</p>}
         {createMutation.isError && <p className="error" role="alert">{createErrorMessage}</p>}
         {deleteMutation.isError && <p className="error" role="alert">{deleteErrorMessage}</p>}
@@ -2197,7 +2327,7 @@ function AuthenticatedApp({
         registrationKey={registrationKeyMutation.data?.key ?? null}
         registrationKeyPending={registrationKeyMutation.isPending}
         registrationKeyError={registrationKeyMutation.isError ? "生成注册 key 失败" : null}
-        onGenerateRegistrationKey={() => registrationKeyMutation.mutate()}
+        onGenerateRegistrationKey={(label) => registrationKeyMutation.mutate(label)}
         onboardingEnabled={isOnboardingEnabled()}
         onStartOnboarding={startOnboardingFromSettings}
         onLogout={onLogout}

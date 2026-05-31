@@ -17,6 +17,11 @@ MAX_INDEXED_RAW_BYTES = 64 * 1024
 MAX_SEARCH_SNIPPET_CHARS = 500
 SAFE_SEARCH_SOURCE_FIELDS = ("virtual_window_id", "title", "tags", "folder_path", "provider", "kind")
 SEARCH_SOURCE_EXCLUDES = ["raw", "source_event_ids", "session_id"]
+READ_ONLY_ALLOW_DELETE_MARKERS = (
+    "read-only-allow-delete",
+    "read_only_allow_delete",
+    "read only allow delete",
+)
 
 
 INDEX_MAPPINGS: dict[str, dict[str, Any]] = {
@@ -61,6 +66,37 @@ INDEX_MAPPINGS: dict[str, dict[str, Any]] = {
 
 def get_es_client() -> AsyncElasticsearch:
     return AsyncElasticsearch(get_settings().elasticsearch_url)
+
+
+def is_flood_stage_index_block(error: BaseException | str) -> bool:
+    """Return true for Elasticsearch's disk-watermark read-only index block."""
+    message = _error_text(error)
+    has_cluster_block = "cluster_block_exception" in message
+    has_flood_watermark = "flood" in message and "watermark" in message
+    has_read_only_block = any(marker in message for marker in READ_ONLY_ALLOW_DELETE_MARKERS)
+    return has_cluster_block and has_flood_watermark and has_read_only_block
+
+
+def flood_stage_index_block_warning(error: BaseException | str) -> str:
+    detail = _error_detail(error)
+    return (
+        "summary search indexing skipped: Elasticsearch disk usage exceeded the "
+        "flood-stage watermark and blocked the summaries index as read-only. "
+        "Free disk space, clear the index block, then retry summary to rebuild "
+        f"the search document. Original error: {detail}"
+    )
+
+
+def _error_text(error: BaseException | str) -> str:
+    return _error_detail(error).lower()
+
+
+def _error_detail(error: BaseException | str) -> str:
+    body = getattr(error, "body", None)
+    parts = [str(error)]
+    if body is not None:
+        parts.append(json.dumps(body, ensure_ascii=False, default=str))
+    return " ".join(parts)
 
 
 def terminal_chunk_doc(

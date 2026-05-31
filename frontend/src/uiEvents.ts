@@ -95,6 +95,9 @@ export function queryKeysForUiInvalidation(event: UiInvalidateEvent): QueryKey[]
   if (clientId !== null && resources.has("tree")) {
     keys.push(["tree", clientId]);
   }
+  if (clientId !== null && resources.has("terminal_notifications")) {
+    keys.push(["terminal-notifications", clientId]);
+  }
   if (clientId !== null && resources.has("window") && !isActivityOnlyWindowInvalidation(event)) {
     keys.push(["window-activity", clientId]);
   }

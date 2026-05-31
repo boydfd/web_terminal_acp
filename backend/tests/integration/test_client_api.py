@@ -6,13 +6,30 @@ import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import select
 
 from app.db import Base, get_session
 from app.main import app
-from app.models import ClientRegistrationKey, ClientRegistrationKeyStatus, ClientRuntime
+from app.models import (
+    AiSession,
+    Client,
+    ClientRegistrationKey,
+    ClientRegistrationKeyStatus,
+    ClientRuntime,
+    Event,
+    EventSourceType,
+    Folder,
+    ProjectSummary,
+    SummaryJob,
+    TerminalNotificationState,
+    TerminalRecentUsage,
+    VirtualWindow,
+)
 from app.repositories.client_registration_keys import create_registration_key
 from app.routers import clients as clients_router
 from app.repositories.clients import create_client, ensure_local_client
+from app.repositories.folders import get_or_create_folder_by_path
+from app.repositories.windows import create_window
 from app.schemas import BootstrapClientIn
 from app.services import polling_response_cache
 from app.services.polling_response_cache import clear_polling_response_cache
@@ -33,6 +50,31 @@ class DbClient:
 
     async def post(self, *args, **kwargs):
         return await self._client.post(*args, **kwargs)
+
+    async def delete(self, *args, **kwargs):
+        return await self._client.delete(*args, **kwargs)
+
+
+class FakeClientConnection:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakeClientConnectionRegistry:
+    def __init__(self, connection: FakeClientConnection | None) -> None:
+        self.connection = connection
+        self.unregistered: list[tuple[object, object]] = []
+
+    def get(self, _client_id):
+        return self.connection
+
+    async def unregister(self, client_id, connection) -> None:
+        self.unregistered.append((client_id, connection))
+        if connection is self.connection:
+            self.connection = None
 
 
 @pytest.fixture
@@ -62,6 +104,8 @@ async def db_client(tmp_path):
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(clients_router.get_bootstrap_runner, None)
         app.dependency_overrides.pop(clients_router.get_update_runner, None)
+        if hasattr(app.state, "client_connections"):
+            delattr(app.state, "client_connections")
         clear_polling_response_cache()
         await engine.dispose()
 
@@ -189,14 +233,149 @@ async def test_patch_client_invalidates_clients_hot_cache(db_client):
 
 
 @pytest.mark.asyncio
+async def test_patch_client_rejects_duplicate_name(db_client):
+    async with db_client.session_factory() as session:
+        first, _first_token = await create_client(session, name="First", runtime=ClientRuntime.remote)
+        second, _second_token = await create_client(session, name="Second", runtime=ClientRuntime.remote)
+        await session.commit()
+
+    response = await db_client.patch(f"/api/clients/{second.id}", json={"name": "First"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "client name already exists"
+
+    get_first = await db_client.get(f"/api/clients/{first.id}")
+    get_second = await db_client.get(f"/api/clients/{second.id}")
+    assert get_first.json()["name"] == "First"
+    assert get_second.json()["name"] == "Second"
+
+
+@pytest.mark.asyncio
 async def test_missing_client_returns_404(db_client):
     missing_id = "00000000-0000-0000-0000-000000000000"
 
     get_response = await db_client.get(f"/api/clients/{missing_id}")
     patch_response = await db_client.patch(f"/api/clients/{missing_id}", json={"name": "missing"})
+    delete_response = await db_client.delete(f"/api/clients/{missing_id}")
 
     assert get_response.status_code == 404
     assert patch_response.status_code == 404
+    assert delete_response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_remote_client_removes_client_graph_and_invalidates_cache(db_client):
+    async with db_client.session_factory() as session:
+        remote_client, _token = await create_client(session, name="Remote", runtime=ClientRuntime.remote)
+        folder = await get_or_create_folder_by_path(session, remote_client.id, "/project")
+        window = await create_window(
+            session,
+            remote_client.id,
+            cwd="/project",
+            shell_command="/bin/bash",
+        )
+        window.folder_id = folder.id
+        summary_job = SummaryJob(virtual_window_id=window.id)
+        session.add(summary_job)
+        terminal_recent = TerminalRecentUsage(
+            client_id=remote_client.id,
+            window_id=window.id,
+            title=window.title,
+        )
+        session.add(terminal_recent)
+        notification_state = TerminalNotificationState(
+            client_id=remote_client.id,
+            window_id=window.id,
+        )
+        session.add(notification_state)
+        ai_session = AiSession(
+            client_id=remote_client.id,
+            provider="codex",
+            source_id="session-1",
+            virtual_window_id=window.id,
+        )
+        session.add(ai_session)
+        await session.flush()
+        event = Event(
+            client_id=remote_client.id,
+            source_type=EventSourceType.codex_trace,
+            source_id="trace-1",
+            kind="agent_message",
+            virtual_window_id=window.id,
+            ai_session_id=ai_session.id,
+            payload_json={},
+            fingerprint="trace-1",
+        )
+        project_summary = ProjectSummary(client_id=remote_client.id, project_path="/project")
+        session.add_all([event, project_summary])
+        await session.commit()
+        remote_client_id = remote_client.id
+        window_id = window.id
+        folder_id = folder.id
+        ai_session_id = ai_session.id
+
+    cached_clients = await db_client.get("/api/clients")
+    assert cached_clients.status_code == 200
+    assert any(client["id"] == str(remote_client_id) for client in cached_clients.json())
+
+    response = await db_client.delete(f"/api/clients/{remote_client_id}")
+
+    assert response.status_code == 204
+    assert (await db_client.get(f"/api/clients/{remote_client_id}")).status_code == 404
+    list_after_delete = await db_client.get("/api/clients")
+    assert all(client["id"] != str(remote_client_id) for client in list_after_delete.json())
+
+    async with db_client.session_factory() as session:
+        assert await session.get(Client, remote_client_id) is None
+        assert await session.get(Folder, folder_id) is None
+        assert await session.get(VirtualWindow, window_id) is None
+        assert await session.get(AiSession, ai_session_id) is None
+        assert (await session.scalars(select(Event).where(Event.client_id == remote_client_id))).first() is None
+        assert (
+            await session.scalars(
+                select(TerminalRecentUsage).where(TerminalRecentUsage.client_id == remote_client_id)
+            )
+        ).first() is None
+        assert (
+            await session.scalars(
+                select(TerminalNotificationState).where(
+                    TerminalNotificationState.client_id == remote_client_id
+                )
+            )
+        ).first() is None
+        assert (
+            await session.scalars(
+                select(ProjectSummary).where(ProjectSummary.client_id == remote_client_id)
+            )
+        ).first() is None
+
+
+@pytest.mark.asyncio
+async def test_delete_remote_client_closes_active_connection(db_client):
+    async with db_client.session_factory() as session:
+        remote_client, _token = await create_client(session, name="Remote", runtime=ClientRuntime.remote)
+        await session.commit()
+
+    connection = FakeClientConnection()
+    registry = FakeClientConnectionRegistry(connection)
+    app.state.client_connections = registry
+
+    response = await db_client.delete(f"/api/clients/{remote_client.id}")
+
+    assert response.status_code == 204
+    assert connection.closed is True
+    assert registry.unregistered == [(remote_client.id, connection)]
+
+
+@pytest.mark.asyncio
+async def test_delete_local_client_is_rejected(db_client):
+    list_response = await db_client.get("/api/clients")
+    local_client_id = list_response.json()[0]["id"]
+
+    response = await db_client.delete(f"/api/clients/{local_client_id}")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "local client deletion unsupported"
 
 
 @pytest.mark.asyncio
@@ -424,6 +603,49 @@ async def test_registration_key_is_single_use_for_direct_client_registration(db_
         assert used_key is not None
         assert used_key.status is ClientRegistrationKeyStatus.used
         assert str(used_key.used_client_id) == body["client_id"]
+
+
+@pytest.mark.asyncio
+async def test_direct_client_registration_reuses_existing_client_with_same_name(db_client):
+    async with db_client.session_factory() as session:
+        first_registration_key, first_key = await create_registration_key(session, label="desk")
+        second_registration_key, second_key = await create_registration_key(session, label="desk")
+        await session.commit()
+
+    first_payload = {
+        "registration_key": first_key,
+        "name": "Office Mac Mini",
+        "hostname": "old-host",
+        "install_path": "/home/alice/.web-terminal-acp",
+        "server_url": "https://control.example.com",
+    }
+    second_payload = {
+        **first_payload,
+        "registration_key": second_key,
+        "hostname": "new-host",
+        "install_path": "/srv/web-terminal-acp",
+    }
+
+    first = await db_client.post("/api/clients/register", json=first_payload)
+    second = await db_client.post("/api/clients/register", json=second_payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_body = first.json()
+    second_body = second.json()
+    assert second_body["client_id"] == first_body["client_id"]
+    assert second_body["token"] != first_body["token"]
+    assert second_body["config"]["install_path"] == "/srv/web-terminal-acp"
+
+    async with db_client.session_factory() as session:
+        clients = list(await session.scalars(select(Client)))
+        remote_clients = [client for client in clients if client.runtime is ClientRuntime.remote]
+        first_used_key = await session.get(ClientRegistrationKey, first_registration_key.id)
+        second_used_key = await session.get(ClientRegistrationKey, second_registration_key.id)
+        assert len(remote_clients) == 1
+        assert remote_clients[0].hostname == "new-host"
+        assert str(first_used_key.used_client_id) == first_body["client_id"]
+        assert str(second_used_key.used_client_id) == first_body["client_id"]
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,11 @@ from sqlalchemy.orm import aliased
 
 from app.models import AiSession, Event, EventSourceType, VirtualWindow
 from app.schemas import WorkStatusOut
-from app.services.agent_activity_projection import event_activity_time, event_is_agent_completion
+from app.services.agent_activity_projection import (
+    event_activity_time,
+    event_is_agent_activity,
+    event_is_agent_completion,
+)
 from app.services.window_runtime_tags import agent_from_command
 
 AGENT_ABORT_IDLE_SECONDS = 60 * 60
@@ -524,18 +528,23 @@ async def _agent_activity_state_by_window(
     latest_activity: dict[UUID, datetime] = {}
     latest_completed_at: dict[UUID, datetime] = {}
     missing_window_ids: list[UUID] = []
+    stale_projection_window_ids: list[UUID] = []
     for window_id, activity_at, completed_at in rows:
         if activity_at is None:
             missing_window_ids.append(window_id)
         else:
             latest_activity[window_id] = _aware_utc(activity_at)
         if completed_at is not None:
-            latest_completed_at[window_id] = _aware_utc(completed_at)
+            completed_at = _aware_utc(completed_at)
+            latest_completed_at[window_id] = completed_at
+            if activity_at is not None and _aware_utc(activity_at) > completed_at:
+                stale_projection_window_ids.append(window_id)
 
-    if _dialect_name(session) == "postgresql":
+    fallback_window_ids = sorted({*missing_window_ids, *stale_projection_window_ids})
+    if _dialect_name(session) == "postgresql" and not fallback_window_ids:
         return _WindowAgentActivityState(latest_activity, latest_completed_at)
 
-    fallback_events = await _recent_agent_events_by_window(session, client_id, missing_window_ids)
+    fallback_events = await _recent_agent_events_by_window(session, client_id, fallback_window_ids)
     latest_activity.update(_latest_ai_activity_by_window(fallback_events))
     latest_completed_at.update(_latest_agent_completed_at_by_window(fallback_events))
     return _WindowAgentActivityState(latest_activity, latest_completed_at)
@@ -561,6 +570,8 @@ def _latest_agent_completed_at_by_window(
     latest: dict[UUID, datetime] = {}
     for window_id, events in recent_agent_events.items():
         for event in events:
+            if not event_is_agent_activity(event):
+                continue
             if event_is_agent_completion(event):
                 completed_at = event_activity_time(event)
                 if window_id not in latest or completed_at > latest[window_id]:
@@ -574,6 +585,8 @@ def _latest_ai_activity_by_window(
     latest: dict[UUID, datetime] = {}
     for window_id, events in recent_agent_events.items():
         for event in events:
+            if not event_is_agent_activity(event):
+                continue
             activity_at = event_activity_time(event)
             if window_id not in latest or activity_at > latest[window_id]:
                 latest[window_id] = activity_at

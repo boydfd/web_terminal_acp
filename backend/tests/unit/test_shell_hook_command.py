@@ -4,7 +4,11 @@ import os
 import subprocess
 from uuid import UUID
 
-from app.client_agent.shell_hook import _agent_environment_script, build_managed_shell_command
+from app.client_agent.shell_hook import (
+    _agent_environment_script,
+    _common_hook_script,
+    build_managed_shell_command,
+)
 
 CLIENT_ID = UUID("12345678-1234-5678-1234-567812345678")
 WINDOW_ID = UUID("87654321-4321-8765-4321-876543218765")
@@ -30,18 +34,24 @@ def test_bash_managed_shell_command_contains_command_capture_hook() -> None:
     assert "WEB_TERMINAL_CODEX_HOME='~/.web-terminal-acp/codex-homes/87654321-4321-8765-4321-876543218765'" in managed.command
     assert "WEB_TERMINAL_CLAUDE_CODE_HOME='~/.web-terminal-acp/claude-code-homes/87654321-4321-8765-4321-876543218765'" in managed.command
     assert "WEB_TERMINAL_CURSOR_HOME='~/.web-terminal-acp/cursor-homes/87654321-4321-8765-4321-876543218765'" in managed.command
+    assert "WEB_TERMINAL_ORIGINAL_CODEX_HOME='~/.codex'" in managed.command
+    assert "WEB_TERMINAL_ORIGINAL_CLAUDE_CODE_HOME='~/.claude'" in managed.command
     assert " CODEX_HOME='~/.web-terminal-acp/codex-homes/87654321-4321-8765-4321-876543218765'" not in managed.command
     assert not managed.command.startswith("CODEX_HOME='~/.web-terminal-acp/codex-homes/87654321-4321-8765-4321-876543218765'")
     assert "CLAUDE_CONFIG_DIR='~/.web-terminal-acp/claude-code-homes/87654321-4321-8765-4321-876543218765'" in managed.command
     assert "CURSOR_AGENT_HOME='~/.web-terminal-acp/cursor-homes/87654321-4321-8765-4321-876543218765'" in managed.command
     assert '__web_terminal_source_codex_home="${WEB_TERMINAL_ORIGINAL_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}"' in managed.command
+    assert '__web_terminal_source_codex_home="$HOME/${__web_terminal_source_codex_home#"~/"}"' in managed.command
     assert "export CODEX_HOME=\"$WEB_TERMINAL_CODEX_HOME\"" in managed.command
     assert "for __web_terminal_codex_item in auth.json config.toml hooks hooks.json hooks.disabled.json AGENTS.md skills skills.disabled plugins plugins.disabled plugin_marketplaces.json" in managed.command
+    assert "for __web_terminal_codex_history_item in history.json history.jsonl" in managed.command
     assert "export CLAUDE_CONFIG_DIR=\"$WEB_TERMINAL_CLAUDE_CODE_HOME\"" in managed.command
     assert '__web_terminal_source_claude_home="${WEB_TERMINAL_ORIGINAL_CLAUDE_CODE_HOME:-$HOME/.claude}"' in managed.command
+    assert '__web_terminal_source_claude_home="$HOME/${__web_terminal_source_claude_home#"~/"}"' in managed.command
     assert "__web_terminal_source_claude_json=\"${WEB_TERMINAL_ORIGINAL_CLAUDE_JSON:-$HOME/.claude.json}\"" in managed.command
     assert "ln -s \"$__web_terminal_source_claude_json\" \"$WEB_TERMINAL_CLAUDE_CODE_HOME/.claude.json\"" in managed.command
     assert "for __web_terminal_claude_item in settings.json settings.local.json commands hooks hooks.disabled.json plugins plugins.disabled skills skills.disabled api-key-helper.sh" in managed.command
+    assert "for __web_terminal_claude_history_item in history.json history.jsonl file-history" in managed.command
     assert "__web_terminal_load_claude_settings_env \"$__web_terminal_source_claude_home/settings.json\"" in managed.command
     assert "json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"env\", {})" in managed.command
     assert "__web_terminal_prepare_claude_code_home" in managed.command
@@ -99,6 +109,8 @@ def test_zsh_managed_shell_command_contains_preexec_command_capture_hook() -> No
     assert "WEB_TERMINAL_CODEX_HOME='~/.web-terminal-acp/codex-homes/87654321-4321-8765-4321-876543218765'" in managed.command
     assert "WEB_TERMINAL_CLAUDE_CODE_HOME='~/.web-terminal-acp/claude-code-homes/87654321-4321-8765-4321-876543218765'" in managed.command
     assert "WEB_TERMINAL_CURSOR_HOME='~/.web-terminal-acp/cursor-homes/87654321-4321-8765-4321-876543218765'" in managed.command
+    assert "WEB_TERMINAL_ORIGINAL_CODEX_HOME='~/.codex'" in managed.command
+    assert "WEB_TERMINAL_ORIGINAL_CLAUDE_CODE_HOME='~/.claude'" in managed.command
     assert " CODEX_HOME='~/.web-terminal-acp/codex-homes/87654321-4321-8765-4321-876543218765'" not in managed.command
     assert not managed.command.startswith("CODEX_HOME='~/.web-terminal-acp/codex-homes/87654321-4321-8765-4321-876543218765'")
     assert "CLAUDE_CONFIG_DIR='~/.web-terminal-acp/claude-code-homes/87654321-4321-8765-4321-876543218765'" in managed.command
@@ -127,6 +139,38 @@ def test_zsh_managed_shell_command_contains_preexec_command_capture_hook() -> No
     assert "exec /bin/zsh" in managed.command
 
 
+def test_common_command_capture_hook_emits_marker_without_python_311_datetime_utc(tmp_path) -> None:
+    script = f"""
+set -e
+{_common_hook_script()}
+__web_terminal_emit_command_marker started bash 7 "" pwd
+"""
+    env = {
+        "HOME": str(tmp_path),
+        "PATH": os.environ["PATH"],
+        "WEB_TERMINAL_WINDOW_ID": str(WINDOW_ID),
+        "WEB_TERMINAL_CODEX_HOME": "~/.web-terminal-acp/codex-homes/window-1",
+        "WEB_TERMINAL_CLAUDE_CODE_HOME": "~/.web-terminal-acp/claude-code-homes/window-1",
+        "WEB_TERMINAL_CURSOR_HOME": "~/.web-terminal-acp/cursor-homes/window-1",
+    }
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        check=False,
+        env=env,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert "web-terminal-command" in result.stdout
+    assert "payload=" in result.stdout
+    assert "from datetime import UTC" not in script
+    assert "timezone.utc" in script
+
+
 def test_unsupported_shell_returns_fallback_command_and_unsupported_flag() -> None:
     managed = build_managed_shell_command(
         shell="/usr/bin/fish",
@@ -147,6 +191,8 @@ def test_unsupported_shell_returns_fallback_command_and_unsupported_flag() -> No
         "WEB_TERMINAL_CODEX_HOME='~/.web-terminal-acp/codex-homes/87654321-4321-8765-4321-876543218765' "
         "WEB_TERMINAL_CLAUDE_CODE_HOME='~/.web-terminal-acp/claude-code-homes/87654321-4321-8765-4321-876543218765' "
         "WEB_TERMINAL_CURSOR_HOME='~/.web-terminal-acp/cursor-homes/87654321-4321-8765-4321-876543218765' "
+        "WEB_TERMINAL_ORIGINAL_CODEX_HOME='~/.codex' "
+        "WEB_TERMINAL_ORIGINAL_CLAUDE_CODE_HOME='~/.claude' "
         "WEB_TERMINAL_ORIGINAL_CURSOR_DIR='~/.cursor' "
         "CLAUDE_CONFIG_DIR='~/.web-terminal-acp/claude-code-homes/87654321-4321-8765-4321-876543218765' "
         "CURSOR_AGENT_HOME='~/.web-terminal-acp/cursor-homes/87654321-4321-8765-4321-876543218765' "
@@ -272,6 +318,7 @@ def test_agent_environment_prepares_per_window_agent_config_links(tmp_path) -> N
             "plugins",
             "plugins.disabled",
             "plugin_marketplaces.json",
+            "history.jsonl",
         ],
         ".claude": [
             "settings.json",
@@ -284,6 +331,7 @@ def test_agent_environment_prepares_per_window_agent_config_links(tmp_path) -> N
             "skills",
             "skills.disabled",
             "api-key-helper.sh",
+            "history.jsonl",
         ],
         ".cursor": [
             "agent-cli-state.json",
@@ -295,6 +343,7 @@ def test_agent_environment_prepares_per_window_agent_config_links(tmp_path) -> N
             "plugins.disabled",
             "skills-cursor",
             "skills-cursor.disabled",
+            "history.jsonl",
         ],
     }
     directory_names = {
@@ -312,7 +361,10 @@ def test_agent_environment_prepares_per_window_agent_config_links(tmp_path) -> N
                 (path / "marker").write_text(item_name, encoding="utf-8")
             else:
                 path.write_text("{}", encoding="utf-8")
+    (home / ".claude" / "file-history").mkdir()
+    (home / ".claude" / "file-history" / "marker").write_text("file-history", encoding="utf-8")
     (home / ".cursor" / "chats").mkdir()
+    (home / ".cursor" / "chats" / "marker").write_text("chats", encoding="utf-8")
 
     env = {
         "HOME": str(home),
@@ -340,12 +392,13 @@ def test_agent_environment_prepares_per_window_agent_config_links(tmp_path) -> N
     assert (codex_home / "log").is_dir()
     assert (codex_home / "shell_snapshots").is_dir()
     assert (claude_home / "projects").is_dir()
-    assert (cursor_home / "chats").is_dir()
-    assert not (cursor_home / "chats").is_symlink()
+    assert (cursor_home / "chats").resolve() == home / ".cursor" / "chats"
+    assert (cursor_home / "chats").is_symlink()
 
     for item_name in source_items[".codex"]:
         assert (codex_home / item_name).resolve() == home / ".codex" / item_name
     for item_name in source_items[".claude"]:
         assert (claude_home / item_name).resolve() == home / ".claude" / item_name
+    assert (claude_home / "file-history").resolve() == home / ".claude" / "file-history"
     for item_name in source_items[".cursor"]:
         assert (cursor_home / item_name).resolve() == home / ".cursor" / item_name

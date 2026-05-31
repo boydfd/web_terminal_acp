@@ -25,6 +25,7 @@ def test_rejects_agent_default_user_context_blocks() -> None:
     assert extract_real_user_input("<user_info>\nOS Version: linux\n</user_info>", provider="cursor_cli") is None
     assert extract_real_user_input("# AGENTS.md instructions for /workspace\n\n<INSTRUCTIONS>...</INSTRUCTIONS>") is None
     assert extract_real_user_input("<turn_aborted>\nThe user interrupted the previous turn.\n</turn_aborted>") is None
+    assert extract_real_user_input("<bash-input>env | grep claude</bash-input>", provider="claude_code") is None
 
 
 def test_keeps_plain_human_input() -> None:

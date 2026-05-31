@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.models import Event
+from app.models import Event, EventSourceType
+
+_CLAUDE_LOCAL_COMMAND_PREFIXES = (
+    "<local-command-caveat>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+)
 
 
 def event_activity_time(event: Event) -> datetime:
@@ -18,9 +25,17 @@ def event_is_agent_completion(event: Event) -> bool:
     payload = event.payload_json
     if payload_text(payload.get("provider")) == "codex" and codex_completion_payload(payload):
         return True
-    if payload_text(payload.get("provider")) == "claude_code" and claude_completion_payload(payload):
+    if payload_text(payload.get("provider")) in {"claude", "claude_code"} and claude_completion_payload(payload):
         return True
     return codex_completion_payload(payload) or claude_completion_payload(payload)
+
+
+def event_is_agent_activity(event: Event) -> bool:
+    payload = event.payload_json
+    provider = payload_text(payload.get("provider"))
+    if provider in {"claude", "claude_code"} or event.source_type == EventSourceType.claude_jsonl:
+        return not claude_local_command_payload(payload)
+    return True
 
 
 def codex_completion_payload(payload: dict) -> bool:
@@ -41,6 +56,12 @@ def codex_completion_payload(payload: dict) -> bool:
 
 
 def claude_completion_payload(payload: dict) -> bool:
+    if (
+        payload_text(payload.get("type")) == "system"
+        and payload_text(payload.get("subtype")) == "turn_duration"
+    ):
+        return True
+
     message = payload.get("message")
     if not isinstance(message, dict):
         message = payload
@@ -49,6 +70,30 @@ def claude_completion_payload(payload: dict) -> bool:
         return False
     role = payload_text(message.get("role")) or payload_text(payload.get("type"))
     return role == "assistant" or payload_text(payload.get("type")) == "assistant"
+
+
+def claude_local_command_payload(payload: dict) -> bool:
+    provider = payload_text(payload.get("provider"))
+    if provider not in {None, "claude", "claude_code"}:
+        return False
+    if payload_text(payload.get("type")) != "user":
+        return False
+
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return False
+    role = payload_text(message.get("role"))
+    if role not in {None, "user"}:
+        return False
+
+    content = payload_text(message.get("content"))
+    if content is None:
+        return payload.get("isMeta") is True
+
+    stripped = content.lstrip()
+    return payload.get("isMeta") is True or any(
+        stripped.startswith(prefix) for prefix in _CLAUDE_LOCAL_COMMAND_PREFIXES
+    )
 
 
 def payload_text(value: object) -> str | None:

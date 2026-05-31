@@ -406,7 +406,7 @@ def test_collect_claude_code_watch_events_maps_history_session_to_managed_transc
     assert state.claude_code_offsets[transcript_file] == transcript_file.stat().st_size
 
 
-def test_initialize_agent_tool_watcher_state_tracks_existing_claude_history_sessions_at_eof(
+def test_initialize_agent_tool_watcher_state_starts_linked_claude_history_at_eof(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -444,6 +444,10 @@ def test_initialize_agent_tool_watcher_state_tracks_existing_claude_history_sess
 
     initialize_agent_tool_watcher_state(state, window_id=WINDOW_ID)
 
+    assert state.claude_code_history_offset == history_file.stat().st_size
+    assert state.claude_code_history_session_ids == set()
+    assert state.claude_code_pending_history_session_ids == set()
+    assert state.claude_code_history_jsonl_files == set()
     assert collect_claude_code_watch_events(
         state,
         client_id=CLIENT_ID,
@@ -451,7 +455,14 @@ def test_initialize_agent_tool_watcher_state_tracks_existing_claude_history_sess
         project_path="/workspace/project",
     ) == []
 
-    new_offset = transcript_file.stat().st_size
+    new_history_offset = history_file.stat().st_size
+    new_transcript_offset = transcript_file.stat().st_size
+    history_file.write_text(
+        history_file.read_text(encoding="utf-8")
+        + json.dumps({"display": "continue", "sessionId": session_id})
+        + "\n",
+        encoding="utf-8",
+    )
     transcript_file.write_text(
         transcript_file.read_text(encoding="utf-8")
         + json.dumps(
@@ -471,8 +482,10 @@ def test_initialize_agent_tool_watcher_state_tracks_existing_claude_history_sess
         project_path="/workspace/project",
     )
 
-    assert [event.offset for event in events] == [new_offset]
+    assert [event.offset for event in events] == [new_transcript_offset]
     assert events[0].payload["message"]["content"] == "new transcript"
+    assert state.claude_code_history_offset > new_history_offset
+    assert state.claude_code_history_session_ids == {session_id}
 
 
 def test_collect_codex_watch_events_reuses_discovered_paths_until_refresh(
@@ -965,6 +978,23 @@ def test_collect_cursor_watch_events_finds_managed_cursor_data_dir_store(
 
     assert [event.source_path for event in events] == [str(store), str(store)]
     assert state.cursor_store_paths == [store]
+
+
+def test_cursor_store_paths_for_window_follows_linked_chats_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    source_chats = home / ".cursor" / "chats"
+    store = source_chats / "workspace-hash" / "session-id" / "store.db"
+    managed_chats = home / ".web-terminal-acp" / "cursor-homes" / str(WINDOW_ID) / "chats"
+    store.parent.mkdir(parents=True)
+    write_cursor_store(store)
+    managed_chats.parent.mkdir(parents=True)
+    managed_chats.symlink_to(source_chats)
+    monkeypatch.setattr(Path, "home", lambda: home)
+
+    assert watchers.cursor_store_paths_for_window(WINDOW_ID) == [managed_chats / "workspace-hash" / "session-id" / "store.db"]
 
 
 def test_collect_cursor_watch_events_discovers_additional_store_after_first_store(

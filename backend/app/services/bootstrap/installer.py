@@ -14,7 +14,13 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Client, ClientRuntime, ClientStatus
-from app.repositories.clients import create_client, get_client, hash_client_token, verify_client_token
+from app.repositories.clients import (
+    create_or_rotate_remote_client_by_name,
+    get_client,
+    get_client_by_name,
+    hash_client_token,
+    verify_client_token,
+)
 from app.schemas import BootstrapClientIn
 from app.services.bootstrap.ssh import SshClient, SshCommandError, SshConnectionInfo
 
@@ -77,6 +83,14 @@ missing=""
 command -v python3 >/dev/null 2>&1 || missing="$missing python3"
 command -v tmux >/dev/null 2>&1 || missing="$missing tmux"
 command -v bash >/dev/null 2>&1 || missing="$missing bash"
+if command -v python3 >/dev/null 2>&1 && ! python3 - <<'PY' >/dev/null 2>&1
+import sys
+
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+then
+  missing="$missing python3>=3.10"
+fi
 venv_test="$(mktemp -d 2>/dev/null || true)"
 if [ -z "$venv_test" ] || ! python3 -m venv "$venv_test/venv" >/dev/null 2>&1 || ! "$venv_test/venv/bin/python" -m pip --version >/dev/null 2>&1; then
   missing="$missing python3-venv"
@@ -228,6 +242,16 @@ async def _resolve_client(
         client_id, token = existing
         client = await get_client(session, client_id)
         if client is None:
+            named_client = await get_client_by_name(session, payload.name)
+            if named_client is not None:
+                rotated_client, _token, _reused = await create_or_rotate_remote_client_by_name(
+                    session,
+                    name=payload.name,
+                    token=token,
+                    hostname=payload.host,
+                    install_path=DEFAULT_INSTALL_PATH,
+                )
+                return rotated_client, token, True
             client = Client(
                 id=client_id,
                 name=payload.name,
@@ -241,6 +265,15 @@ async def _resolve_client(
             await session.flush()
             return client, token, True
         if verify_client_token(token, client.token_hash):
+            named_client = await get_client_by_name(session, payload.name)
+            if named_client is not None and named_client.id != client.id:
+                rotated_client, rotated_token, _reused = await create_or_rotate_remote_client_by_name(
+                    session,
+                    name=payload.name,
+                    hostname=payload.host,
+                    install_path=DEFAULT_INSTALL_PATH,
+                )
+                return rotated_client, rotated_token, True
             client.name = payload.name
             client.hostname = payload.host
             client.install_path = DEFAULT_INSTALL_PATH
@@ -248,14 +281,13 @@ async def _resolve_client(
             await session.flush()
             return client, token, True
 
-    client, token = await create_client(
+    client, token, reused = await create_or_rotate_remote_client_by_name(
         session,
         name=payload.name,
         hostname=payload.host,
         install_path=DEFAULT_INSTALL_PATH,
-        runtime=ClientRuntime.remote,
     )
-    return client, token, False
+    return client, token, reused
 
 
 def _parse_existing_config(config_text: str | None) -> tuple[UUID, str] | None:

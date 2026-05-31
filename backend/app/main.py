@@ -21,6 +21,7 @@ from app.routers import (
     folders,
     search,
     terminal,
+    terminal_notifications,
     project_summaries,
     terminal_recents,
     traces,
@@ -135,6 +136,7 @@ app.include_router(folders.router)
 app.include_router(windows.router)
 app.include_router(project_summaries.router)
 app.include_router(terminal_recents.router)
+app.include_router(terminal_notifications.router)
 app.include_router(terminal.router)
 app.include_router(search.router)
 app.include_router(traces.router)

@@ -165,6 +165,7 @@ def _materialize_agent_config_root(agent: AgentKind, source_root: Path, managed_
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target, follow_symlinks=True)
+    _link_agent_history_items(agent, source_root, managed_root)
 
     home_root = _managed_home_root(managed_root)
     alias = home_root / _agent_root(agent, Path()).name
@@ -178,6 +179,19 @@ def _materialize_agent_config_root(agent: AgentKind, source_root: Path, managed_
 
 def _copy_config_directory(source: Path, target: Path) -> None:
     shutil.copytree(source, target, symlinks=True, dirs_exist_ok=True)
+
+
+def _link_agent_history_items(agent: AgentKind, source_root: Path, managed_root: Path) -> None:
+    for item_name in _agent_history_item_names(agent):
+        _link_existing_item(source_root / item_name, managed_root / item_name)
+
+
+def _link_existing_item(source: Path, target: Path) -> None:
+    if not source.exists() or target.exists() or target.is_symlink():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        target.symlink_to(source)
 
 
 def _agent_config_item_names(agent: AgentKind) -> tuple[str, ...]:
@@ -208,6 +222,14 @@ def _agent_config_item_names(agent: AgentKind) -> tuple[str, ...]:
         "skills-cursor.disabled",
         *common,
     )
+
+
+def _agent_history_item_names(agent: AgentKind) -> tuple[str, ...]:
+    if agent == "codex":
+        return ("history.json", "history.jsonl")
+    if agent == "claude":
+        return ("history.json", "history.jsonl", "file-history")
+    return ("history.json", "history.jsonl", "chats")
 
 
 def _skills_directory(agent: AgentKind) -> str:

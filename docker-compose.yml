@@ -182,6 +182,7 @@ services:
       args:
         VITE_API_BASE: ${VITE_API_BASE:-}
         VITE_ENABLE_ONBOARDING: ${VITE_ENABLE_ONBOARDING:-}
+        VITE_CLIENT_AGENT_SERVER_URL: ${VITE_CLIENT_AGENT_SERVER_URL:-}
         NPM_REGISTRY: ${NPM_REGISTRY:-}
     restart: unless-stopped
     network_mode: bridge

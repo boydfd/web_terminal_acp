@@ -1,14 +1,14 @@
 {
   "name": "web-terminal-acp-frontend",
   "private": true,
-  "version": "2.17.7",
+  "version": "2.17.16",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest run --environment jsdom tests/terminalGrouping.test.ts tests/terminalNotifications.test.ts tests/terminalTree.test.ts tests/uiEvents.test.ts tests/gitDiff.test.ts tests/terminalFit.test.ts tests/keyboardShortcuts.test.ts tests/terminalQuickKeys.test.ts tests/terminalQuickInput.test.tsx tests/mobileShortcutFab.test.tsx tests/onboardingTour.test.tsx tests/settingsModal.test.tsx tests/clientList.test.tsx tests/notificationCenterLayout.test.ts tests/terminalClipboard.test.ts tests/terminalTouchScroll.test.ts tests/terminalVirtualClipboardButtons.test.tsx tests/folderTree.test.tsx tests/agentConfigViewer.test.tsx tests/projectTerminalPicker.test.tsx tests/userPreferences.test.ts",
+    "test": "vitest run --environment jsdom tests/apiBase.test.ts tests/terminalGrouping.test.ts tests/terminalNotifications.test.ts tests/terminalTree.test.ts tests/uiEvents.test.ts tests/gitDiff.test.ts tests/terminalFit.test.ts tests/keyboardShortcuts.test.ts tests/terminalQuickKeys.test.ts tests/terminalQuickInput.test.tsx tests/mobileShortcutFab.test.tsx tests/onboardingTour.test.tsx tests/settingsModal.test.tsx tests/clientList.test.tsx tests/notificationCenterLayout.test.ts tests/terminalClipboard.test.ts tests/terminalTouchScroll.test.ts tests/terminalVirtualClipboardButtons.test.tsx tests/folderTree.test.tsx tests/agentConfigViewer.test.tsx tests/projectTerminalPicker.test.tsx tests/userPreferences.test.ts",
     "test:e2e": "playwright test",
     "test:e2e:docker": "playwright test --config=playwright.config.docker.ts",
     "electron:dev": "concurrently -k \"vite\" \"wait-on http://127.0.0.1:5173 && cross-env ELECTRON_DEV=1 electron .\"",
