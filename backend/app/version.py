@@ -1,3 +1,3 @@
 """Shared application and client-agent version."""
 
-__version__ = "2.17.16"
+__version__ = "2.17.17"

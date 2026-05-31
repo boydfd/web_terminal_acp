@@ -28,7 +28,7 @@ import { AgentRecordModal } from "./components/AgentRecordViewer";
 import { ClientList } from "./components/ClientList";
 import { FolderTree } from "./components/FolderTree";
 import { GitDiffBrowserModal } from "./components/GitDiffBrowserModal";
-import { LoginGate } from "./components/LoginGate";
+import { BackendConnectionGate, LoginGate } from "./components/LoginGate";
 import { OnboardingTour, type OnboardingAction, type OnboardingStep } from "./components/OnboardingTour";
 import { ProjectTerminalPicker } from "./components/ProjectTerminalPicker";
 import { SearchPanel } from "./components/SearchPanel";
@@ -101,6 +101,7 @@ import type {
   Client,
   TreeFolder
 } from "./types";
+import { readApiBase, writeConfiguredApiBase } from "./apiBase";
 type TerminalViewportMode = "desktop" | "phone" | "fixed";
 
 const TERMINAL_VIEWPORT_STORAGE_KEY = "web-terminal-acp:terminal-viewport-mode";
@@ -509,9 +510,12 @@ function useVisualViewportHeightCssVariable(): void {
 export default function App() {
   const [authToken, setAuthToken] = useState<string | null>(readAuthToken);
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [apiBase, setApiBase] = useState(readApiBase);
+  const [apiBaseRevision, setApiBaseRevision] = useState(0);
+  const [apiBaseError, setApiBaseError] = useState<string | null>(null);
   const queryClient = useQueryClient();
   const authStatusQuery = useQuery({
-    queryKey: ["auth-status"],
+    queryKey: ["auth-status", apiBase, apiBaseRevision],
     queryFn: fetchAuthStatus,
     retry: false
   });
@@ -537,6 +541,22 @@ export default function App() {
     queryClient.clear();
   }, [queryClient]);
 
+  const saveBackendAddress = useCallback((value: string) => {
+    try {
+      writeConfiguredApiBase(value);
+      const nextApiBase = readApiBase();
+      clearAuthToken();
+      setAuthToken(null);
+      setApiBase(nextApiBase);
+      setApiBaseRevision((revision) => revision + 1);
+      setApiBaseError(null);
+      setLoginError(null);
+      queryClient.clear();
+    } catch {
+      setApiBaseError("请输入有效的 HTTP/HTTPS 后端地址");
+    }
+  }, [queryClient]);
+
   const submitLogin = useCallback(async (secret: string) => {
     await loginMutation.mutateAsync(secret);
   }, [loginMutation]);
@@ -554,17 +574,25 @@ export default function App() {
 
   if (authStatusQuery.isError) {
     return (
-      <main className="login-shell">
-        <p className="error" role="alert">Failed to connect to backend.</p>
-      </main>
+      <BackendConnectionGate
+        backendAddress={apiBase}
+        backendAddressError={apiBaseError}
+        connectionError={authStatusQuery.error instanceof Error ? authStatusQuery.error.message : null}
+        isCheckingBackend={authStatusQuery.isFetching}
+        onSaveBackendAddress={saveBackendAddress}
+      />
     );
   }
 
   if (!authReady) {
     return (
       <LoginGate
+        backendAddress={apiBase}
+        backendAddressError={apiBaseError}
         error={loginError}
+        isCheckingBackend={authStatusQuery.isFetching}
         isSubmitting={loginMutation.isPending}
+        onSaveBackendAddress={saveBackendAddress}
         onSubmit={submitLogin}
       />
     );
