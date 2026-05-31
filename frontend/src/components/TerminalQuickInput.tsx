@@ -80,6 +80,7 @@ export function TerminalQuickInput({
 }: TerminalQuickInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const lastPropValueRef = useRef(value);
+  const compositionActiveRef = useRef(false);
   const [quickKeysOpen, setQuickKeysOpen] = useState(false);
   const [quickKeyQuery, setQuickKeyQuery] = useState("");
   const [localValue, setLocalValue] = useState(value);
@@ -158,6 +159,16 @@ export function TerminalQuickInput({
           onValueChange(nextValue);
           resizeQuickInputTextarea(event.target);
         }}
+        onCompositionStart={() => {
+          compositionActiveRef.current = true;
+        }}
+        onCompositionEnd={(event) => {
+          compositionActiveRef.current = false;
+          const nextValue = event.currentTarget.value;
+          setLocalValue(nextValue);
+          onValueChange(nextValue);
+          resizeQuickInputTextarea(event.currentTarget);
+        }}
         onKeyDown={(event) => {
           if (event.key === "Escape" && onCancel !== undefined) {
             event.preventDefault();
@@ -167,6 +178,10 @@ export function TerminalQuickInput({
           }
 
           if (event.key !== "Enter") {
+            return;
+          }
+
+          if (compositionActiveRef.current || event.nativeEvent.isComposing) {
             return;
           }
 

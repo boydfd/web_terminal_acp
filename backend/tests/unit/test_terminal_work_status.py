@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.model_base import Base
 from app.models import Event, EventSourceType, VirtualWindow, WindowStatus
+from app.services import terminal_work_status
 from app.services.terminal_work_status import (
     load_tree_window_activity,
     load_last_agent_task_completed_at_by_window,
@@ -389,6 +390,89 @@ async def test_load_work_statuses_uses_window_agent_activity_state(counted_db_se
     statuses = await load_work_statuses(db_session, client_id, [window.id], now=now)
 
     assert statuses[window.id].state == "WORKING"
+    assert not [
+        statement
+        for statement in statements
+        if "FROM events" in statement and "events.source_type IN" in statement
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_activity_projection_does_not_scan_empty_agent_windows(
+    counted_db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_session, statements = counted_db_session
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    window = VirtualWindow(
+        id=uuid4(),
+        client_id=client_id,
+        title="Terminal",
+        status=WindowStatus.active,
+    )
+    db_session.add(window)
+    await db_session.flush()
+    monkeypatch.setattr("app.services.terminal_work_status._dialect_name", lambda _session: "postgresql")
+    statements.clear()
+
+    activity = await terminal_work_status._agent_activity_state_by_window(
+        db_session,
+        client_id,
+        [window.id],
+    )
+
+    assert window.id not in activity.latest_activity
+    assert not [
+        statement
+        for statement in statements
+        if "FROM events" in statement and "events.source_type IN" in statement
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_activity_projection_repairs_stale_latest_event_without_scan(
+    counted_db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_session, statements = counted_db_session
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    completed_at = now - timedelta(minutes=2)
+    local_command_at = now - timedelta(seconds=10)
+    window = VirtualWindow(
+        id=uuid4(),
+        client_id=client_id,
+        title="Terminal",
+        status=WindowStatus.active,
+        agent_activity_latest_at=local_command_at,
+        agent_activity_latest_completed_at=completed_at,
+    )
+    local_command = Event(
+        id=uuid4(),
+        client_id=client_id,
+        source_type=EventSourceType.agent_tool_record,
+        source_id="claude-session-1",
+        kind="user_message",
+        virtual_window_id=window.id,
+        payload_json=claude_local_command_payload(),
+        fingerprint="claude-local-command-after-finish-projection",
+        created_at=local_command_at,
+    )
+    window.agent_activity_latest_event_id = local_command.id
+    db_session.add_all([window, local_command])
+    await db_session.flush()
+    monkeypatch.setattr("app.services.terminal_work_status._dialect_name", lambda _session: "postgresql")
+    statements.clear()
+
+    activity = await terminal_work_status._agent_activity_state_by_window(
+        db_session,
+        client_id,
+        [window.id],
+    )
+
+    assert activity.latest_activity[window.id] == completed_at
+    assert activity.latest_completed_at[window.id] == completed_at
     assert not [
         statement
         for statement in statements

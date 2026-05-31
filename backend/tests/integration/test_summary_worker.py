@@ -91,6 +91,23 @@ class FloodStageBlockedElasticsearch:
         )
 
 
+@dataclass
+class ClaimObservingSummarizer:
+    session_factory: async_sessionmaker
+    observed_statuses: list[SummaryJobStatus]
+
+    async def summarize(self, context_items):
+        async with self.session_factory() as session:
+            job = (await session.execute(select(SummaryJob))).scalar_one()
+            self.observed_statuses.append(job.status)
+        return SummaryResult(
+            title="Observed claim",
+            summary="Summary job claim was committed before summarization.",
+            tags=["summary"],
+            folder_path="/observed",
+        )
+
+
 @pytest.fixture
 async def session_factory(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/test.db")
@@ -573,6 +590,24 @@ async def test_process_summary_jobs_once_opens_session_and_commits_processed_job
 
 
 @pytest.mark.asyncio
+async def test_process_summary_jobs_once_commits_claim_before_summarizing(session_factory):
+    async with session_factory() as session:
+        window = await create_local_window(session)
+        await enqueue_summary_job(session, window.id)
+        await session.commit()
+
+    observed_statuses: list[SummaryJobStatus] = []
+    processed = await process_summary_jobs_once(
+        session_factory,
+        summarizer=ClaimObservingSummarizer(session_factory, observed_statuses),
+        es_client=FakeElasticsearch(),
+    )
+
+    assert processed is True
+    assert observed_statuses == [SummaryJobStatus.running]
+
+
+@pytest.mark.asyncio
 async def test_folder_creation_race_does_not_rollback_claimed_summary_job(session_factory):
     async with session_factory() as session:
         window = await create_local_window(session)
@@ -882,6 +917,38 @@ async def test_process_summary_job_propagates_sqlalchemy_errors_without_marking_
         job = (await session.execute(select(SummaryJob))).scalar_one()
         assert job.status == SummaryJobStatus.pending
         assert job.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_process_summary_jobs_once_releases_claimed_job_after_sqlalchemy_error(
+    session_factory,
+    monkeypatch,
+):
+    async def fail_collect_summary_context(session, window):
+        raise SQLAlchemyError("transaction is aborted")
+
+    monkeypatch.setattr(
+        summary_worker, "collect_summary_context", fail_collect_summary_context, raising=False
+    )
+
+    async with session_factory() as session:
+        window = await create_local_window(session)
+        await enqueue_summary_job(session, window.id)
+        await session.commit()
+
+    with pytest.raises(SQLAlchemyError, match="transaction is aborted"):
+        await process_summary_jobs_once(
+            session_factory,
+            summarizer=FakeSummarizer(),
+            es_client=FakeElasticsearch(),
+        )
+
+    async with session_factory() as session:
+        job = (await session.execute(select(SummaryJob))).scalar_one()
+        assert job.status == SummaryJobStatus.pending
+        assert job.attempts == 1
+        assert job.run_after is not None
+        assert job.last_error == "summary processing transaction failed"
 
 
 @pytest.mark.asyncio

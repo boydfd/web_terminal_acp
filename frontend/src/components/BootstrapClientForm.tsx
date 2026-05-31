@@ -5,7 +5,6 @@ import type { BootstrapClientInput } from "../types";
 
 type BootstrapClientFormProps = {
   isSubmitting: boolean;
-  onCancel: () => void;
   onSubmit: (payload: BootstrapClientInput) => void;
 };
 
@@ -13,7 +12,7 @@ function defaultServerUrl(): string {
   return readClientAgentServerUrl();
 }
 
-export function BootstrapClientForm({ isSubmitting, onCancel, onSubmit }: BootstrapClientFormProps) {
+export function BootstrapClientForm({ isSubmitting, onSubmit }: BootstrapClientFormProps) {
   const [name, setName] = useState("");
   const [host, setHost] = useState("");
   const [port, setPort] = useState("22");
@@ -39,7 +38,7 @@ export function BootstrapClientForm({ isSubmitting, onCancel, onSubmit }: Bootst
         });
       }}
     >
-      <h2>Add client</h2>
+      <h3>SSH bootstrap</h3>
       <p className="muted">
         SSH bootstrap connects to the target host once, uploads the remote client, and registers it automatically.
       </p>
@@ -111,9 +110,6 @@ export function BootstrapClientForm({ isSubmitting, onCancel, onSubmit }: Bootst
       <div className="bootstrap-form-actions">
         <button type="submit" disabled={isSubmitting}>
           {isSubmitting ? "Bootstrapping..." : "Bootstrap client"}
-        </button>
-        <button type="button" onClick={onCancel} disabled={isSubmitting}>
-          Cancel
         </button>
       </div>
     </form>

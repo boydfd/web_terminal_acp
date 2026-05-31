@@ -277,9 +277,17 @@ __web_terminal_prepare_cursor_home() {
     "~/"*) source_cursor="$HOME/${WEB_TERMINAL_ORIGINAL_CURSOR_DIR#"~/"}" ;;
     *) source_cursor="${WEB_TERMINAL_ORIGINAL_CURSOR_DIR:-$HOME/.cursor}" ;;
   esac
+  mkdir -p "$managed_cursor/chats" 2>/dev/null || true
+  if [ -L "$managed_cursor/chats" ]; then
+    rm -f "$managed_cursor/chats" 2>/dev/null || true
+    mkdir -p "$managed_cursor/chats" 2>/dev/null || true
+  fi
   for item in "$source_cursor"/*; do
     [ -e "$item" ] || continue
     base="${item##*/}"
+    case "$base" in
+      chats) continue ;;
+    esac
     [ -e "$managed_cursor/$base" ] && continue
     ln -sf "$item" "$managed_cursor/$base" 2>/dev/null || true
   done

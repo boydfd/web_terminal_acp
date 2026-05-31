@@ -197,6 +197,36 @@ async def test_scoped_terminal_route_reports_disconnected_local_window(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_scoped_terminal_route_reports_runtime_starting_window(monkeypatch) -> None:
+    client_id = uuid4()
+    window_id = uuid4()
+    window = VirtualWindow(
+        id=window_id,
+        client_id=client_id,
+        title="Terminal",
+        status=WindowStatus.active,
+    )
+
+    async def fake_get_window_for_client(session, requested_client_id, requested_window_id):
+        assert requested_client_id == client_id
+        assert requested_window_id == window_id
+        return window
+
+    monkeypatch.setattr(terminal, "SessionLocal", lambda: FakeSession())
+    monkeypatch.setattr(terminal, "get_window_for_client", fake_get_window_for_client)
+    websocket = FakeWebSocket()
+
+    await terminal.terminal_websocket(websocket, client_id, window_id, tmux_manager=object())
+
+    assert websocket.accepted is True
+    assert websocket.sent_text == [
+        '{"type":"terminal_status","status":"reconnecting","reason":"runtime_starting",'
+        '"retry_after_ms":500}'
+    ]
+    assert websocket.closed == [1013]
+
+
+@pytest.mark.asyncio
 async def test_scoped_terminal_route_attaches_even_when_local_tmux_window_was_missing(monkeypatch) -> None:
     window_id = uuid4()
     window = VirtualWindow(

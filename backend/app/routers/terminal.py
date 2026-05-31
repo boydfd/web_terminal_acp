@@ -43,6 +43,7 @@ from app.services.tmux_manager import TmuxCommandError, TmuxManager, get_tmux_ma
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["terminal"])
 REMOTE_RECONNECT_RETRY_AFTER_MS = 5000
+RUNTIME_START_RETRY_AFTER_MS = 500
 ATTACH_SNAPSHOT_GRACE_SECONDS = 0.5
 LOCAL_OUTPUT_RECORD_BATCH_BYTES = 32 * 1024
 LOCAL_OUTPUT_RECORD_BATCH_DELAY_SECONDS = 0.02
@@ -228,7 +229,31 @@ async def terminal_websocket(
             return
         runtime_result = _runtime_window_from_virtual_window(window)
         if runtime_result is None:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            await websocket.accept()
+            if window.status is WindowStatus.disconnected:
+                await websocket.send_text(
+                    terminal_status_message(
+                        "unavailable",
+                        reason="client_offline",
+                        retry_after_ms=REMOTE_RECONNECT_RETRY_AFTER_MS,
+                    )
+                )
+                await websocket.close(code=1013)
+                return
+            if window.status is WindowStatus.error:
+                await websocket.send_text(
+                    terminal_status_message("error", reason="runtime_start_failed")
+                )
+                await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+                return
+            await websocket.send_text(
+                terminal_status_message(
+                    "reconnecting",
+                    reason="runtime_starting",
+                    retry_after_ms=RUNTIME_START_RETRY_AFTER_MS,
+                )
+            )
+            await websocket.close(code=1013)
             return
         runtime_window, is_local_window, is_remote_window = runtime_result
         if window.status is WindowStatus.disconnected and not is_remote_window:

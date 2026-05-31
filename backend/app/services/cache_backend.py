@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Callable
@@ -190,6 +191,9 @@ def clear_namespace(namespace: str) -> None:
 
 
 def _run(operation: Callable[[Redis], Any]) -> Any:
+    if _running_event_loop():
+        return None
+
     client = _get_client()
     if client is None:
         return None
@@ -227,6 +231,14 @@ def _disable_temporarily() -> None:
     global _redis_client, _redis_disabled_until
     _redis_client = None
     _redis_disabled_until = monotonic() + _REDIS_RETRY_AFTER_SECONDS
+
+
+def _running_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 def _index_keys(namespace: str, resources: frozenset[str], client_id: str | None) -> list[str]:

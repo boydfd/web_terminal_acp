@@ -61,6 +61,18 @@ function changeInputValue(target: HTMLInputElement, value: string): void {
   });
 }
 
+function compositionStart(target: HTMLTextAreaElement): void {
+  act(() => {
+    target.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+  });
+}
+
+function compositionEnd(target: HTMLTextAreaElement): void {
+  act(() => {
+    target.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+  });
+}
+
 afterEach(() => {
   act(() => {
     root?.unmount();
@@ -147,6 +159,27 @@ describe("TerminalQuickInput", () => {
     keyDown(textarea, { key: "Enter" });
 
     expect(textarea.value).toBe("");
+  });
+
+  it("does not submit Enter while IME composition is active", () => {
+    const onSubmit = vi.fn();
+    const textarea = renderQuickInput({
+      value: "",
+      onValueChange: () => {},
+      onSubmit,
+      submitOnEnter: true
+    });
+
+    changeTextareaValue(textarea, "123");
+    compositionStart(textarea);
+    keyDown(textarea, { key: "Enter" });
+
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    compositionEnd(textarea);
+    keyDown(textarea, { key: "Enter" });
+
+    expect(onSubmit).toHaveBeenCalledWith("123");
   });
 
   it("filters and submits custom quick keys", () => {

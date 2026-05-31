@@ -519,6 +519,7 @@ async def _agent_activity_state_by_window(
         select(
             VirtualWindow.id,
             VirtualWindow.agent_activity_latest_at,
+            VirtualWindow.agent_activity_latest_event_id,
             VirtualWindow.agent_activity_latest_completed_at,
         ).where(
             VirtualWindow.client_id == client_id,
@@ -529,7 +530,8 @@ async def _agent_activity_state_by_window(
     latest_completed_at: dict[UUID, datetime] = {}
     missing_window_ids: list[UUID] = []
     stale_projection_window_ids: list[UUID] = []
-    for window_id, activity_at, completed_at in rows:
+    stale_projection_event_ids: dict[UUID, UUID] = {}
+    for window_id, activity_at, latest_event_id, completed_at in rows:
         if activity_at is None:
             missing_window_ids.append(window_id)
         else:
@@ -539,15 +541,68 @@ async def _agent_activity_state_by_window(
             latest_completed_at[window_id] = completed_at
             if activity_at is not None and _aware_utc(activity_at) > completed_at:
                 stale_projection_window_ids.append(window_id)
+                if latest_event_id is not None:
+                    stale_projection_event_ids[window_id] = latest_event_id
 
-    fallback_window_ids = sorted({*missing_window_ids, *stale_projection_window_ids})
-    if _dialect_name(session) == "postgresql" and not fallback_window_ids:
+    dialect_name = _dialect_name(session)
+    if dialect_name == "postgresql":
+        if stale_projection_window_ids:
+            await _repair_stale_projected_agent_activity(
+                session,
+                client_id,
+                stale_projection_event_ids,
+                latest_activity=latest_activity,
+                latest_completed_at=latest_completed_at,
+            )
         return _WindowAgentActivityState(latest_activity, latest_completed_at)
+    else:
+        fallback_window_ids = sorted({*missing_window_ids, *stale_projection_window_ids})
 
     fallback_events = await _recent_agent_events_by_window(session, client_id, fallback_window_ids)
     latest_activity.update(_latest_ai_activity_by_window(fallback_events))
     latest_completed_at.update(_latest_agent_completed_at_by_window(fallback_events))
     return _WindowAgentActivityState(latest_activity, latest_completed_at)
+
+
+async def _repair_stale_projected_agent_activity(
+    session: AsyncSession,
+    client_id: UUID,
+    latest_event_ids: dict[UUID, UUID],
+    *,
+    latest_activity: dict[UUID, datetime],
+    latest_completed_at: dict[UUID, datetime],
+) -> None:
+    if not latest_event_ids:
+        return
+
+    events = list(
+        await session.scalars(
+            select(Event).where(
+                Event.client_id == client_id,
+                Event.id.in_(tuple(latest_event_ids.values())),
+            )
+        )
+    )
+    events_by_id = {event.id: event for event in events}
+    for window_id, event_id in latest_event_ids.items():
+        event = events_by_id.get(event_id)
+        if event is None or event.virtual_window_id != window_id:
+            if window_id in latest_completed_at:
+                latest_activity[window_id] = latest_completed_at[window_id]
+            else:
+                latest_activity.pop(window_id, None)
+            continue
+        if not event_is_agent_activity(event):
+            if window_id in latest_completed_at:
+                latest_activity[window_id] = latest_completed_at[window_id]
+            else:
+                latest_activity.pop(window_id, None)
+            continue
+        if event_is_agent_completion(event):
+            completed_at = event_activity_time(event)
+            current_completed_at = latest_completed_at.get(window_id)
+            if current_completed_at is None or completed_at > current_completed_at:
+                latest_completed_at[window_id] = completed_at
 
 
 def _group_events_by_window(rows: list[Event]) -> dict[UUID, list[Event]]:

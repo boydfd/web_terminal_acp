@@ -132,6 +132,19 @@ const PENDING_INPUT_QUEUE_MAX_SIZE = 64;
 const TOUCH_SCROLL_START_THRESHOLD_PX = 12;
 const TOUCH_SCROLL_FALLBACK_STEP_PX = 18;
 const TOUCH_SCROLL_MAX_WHEEL_EVENTS_PER_MOVE = 12;
+const NATIVE_TEXT_INPUT_FALLBACK_DELAY_MS = 0;
+const NATIVE_TEXT_INPUT_DEDUPE_MS = 250;
+
+type RecentNativeFallbackInput = {
+  data: string;
+  inputEventSerial: number;
+  sentAt: number;
+};
+
+type RecentXtermInput = {
+  data: string;
+  seenAt: number;
+};
 
 function terminalStatusLabel(status: TerminalConnectionStatus): string {
   switch (status) {
@@ -567,6 +580,14 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     let inputPriorityClaimTimer: number | null = null;
     let lastSentResize: { cols: number; rows: number } | null = null;
     let lastInputPriorityClaimedAt = 0;
+    let xtermInputSerial = 0;
+    let nativeTextInputEventSerial = 0;
+    let activeNativeTextInputEventSerial: number | null = null;
+    let nativeTextInputEventClearTimer: number | null = null;
+    let nativeInputFallbackTimer: number | null = null;
+    let nativeInputFallbackCompositionActive = false;
+    const recentNativeFallbackInputs: RecentNativeFallbackInput[] = [];
+    const recentXtermInputs: RecentXtermInput[] = [];
     const pendingInputs: string[] = [];
 
     const terminalViewLease = { viewId: viewIdRef.current, clientId, windowId: initialWindowId };
@@ -962,6 +983,11 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
             updateConnectionStatus("error");
           } else if (statusMessage?.status === "reconnecting") {
             updateConnectionStatus("reconnecting");
+            const retryAfterMs = typeof statusMessage.retry_after_ms === "number"
+              ? statusMessage.retry_after_ms
+              : undefined;
+            closeSocketWorker(worker);
+            scheduleReconnect(retryAfterMs);
           }
           worker.postMessage({ type: "output-ack" });
           return true;
@@ -1121,7 +1147,66 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       VIEW_PRIORITY_RECONCILE_INTERVAL_MS,
     );
 
+    const pruneRecentNativeFallbackInputs = (now = performance.now()) => {
+      while (
+        recentNativeFallbackInputs.length > 0
+        && now - recentNativeFallbackInputs[0].sentAt > NATIVE_TEXT_INPUT_DEDUPE_MS
+      ) {
+        recentNativeFallbackInputs.shift();
+      }
+    };
+
+    const pruneRecentXtermInputs = (now = performance.now()) => {
+      while (
+        recentXtermInputs.length > 0
+        && now - recentXtermInputs[0].seenAt > NATIVE_TEXT_INPUT_DEDUPE_MS
+      ) {
+        recentXtermInputs.shift();
+      }
+    };
+
+    const consumeMatchingNativeFallbackInput = (data: string): boolean => {
+      const now = performance.now();
+      pruneRecentNativeFallbackInputs(now);
+      const activeInputEventSerial = activeNativeTextInputEventSerial;
+      const index = recentNativeFallbackInputs.findIndex((entry) => (
+        entry.data === data
+        && (
+          activeInputEventSerial === entry.inputEventSerial
+          || (activeInputEventSerial === null && nativeTextInputEventSerial === entry.inputEventSerial)
+        )
+      ));
+      if (index < 0) {
+        return false;
+      }
+      recentNativeFallbackInputs.splice(index, 1);
+      return true;
+    };
+
+    const rememberNativeFallbackInput = (data: string, inputEventSerial: number) => {
+      const now = performance.now();
+      pruneRecentNativeFallbackInputs(now);
+      recentNativeFallbackInputs.push({ data, inputEventSerial, sentAt: now });
+    };
+
+    const rememberXtermInput = (data: string) => {
+      const now = performance.now();
+      pruneRecentXtermInputs(now);
+      recentXtermInputs.push({ data, seenAt: now });
+    };
+
+    const hasRecentXtermInput = (data: string): boolean => {
+      const now = performance.now();
+      pruneRecentXtermInputs(now);
+      return recentXtermInputs.some((entry) => entry.data === data);
+    };
+
     const disposable = terminal.onData((data) => {
+      xtermInputSerial += 1;
+      if (consumeMatchingNativeFallbackInput(data)) {
+        return;
+      }
+      rememberXtermInput(data);
       window.__WEB_TERMINAL_TEST_ON_TERMINAL_DATA__?.(data, performance.now());
       sendOrQueueInput(data);
       scheduleInputPriorityClaim();
@@ -1195,6 +1280,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
 
     let nativePasteElement: HTMLElement | undefined;
     let nativePasteTextarea: HTMLTextAreaElement | undefined;
+    let nativeInputTextarea: HTMLTextAreaElement | undefined;
     const handleNativePaste = (event: ClipboardEvent) => {
       if (connectionStatusRef.current !== "connected") {
         return;
@@ -1209,18 +1295,97 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
         focusCurrentTerminal();
       }
     };
+
+    const handleNativeInputCompositionStart = () => {
+      nativeInputFallbackCompositionActive = true;
+      if (nativeInputFallbackTimer !== null) {
+        window.clearTimeout(nativeInputFallbackTimer);
+        nativeInputFallbackTimer = null;
+      }
+    };
+    const handleNativeInputCompositionEnd = () => {
+      nativeInputFallbackCompositionActive = false;
+    };
+    const markNativeTextInputEvent = (event: InputEvent) => {
+      if (
+        event.inputType === "insertText"
+        && event.data !== null
+        && event.data.length > 1
+      ) {
+        nativeTextInputEventSerial += 1;
+        activeNativeTextInputEventSerial = nativeTextInputEventSerial;
+        if (nativeTextInputEventClearTimer !== null) {
+          window.clearTimeout(nativeTextInputEventClearTimer);
+        }
+        const markedInputEventSerial = nativeTextInputEventSerial;
+        nativeTextInputEventClearTimer = window.setTimeout(() => {
+          nativeTextInputEventClearTimer = null;
+          if (activeNativeTextInputEventSerial === markedInputEventSerial) {
+            activeNativeTextInputEventSerial = null;
+          }
+        }, 0);
+      }
+    };
+    const handleNativeTextInputFallback = (event: InputEvent) => {
+      if (
+        connectionStatusRef.current !== "connected"
+        || nativeInputFallbackCompositionActive
+        || event.isComposing
+        || event.inputType !== "insertText"
+        || event.data === null
+        || event.data.length <= 1
+        || event.defaultPrevented
+      ) {
+        return;
+      }
+
+      const data = event.data;
+      const xtermSerialBeforeFallback = xtermInputSerial;
+      const inputEventSerial = nativeTextInputEventSerial;
+      if (nativeInputFallbackTimer !== null) {
+        window.clearTimeout(nativeInputFallbackTimer);
+      }
+      nativeInputFallbackTimer = window.setTimeout(() => {
+        nativeInputFallbackTimer = null;
+        if (
+          !isActive()
+          || connectionStatusRef.current !== "connected"
+          || nativeInputFallbackCompositionActive
+          || xtermInputSerial !== xtermSerialBeforeFallback
+          || hasRecentXtermInput(data)
+        ) {
+          return;
+        }
+
+        rememberNativeFallbackInput(data, inputEventSerial);
+        sendOrQueueInput(data);
+        scheduleInputPriorityClaim();
+      }, NATIVE_TEXT_INPUT_FALLBACK_DELAY_MS);
+    };
+
     const attachNativePasteHandlers = () => {
       const element = terminal.element;
       const textarea = terminal.textarea;
       if (element !== undefined && nativePasteElement !== element) {
         nativePasteElement?.removeEventListener("paste", handleNativePaste, true);
+        nativePasteElement?.removeEventListener("input", markNativeTextInputEvent as EventListener, true);
         element.addEventListener("paste", handleNativePaste, true);
+        element.addEventListener("input", markNativeTextInputEvent as EventListener, true);
         nativePasteElement = element;
       }
       if (textarea !== undefined && nativePasteTextarea !== textarea) {
         nativePasteTextarea?.removeEventListener("paste", handleNativePaste, true);
         textarea.addEventListener("paste", handleNativePaste, true);
         nativePasteTextarea = textarea;
+      }
+      if (textarea !== undefined && nativeInputTextarea !== textarea) {
+        nativeInputTextarea?.removeEventListener("compositionstart", handleNativeInputCompositionStart);
+        nativeInputTextarea?.removeEventListener("compositionend", handleNativeInputCompositionEnd);
+        nativeInputTextarea?.removeEventListener("input", handleNativeTextInputFallback as EventListener, true);
+        textarea.addEventListener("compositionstart", handleNativeInputCompositionStart);
+        textarea.addEventListener("compositionend", handleNativeInputCompositionEnd);
+        textarea.addEventListener("input", handleNativeTextInputFallback as EventListener, true);
+        nativeInputTextarea = textarea;
       }
     };
 
@@ -1289,12 +1454,22 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       if (resizeDebounceTimer !== null) {
         window.clearTimeout(resizeDebounceTimer);
       }
+      if (nativeInputFallbackTimer !== null) {
+        window.clearTimeout(nativeInputFallbackTimer);
+      }
+      if (nativeTextInputEventClearTimer !== null) {
+        window.clearTimeout(nativeTextInputEventClearTimer);
+      }
       window.clearInterval(viewPriorityReconcileInterval);
       window.clearInterval(undersizedCheckInterval);
       resizeObserver.disconnect();
       canvasObserver.disconnect();
       nativePasteElement?.removeEventListener("paste", handleNativePaste, true);
+      nativePasteElement?.removeEventListener("input", markNativeTextInputEvent as EventListener, true);
       nativePasteTextarea?.removeEventListener("paste", handleNativePaste, true);
+      nativeInputTextarea?.removeEventListener("compositionstart", handleNativeInputCompositionStart);
+      nativeInputTextarea?.removeEventListener("compositionend", handleNativeInputCompositionEnd);
+      nativeInputTextarea?.removeEventListener("input", handleNativeTextInputFallback as EventListener, true);
       document.removeEventListener("visibilitychange", handleTerminalVisibilityChange);
       window.removeEventListener("storage", handleTerminalViewPriorityChange);
       window.removeEventListener(TERMINAL_VIEW_PRIORITY_CHANGED_EVENT, handleTerminalViewPriorityChange);

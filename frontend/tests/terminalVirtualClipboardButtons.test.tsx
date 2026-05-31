@@ -6,8 +6,10 @@ import { TerminalPane } from "../src/components/TerminalPane";
 
 let latestTerminal: {
   element: HTMLElement | undefined;
+  textarea: HTMLTextAreaElement | undefined;
   options: { theme?: unknown };
   customKeyEventHandler?: (event: KeyboardEvent) => boolean;
+  emitData: (data: string) => void;
 } | null = null;
 
 vi.mock("@xterm/xterm", () => ({
@@ -19,6 +21,7 @@ vi.mock("@xterm/xterm", () => ({
     public options: { theme?: unknown };
     public modes = { bracketedPasteMode: false };
     public customKeyEventHandler?: (event: KeyboardEvent) => boolean;
+    public dataHandler?: (data: string) => void;
     public parser = {
       registerOscHandler: vi.fn(() => ({ dispose: vi.fn() }))
     };
@@ -45,11 +48,15 @@ vi.mock("@xterm/xterm", () => ({
     onWriteParsed() {
       return { dispose: vi.fn() };
     }
-    onData() {
+    onData(handler: (data: string) => void) {
+      this.dataHandler = handler;
       return { dispose: vi.fn() };
     }
     attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean) {
       this.customKeyEventHandler = handler;
+    }
+    emitData(data: string) {
+      this.dataHandler?.(data);
     }
   }
 }));
@@ -110,6 +117,22 @@ function installTerminalPaneDomMocks() {
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
+}
+
+function textInputEvent(data: string): InputEvent {
+  const event = new Event("input", { bubbles: true, cancelable: true }) as InputEvent;
+  Object.defineProperties(event, {
+    data: { configurable: true, value: data },
+    inputType: { configurable: true, value: "insertText" },
+    isComposing: { configurable: true, value: false },
+  });
+  return event;
+}
+
+async function waitForNativeInputFallback(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+  });
 }
 
 afterEach(() => {
@@ -233,4 +256,128 @@ describe("TerminalPane virtual clipboard controls", () => {
     expect(pasteEvent.stopImmediatePropagation).toHaveBeenCalledTimes(1);
   });
 
+  it("falls back to native multi-character text input when xterm misses Android IME data", async () => {
+    installTerminalPaneDomMocks();
+
+    act(() => {
+      root?.render(
+        <TerminalPane
+          clientId="client-1"
+          windowId="window-1"
+        />
+      );
+    });
+
+    const textarea = latestTerminal?.textarea;
+    if (!(textarea instanceof HTMLTextAreaElement)) {
+      throw new Error("Terminal helper textarea was not rendered");
+    }
+
+    act(() => {
+      textarea.dispatchEvent(textInputEvent("12345"));
+    });
+    await waitForNativeInputFallback();
+
+    const inputMessages = workerInstances[0].messages.filter((message) => message.type === "input");
+    expect(inputMessages).toHaveLength(1);
+    expect(new TextDecoder().decode((inputMessages[0] as { data: Uint8Array }).data)).toBe("12345");
+  });
+
+  it("does not duplicate native text input when xterm emits the same Android IME data", async () => {
+    installTerminalPaneDomMocks();
+
+    act(() => {
+      root?.render(
+        <TerminalPane
+          clientId="client-1"
+          windowId="window-1"
+        />
+      );
+    });
+
+    const textarea = latestTerminal?.textarea;
+    if (!(textarea instanceof HTMLTextAreaElement)) {
+      throw new Error("Terminal helper textarea was not rendered");
+    }
+
+    textarea.addEventListener("input", () => latestTerminal?.emitData("67890"));
+
+    act(() => {
+      textarea.dispatchEvent(textInputEvent("67890"));
+    });
+    await waitForNativeInputFallback();
+
+    const inputMessages = workerInstances[0].messages.filter((message) => message.type === "input");
+    expect(inputMessages).toHaveLength(1);
+    expect(new TextDecoder().decode((inputMessages[0] as { data: Uint8Array }).data)).toBe("67890");
+  });
+
+  it("keeps repeated identical Android IME batches as separate terminal inputs", async () => {
+    installTerminalPaneDomMocks();
+
+    act(() => {
+      root?.render(
+        <TerminalPane
+          clientId="client-1"
+          windowId="window-1"
+        />
+      );
+    });
+
+    const textarea = latestTerminal?.textarea;
+    if (!(textarea instanceof HTMLTextAreaElement)) {
+      throw new Error("Terminal helper textarea was not rendered");
+    }
+
+    act(() => {
+      textarea.dispatchEvent(textInputEvent("11"));
+    });
+    await waitForNativeInputFallback();
+    act(() => {
+      textarea.dispatchEvent(textInputEvent("11"));
+    });
+    await waitForNativeInputFallback();
+
+    const inputMessages = workerInstances[0].messages.filter((message) => message.type === "input");
+    expect(inputMessages).toHaveLength(2);
+    expect(inputMessages.map((message) => (
+      new TextDecoder().decode((message as { data: Uint8Array }).data)
+    ))).toEqual(["11", "11"]);
+  });
+
+  it("does not swallow the next identical Android IME batch when xterm handles it", async () => {
+    installTerminalPaneDomMocks();
+
+    act(() => {
+      root?.render(
+        <TerminalPane
+          clientId="client-1"
+          windowId="window-1"
+        />
+      );
+    });
+
+    const textarea = latestTerminal?.textarea;
+    if (!(textarea instanceof HTMLTextAreaElement)) {
+      throw new Error("Terminal helper textarea was not rendered");
+    }
+
+    act(() => {
+      textarea.dispatchEvent(textInputEvent("22"));
+    });
+    await waitForNativeInputFallback();
+
+    const emitXtermInput = () => latestTerminal?.emitData("22");
+    textarea.addEventListener("input", emitXtermInput, { once: true });
+    act(() => {
+      textarea.dispatchEvent(textInputEvent("22"));
+    });
+    await waitForNativeInputFallback();
+
+    const inputMessages = workerInstances[0].messages.filter((message) => message.type === "input");
+    expect(inputMessages).toHaveLength(2);
+    expect(inputMessages.map((message) => (
+      new TextDecoder().decode((message as { data: Uint8Array }).data)
+    ))).toEqual(["22", "22"]);
+  });
 });

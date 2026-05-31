@@ -392,8 +392,9 @@ def test_agent_environment_prepares_per_window_agent_config_links(tmp_path) -> N
     assert (codex_home / "log").is_dir()
     assert (codex_home / "shell_snapshots").is_dir()
     assert (claude_home / "projects").is_dir()
-    assert (cursor_home / "chats").resolve() == home / ".cursor" / "chats"
-    assert (cursor_home / "chats").is_symlink()
+    assert (cursor_home / "chats").is_dir()
+    assert not (cursor_home / "chats").is_symlink()
+    assert not (cursor_home / "chats" / "marker").exists()
 
     for item_name in source_items[".codex"]:
         assert (codex_home / item_name).resolve() == home / ".codex" / item_name
@@ -402,3 +403,33 @@ def test_agent_environment_prepares_per_window_agent_config_links(tmp_path) -> N
     assert (claude_home / "file-history").resolve() == home / ".claude" / "file-history"
     for item_name in source_items[".cursor"]:
         assert (cursor_home / item_name).resolve() == home / ".cursor" / item_name
+
+
+def test_agent_environment_replaces_legacy_cursor_chats_symlink(tmp_path) -> None:
+    home = tmp_path / "home"
+    source_chats = home / ".cursor" / "chats"
+    source_chats.mkdir(parents=True)
+    cursor_home = home / ".web-terminal-acp" / "cursor-homes" / "window-1"
+    cursor_home.mkdir(parents=True)
+    (cursor_home / "chats").symlink_to(source_chats)
+
+    env = {
+        "HOME": str(home),
+        "PATH": os.environ["PATH"],
+        "WEB_TERMINAL_CODEX_HOME": "~/.web-terminal-acp/codex-homes/window-1",
+        "WEB_TERMINAL_CLAUDE_CODE_HOME": "~/.web-terminal-acp/claude-code-homes/window-1",
+        "WEB_TERMINAL_CURSOR_HOME": "~/.web-terminal-acp/cursor-homes/window-1",
+        "CODEX_HOME": "",
+    }
+    result = subprocess.run(
+        ["bash", "-c", _agent_environment_script()],
+        check=False,
+        env=env,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (cursor_home / "chats").is_dir()
+    assert not (cursor_home / "chats").is_symlink()

@@ -6,7 +6,7 @@ import inspect
 import logging
 import socket
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from uuid import UUID
 
 import websockets
@@ -157,6 +157,7 @@ async def _run_client_agent_once(config: ClientAgentConfig) -> bool:
             )
             agent_tool_watcher.start()
             attach_snapshot_tasks: dict[UUID, asyncio.Task[None]] = {}
+            create_window_tasks: set[asyncio.Task[None]] = set()
             git_worktree_tasks: set[asyncio.Task[None]] = set()
             git_worktree_semaphore = asyncio.Semaphore(GIT_WORKTREE_REQUEST_CONCURRENCY)
             terminal_view_window_ids: dict[UUID, UUID] = {}
@@ -195,6 +196,7 @@ async def _run_client_agent_once(config: ClientAgentConfig) -> bool:
                             git_worktree_semaphore,
                             terminal_view_window_ids,
                             message,
+                            create_window_tasks=create_window_tasks,
                         ):
                             return True
                     except Exception as exc:
@@ -208,8 +210,11 @@ async def _run_client_agent_once(config: ClientAgentConfig) -> bool:
             finally:
                 if heartbeat_task is not None:
                     heartbeat_task.cancel()
+                pending_create_window_tasks = tuple(create_window_tasks)
                 pending_git_worktree_tasks = tuple(git_worktree_tasks)
                 for task in attach_snapshot_tasks.values():
+                    task.cancel()
+                for task in pending_create_window_tasks:
                     task.cancel()
                 for task in pending_git_worktree_tasks:
                     task.cancel()
@@ -217,6 +222,9 @@ async def _run_client_agent_once(config: ClientAgentConfig) -> bool:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await heartbeat_task
                 for task in attach_snapshot_tasks.values():
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+                for task in pending_create_window_tasks:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await task
                 for task in pending_git_worktree_tasks:
@@ -251,7 +259,7 @@ def _register_inventory_windows(
 @dataclass(frozen=True)
 class RuntimeWindowAvailability:
     window: ClientRuntimeWindow
-    recreated: bool
+    should_resume_session: bool
 
 
 async def _ensure_runtime_window_available(
@@ -274,15 +282,20 @@ async def _ensure_runtime_window_available(
             shell_command=shell_command,
             managed_agent_tools=True,
         )
-        recreated = False
+        should_resume_session = False
     else:
         terminal.unregister_window(window_id)
+        should_resume_session = idle_supervisor.has_resumable_session(
+            window_id,
+            project_path=cwd,
+        )
         runtime_window = await runtime.recreate_window(
             window_id,
             cwd=cwd,
-            shell_command=shell_command,
+            shell_command=None if should_resume_session else shell_command,
         )
-        recreated = True
+        if should_resume_session:
+            runtime_window = replace(runtime_window, shell_command=shell_command)
 
     terminal.register_window(
         window_id,
@@ -290,7 +303,10 @@ async def _ensure_runtime_window_available(
         runtime_window.remote_window_id,
     )
     idle_supervisor.register_window(window_id, runtime_window.cwd)
-    return RuntimeWindowAvailability(window=runtime_window, recreated=recreated)
+    return RuntimeWindowAvailability(
+        window=runtime_window,
+        should_resume_session=should_resume_session,
+    )
 
 
 async def _send_inventory(
@@ -365,6 +381,8 @@ async def _handle_agent_message(
     git_worktree_semaphore: asyncio.Semaphore,
     terminal_view_window_ids: dict[UUID, UUID],
     message: AgentMessage,
+    *,
+    create_window_tasks: set[asyncio.Task[None]] | None = None,
 ) -> bool:
     if message.type == "shutdown":
         return True
@@ -382,53 +400,28 @@ async def _handle_agent_message(
         return False
 
     if message.type == "create_window":
-        window_id = _message_window_id(message)
-        logger.info(
-            "client-agent create_window started",
-            extra={"client_id": str(message.client_id), "window_id": str(window_id)},
-        )
-        agent_config_selection = _agent_config_selection_from_payload(
-            message.payload.get("agent_config_selection")
-        )
-        if agent_config_selection is not None:
-            agent_config_service.apply_agent_config_selection(
-                agent_config_selection,
-                window_id=str(window_id),
+        if create_window_tasks is None:
+            await _handle_create_window_job(
+                control_writer,
+                runtime,
+                terminal,
+                idle_supervisor,
+                agent_tool_watcher,
+                message,
             )
-        project_path = _optional_payload_string(message, "cwd")
-        runtime_window = await runtime.create_window(
-            window_id,
-            cwd=project_path,
-            shell_command=_optional_payload_string(message, "shell_command"),
-        )
-        terminal.register_window(
-            window_id,
-            runtime_window.remote_session_id,
-            runtime_window.remote_window_id,
-        )
-        idle_supervisor.register_window(window_id, project_path)
-        agent_tool_watcher.watch_window(
-            window_id,
-            project_path,
-        )
-        await control_writer.send(
-            AgentMessage(
-                type="create_window_result",
-                client_id=message.client_id,
-                window_id=window_id,
-                request_id=message.request_id,
-                payload=asdict(runtime_window),
+            return False
+        task = asyncio.create_task(
+            _handle_create_window_job(
+                control_writer,
+                runtime,
+                terminal,
+                idle_supervisor,
+                agent_tool_watcher,
+                message,
             )
         )
-        logger.info(
-            "client-agent create_window completed",
-            extra={
-                "client_id": str(message.client_id),
-                "window_id": str(window_id),
-                "remote_session_id": runtime_window.remote_session_id,
-                "remote_window_id": runtime_window.remote_window_id,
-            },
-        )
+        create_window_tasks.add(task)
+        task.add_done_callback(create_window_tasks.discard)
         return False
 
     if message.type == "kill_window":
@@ -501,7 +494,7 @@ async def _handle_agent_message(
         runtime_window = availability.window
         await idle_supervisor.resume_window(
             window_id,
-            allow_latest_session=availability.recreated,
+            allow_latest_session=availability.should_resume_session,
         )
         await terminal.attach_with_selection(
             window_id,
@@ -581,7 +574,7 @@ async def _handle_agent_message(
         idle_supervisor.attach_view(view_id, window_id)
         await idle_supervisor.resume_window(
             window_id,
-            allow_latest_session=availability.recreated,
+            allow_latest_session=availability.should_resume_session,
         )
         await terminal.select_window(window_id, view_id=view_id)
         await _send_terminal_attach_result(
@@ -666,6 +659,78 @@ def _agent_config_payload(config: agent_config_service.AgentConfig) -> dict[str,
             for section in config.sections
         ],
     }
+
+
+async def _handle_create_window_job(
+    control_writer: ControlMessageWriter,
+    runtime: ClientTmuxRuntime,
+    terminal: ClientTerminalMultiplexer,
+    idle_supervisor: AgentIdleSupervisor,
+    agent_tool_watcher: UnifiedAgentToolWatcher,
+    message: AgentMessage,
+) -> None:
+    window_id = _message_window_id(message)
+    logger.info(
+        "client-agent create_window started",
+        extra={"client_id": str(message.client_id), "window_id": str(window_id)},
+    )
+    try:
+        agent_config_selection = _agent_config_selection_from_payload(
+            message.payload.get("agent_config_selection")
+        )
+        if agent_config_selection is not None:
+            agent_config_service.apply_agent_config_selection(
+                agent_config_selection,
+                window_id=str(window_id),
+            )
+        project_path = _optional_payload_string(message, "cwd")
+        runtime_window = await runtime.create_window(
+            window_id,
+            cwd=project_path,
+            shell_command=_optional_payload_string(message, "shell_command"),
+        )
+        terminal.register_window(
+            window_id,
+            runtime_window.remote_session_id,
+            runtime_window.remote_window_id,
+        )
+        idle_supervisor.register_window(window_id, project_path)
+        agent_tool_watcher.watch_window(
+            window_id,
+            project_path,
+        )
+        await control_writer.send(
+            AgentMessage(
+                type="create_window_result",
+                client_id=message.client_id,
+                window_id=window_id,
+                request_id=message.request_id,
+                payload=asdict(runtime_window),
+            )
+        )
+        logger.info(
+            "client-agent create_window completed",
+            extra={
+                "client_id": str(message.client_id),
+                "window_id": str(window_id),
+                "remote_session_id": runtime_window.remote_session_id,
+                "remote_window_id": runtime_window.remote_window_id,
+            },
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "client-agent create_window failed",
+            extra={"client_id": str(message.client_id), "window_id": str(window_id)},
+        )
+        await _send_terminal_error(
+            control_writer,
+            message.client_id,
+            window_id,
+            request_id=message.request_id,
+            message=str(exc),
+        )
 
 
 async def _handle_git_worktree_request_job(

@@ -47,13 +47,13 @@ def cursor_store_paths_for_window(window_id: UUID | str) -> list[Path]:
     root = Path.home() / ".web-terminal-acp" / "cursor-homes" / str(window_id)
     if not root.exists():
         return []
-    return _find_files_following_directory_symlinks(root, "store.db")
+    return _find_files_without_directory_symlinks(root, "store.db")
 
 
-def _find_files_following_directory_symlinks(root: Path, file_name: str) -> list[Path]:
+def _find_files_without_directory_symlinks(root: Path, file_name: str) -> list[Path]:
     paths: list[Path] = []
     visited_dirs: set[tuple[int, int]] = set()
-    for current_root, dir_names, file_names in os.walk(root, followlinks=True):
+    for current_root, dir_names, file_names in os.walk(root, followlinks=False):
         current_path = Path(current_root)
         try:
             stat = current_path.stat()
@@ -122,6 +122,7 @@ class AgentToolWatcherState:
     cursor_store_paths: list[Path] = field(default_factory=list)
     cursor_seen_blob_ids: dict[Path, set[str]] = field(default_factory=dict)
     cursor_last_rowids: dict[Path, int] = field(default_factory=dict)
+    cursor_discovery_started: bool = False
 
 
 AGENT_TOOL_COLLECTORS: tuple[tuple[str, str], ...] = (
@@ -382,6 +383,7 @@ def initialize_agent_tool_watcher_state(state: AgentToolWatcherState, *, window_
     for path in state.cursor_store_paths:
         state.cursor_last_rowids[path] = _cursor_store_max_rowid(path)
         state.cursor_seen_blob_ids.setdefault(path, set())
+    state.cursor_discovery_started = True
 
 
 def _cursor_store_max_rowid(path: Path) -> int:
@@ -640,6 +642,10 @@ def collect_cursor_watch_events(
         if path not in known_paths:
             state.cursor_store_paths.append(path)
             known_paths.add(path)
+            if state.cursor_discovery_started:
+                state.cursor_last_rowids[path] = _cursor_store_max_rowid(path)
+            state.cursor_seen_blob_ids.setdefault(path, set())
+    state.cursor_discovery_started = True
 
     events: list[ManagedAiEvent] = []
     for path in state.cursor_store_paths:

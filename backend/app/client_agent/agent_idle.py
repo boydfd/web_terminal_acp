@@ -135,6 +135,14 @@ class AgentIdleSupervisor:
     def register_window(self, window_id: UUID, project_path: str | None) -> None:
         self._window_project_paths[window_id] = project_path
 
+    def has_resumable_session(self, window_id: UUID, *, project_path: str | None = None) -> bool:
+        if any(resume_command(record) is not None for record in self._load_suspended_agents(window_id)):
+            return True
+        return latest_resume_command(
+            window_id,
+            project_path=project_path or self._window_project_paths.get(window_id),
+        ) is not None
+
     def remove_window(self, window_id: UUID) -> None:
         self._window_project_paths.pop(window_id, None)
         for key in [key for key in self._states if key[0] == window_id]:

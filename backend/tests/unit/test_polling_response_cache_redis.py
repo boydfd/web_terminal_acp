@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+import pytest
+
 from app.services import cache_backend
 from app.services import polling_response_cache
 from app.services.polling_response_cache import (
@@ -65,3 +67,13 @@ def test_polling_response_cache_expires_redis_entries(monkeypatch) -> None:
     expire_polling_response_cache({"window"}, client_id=client_id)
 
     assert expire_calls == [("polling-response", {"window"}, str(client_id), 89.0, 60)]
+
+
+@pytest.mark.asyncio
+async def test_cache_backend_skips_sync_redis_inside_event_loop(monkeypatch) -> None:
+    def fail_get_client():
+        raise AssertionError("sync Redis client should not be opened inside the event loop")
+
+    monkeypatch.setattr(cache_backend, "_get_client", fail_get_client)
+
+    assert cache_backend.get_json("polling-response", ("tree", uuid4())) is None

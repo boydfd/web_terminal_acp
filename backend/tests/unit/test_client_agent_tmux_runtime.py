@@ -10,7 +10,7 @@ WINDOW_ID = UUID("87654321-4321-8765-4321-876543218765")
 
 
 @pytest.mark.asyncio
-async def test_create_window_ensures_pool_and_returns_remote_target_when_pool_missing() -> None:
+async def test_create_window_ensures_pool_and_returns_remote_target_when_pool_missing(tmp_path) -> None:
     calls: list[list[str]] = []
 
     async def fake_run(args: list[str]) -> str:
@@ -26,10 +26,12 @@ async def test_create_window_ensures_pool_and_returns_remote_target_when_pool_mi
         server_url="https://control.example.com",
         pool_session="client_pool",
         default_shell="/bin/bash",
+        launcher_dir=tmp_path / "launchers",
         runner=fake_run,
     )
 
     target = await runtime.create_window(WINDOW_ID, cwd="/tmp/project")
+    launcher_command = f"exec {tmp_path / 'launchers' / f'{WINDOW_ID}.sh'}"
 
     assert target == ClientRuntimeWindow(
         remote_session_id="client_pool",
@@ -57,7 +59,7 @@ async def test_create_window_ensures_pool_and_returns_remote_target_when_pool_mi
             "client_pool",
             "-c",
             "/tmp/project",
-            runtime.managed_shell_command(WINDOW_ID, project_path="/tmp/project"),
+            launcher_command,
         ],
         ["tmux", "set-option", "-p", "-t", "client_pool:@9", "allow-passthrough", "on"],
         ["tmux", "select-window", "-t", "client_pool:@9"],
@@ -80,6 +82,40 @@ async def test_create_window_ensures_pool_and_returns_remote_target_when_pool_mi
             "1",
         ],
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_window_uses_short_launcher_script_for_managed_shell(tmp_path) -> None:
+    calls: list[list[str]] = []
+
+    async def fake_run(args: list[str]) -> str:
+        calls.append(args)
+        if args[:3] == ["tmux", "new-window", "-P"]:
+            return "@9\n"
+        return ""
+
+    runtime = ClientTmuxRuntime(
+        client_id=CLIENT_ID,
+        server_url="https://control.example.com/with space/it's-ok",
+        pool_session="client_pool",
+        default_shell="/bin/bash",
+        launcher_dir=tmp_path / "launchers",
+        runner=fake_run,
+    )
+
+    await runtime.create_window(WINDOW_ID, cwd="/workspace/project")
+
+    new_window_call = next(call for call in calls if call[:3] == ["tmux", "new-window", "-P"])
+    launcher_command = new_window_call[-1]
+    assert launcher_command.startswith("exec ")
+    assert len(launcher_command) < 200
+    launcher_path = tmp_path / "launchers" / f"{WINDOW_ID}.sh"
+    assert launcher_command == f"exec {launcher_path}"
+    launcher_text = launcher_path.read_text(encoding="utf-8")
+    assert launcher_text.startswith("#!/bin/sh\n")
+    assert "WEB_TERMINAL_WINDOW_ID=87654321-4321-8765-4321-876543218765" in launcher_text
+    assert "WEB_TERMINAL_PROJECT_PATH=/workspace/project" in launcher_text
+    assert "exec /bin/bash" in launcher_text
 
 
 def test_managed_shell_command_injects_quoted_environment_and_execs_default_shell() -> None:
@@ -200,7 +236,7 @@ async def test_has_window_checks_remote_tmux_target() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_window_launches_direct_agent_inside_default_shell_with_literal_send_keys() -> None:
+async def test_create_window_launches_direct_agent_inside_default_shell_with_literal_send_keys(tmp_path) -> None:
     calls: list[list[str]] = []
 
     async def fake_run(args: list[str]) -> str:
@@ -214,6 +250,7 @@ async def test_create_window_launches_direct_agent_inside_default_shell_with_lit
         server_url="https://control.example.com",
         pool_session="client_pool",
         default_shell="/bin/bash",
+        launcher_dir=tmp_path / "launchers",
         runner=fake_run,
     )
 
@@ -224,7 +261,7 @@ async def test_create_window_launches_direct_agent_inside_default_shell_with_lit
     )
 
     new_window_call = next(call for call in calls if call[:3] == ["tmux", "new-window", "-P"])
-    assert new_window_call[-1] == runtime.managed_shell_command(WINDOW_ID, project_path="/workspace/project")
+    assert new_window_call[-1] == f"exec {tmp_path / 'launchers' / f'{WINDOW_ID}.sh'}"
     assert target.remote_window_id == "@9"
     assert target.shell_command == "codex resume codex-session"
     assert [

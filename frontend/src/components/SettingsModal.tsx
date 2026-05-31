@@ -16,7 +16,7 @@ import {
   writeThemeSkin
 } from "../userPreferences";
 import { ensureDesktopNotificationPermission } from "../desktopNotifications";
-import { readApiBase, readClientAgentServerUrl, readConfiguredApiBase, writeConfiguredApiBase } from "../apiBase";
+import { readApiBase, readConfiguredApiBase, writeConfiguredApiBase } from "../apiBase";
 import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   createCustomQuickKey,
@@ -37,7 +37,7 @@ import {
 } from "../keyboardShortcuts";
 import { THEME_SKINS } from "../themeSkins";
 
-export type SettingsView = "general" | "theme" | "shortcuts" | "quick-keys" | "clients";
+export type SettingsView = "general" | "theme" | "shortcuts" | "quick-keys";
 type ShortcutBindingTarget =
   | { type: "builtin"; id: KeyboardShortcutId }
   | { type: "quick-key"; id: string }
@@ -59,27 +59,11 @@ type SettingsModalProps = {
   onKeyboardShortcutBindingsChange: (bindings: KeyboardShortcutBindings) => void;
   onCustomQuickKeysChange: (quickKeys: CustomQuickKey[]) => void;
   authEnabled: boolean;
-  registrationKey: string | null;
-  registrationKeyPending: boolean;
-  registrationKeyError: string | null;
   initialView?: SettingsView;
-  onGenerateRegistrationKey: (label?: string | null) => void;
   onboardingEnabled: boolean;
   onStartOnboarding: () => void;
   onLogout: () => void;
 };
-
-function apiPath(path: string): string {
-  const base = new URL(readApiBase());
-  if (!base.pathname.endsWith("/")) {
-    base.pathname = `${base.pathname}/`;
-  }
-  return new URL(path.replace(/^\/+/, ""), base).toString();
-}
-
-function shellSingleQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
 
 function shortcutTargetKey(target: ShortcutBindingTarget): string {
   return target.type === "quick-key-draft" ? target.type : `${target.type}:${target.id}`;
@@ -184,11 +168,7 @@ export function SettingsModal({
   onKeyboardShortcutBindingsChange,
   onCustomQuickKeysChange,
   authEnabled,
-  registrationKey,
-  registrationKeyPending,
-  registrationKeyError,
   initialView = "general",
-  onGenerateRegistrationKey,
   onboardingEnabled,
   onStartOnboarding,
   onLogout
@@ -198,9 +178,7 @@ export function SettingsModal({
   const [agentCommandDraft, setAgentCommandDraft] = useState<AgentCommandSettings>(() => readAgentCommandSettings());
   const [view, setView] = useState<SettingsView>("general");
   const [quickKeyDraft, setQuickKeyDraft] = useState<CustomQuickKey>(() => createCustomQuickKey());
-  const [registrationClientName, setRegistrationClientName] = useState("");
   const [recordingShortcutTarget, setRecordingShortcutTarget] = useState<ShortcutBindingTarget | null>(null);
-  const effectiveRegistrationClientName = registrationClientName.trim() || "<唯一 client 名称>";
   const quickKeyDraftValid = quickKeyDraft.label.trim().length > 0 && quickKeyDraft.input.length > 0;
   const shortcutRows: Array<{
     target: ShortcutBindingTarget;
@@ -362,18 +340,8 @@ export function SettingsModal({
       ? "快捷键绑定"
       : view === "quick-keys"
         ? "快速按键"
-        : view === "clients"
-          ? "Client 注册"
-          : "设置";
+        : "设置";
   const selectedThemeSkin = THEME_SKINS.find((skin) => skin.id === themeSkin) ?? THEME_SKINS[0];
-  const registrationScript = [
-    `curl -fsSL ${shellSingleQuote(apiPath("/api/clients/register-script"))} -o register-client-direct.sh`,
-    "chmod +x register-client-direct.sh",
-    `WEB_TERMINAL_SERVER_URL=${shellSingleQuote(readClientAgentServerUrl())} \\`,
-    `WEB_TERMINAL_REGISTRATION_KEY=${shellSingleQuote(registrationKey ?? "<先生成 key>")} \\`,
-    `WEB_TERMINAL_CLIENT_NAME=${shellSingleQuote(effectiveRegistrationClientName)} \\`,
-    "./register-client-direct.sh"
-  ].join("\n");
 
   return (
     <div
@@ -553,16 +521,6 @@ export function SettingsModal({
               <strong>{customQuickKeys.length}</strong>
             </button>
 
-            <button
-              type="button"
-              className="settings-nav-row"
-              data-onboarding-id="settings-client-registration-nav"
-              onClick={() => setView("clients")}
-            >
-              <span>Client 注册</span>
-              <strong>Key</strong>
-            </button>
-
             {onboardingEnabled && (
               <button
                 type="button"
@@ -676,48 +634,6 @@ export function SettingsModal({
                   </article>
                 );
               })}
-            </div>
-          </section>
-        ) : view === "clients" ? (
-          <section className="settings-client-registration-page" data-onboarding-id="remote-registration-panel">
-            <div className="settings-registration-panel">
-              <p className="muted">
-                一次性注册 Key 适合在目标机器上主动运行脚本接入 remote client；不用从本机 SSH 登录目标机器。
-              </p>
-              <label className="settings-field">
-                <span>Client 唯一名称</span>
-                <input
-                  value={registrationClientName}
-                  onChange={(event) => setRegistrationClientName(event.target.value)}
-                  placeholder="例如：office-mac-mini"
-                />
-              </label>
-              <button
-                type="button"
-                disabled={registrationKeyPending || registrationClientName.trim().length === 0}
-                onClick={() => onGenerateRegistrationKey(registrationClientName.trim() || null)}
-              >
-                生成一次性注册 Key
-              </button>
-              {registrationKeyError && (
-                <p className="error settings-error" role="alert">
-                  {registrationKeyError}
-                </p>
-              )}
-              {registrationKey && (
-                <label className="settings-field">
-                  <span>一次性注册 Key</span>
-                  <textarea readOnly rows={3} value={registrationKey} />
-                </label>
-              )}
-              <label className="settings-field">
-                <span>注册脚本</span>
-                <textarea
-                  readOnly
-                  rows={7}
-                  value={registrationScript}
-                />
-              </label>
             </div>
           </section>
         ) : (

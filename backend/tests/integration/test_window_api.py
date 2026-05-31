@@ -30,6 +30,7 @@ from app.repositories.windows import create_window
 from app.routers import folders as folders_router
 from app.routers import windows as windows_router
 from app.routers.windows import get_tmux_manager
+from app.schemas import WindowCreateIn
 from app.services import polling_response_cache
 from app.services.polling_response_cache import clear_polling_response_cache
 from app.services.runtime.client_connections import ClientConnectionClosed
@@ -128,9 +129,13 @@ class CancellingTmuxManager(FakeTmuxManager):
 class FakeRemoteConnection:
     def __init__(self) -> None:
         self.requests: list[AgentMessage] = []
+        self.request_started = asyncio.Event()
+        self.request_continue = asyncio.Event()
 
     async def request(self, message: AgentMessage, *, timeout: float) -> AgentMessage:
         self.requests.append(message)
+        self.request_started.set()
+        await self.request_continue.wait()
         if message.type == "kill_window":
             return AgentMessage(
                 type="kill_window_result",
@@ -146,7 +151,6 @@ class FakeRemoteConnection:
             request_id=message.request_id,
             payload={"remote_session_id": "remote-session", "remote_window_id": "remote-window"},
         )
-
 
 class AgentConfigRemoteConnection(FakeRemoteConnection):
     async def request(self, message: AgentMessage, *, timeout: float) -> AgentMessage:
@@ -192,7 +196,23 @@ class AgentConfigRemoteConnection(FakeRemoteConnection):
                     ],
                 },
             )
-        return await super().request(message, timeout=timeout)
+        self.request_started.set()
+        await self.request_continue.wait()
+        if message.type == "kill_window":
+            return AgentMessage(
+                type="kill_window_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload={},
+            )
+        return AgentMessage(
+            type="create_window_result",
+            client_id=message.client_id,
+            window_id=message.window_id,
+            request_id=message.request_id,
+            payload={"remote_session_id": "remote-session", "remote_window_id": "remote-window"},
+        )
 
 
 class FailingRemoteConnection(FakeRemoteConnection):
@@ -202,12 +222,16 @@ class FailingRemoteConnection(FakeRemoteConnection):
 
     async def request(self, message: AgentMessage, *, timeout: float) -> AgentMessage:
         self.requests.append(message)
+        self.request_started.set()
+        await self.request_continue.wait()
         raise self.exc
 
 
 class TerminalErrorRemoteConnection(FakeRemoteConnection):
     async def request(self, message: AgentMessage, *, timeout: float) -> AgentMessage:
         self.requests.append(message)
+        self.request_started.set()
+        await self.request_continue.wait()
         return AgentMessage(
             type="terminal_error",
             client_id=message.client_id,
@@ -235,6 +259,44 @@ class FakeConnectionRegistry:
     def get(self, client_id: UUID):
         self.requested_client_ids.append(client_id)
         return self.connection
+
+
+async def allow_remote_create_to_finish(connection: FakeRemoteConnection) -> None:
+    await asyncio.wait_for(connection.request_started.wait(), timeout=1.0)
+    connection.request_continue.set()
+
+
+async def wait_for_remote_window_ready(
+    db_client: "DbClient",
+    client_id: str,
+    window_id: str,
+) -> VirtualWindow:
+    for _ in range(50):
+        async with db_client.session_factory() as session:
+            window = await session.get(VirtualWindow, UUID(window_id))
+            if (
+                window is not None
+                and window.client_id == UUID(client_id)
+                and window.remote_session_id is not None
+                and window.remote_window_id is not None
+            ):
+                return window
+        await asyncio.sleep(0.01)
+    raise AssertionError("remote window did not become ready")
+
+
+async def wait_for_remote_window_status(
+    db_client: "DbClient",
+    window_id: str,
+    status: str,
+) -> VirtualWindow:
+    for _ in range(50):
+        async with db_client.session_factory() as session:
+            window = await session.get(VirtualWindow, UUID(window_id))
+            if window is not None and window.status.value == status:
+                return window
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"remote window did not reach status {status}")
 
 
 class DbClient:
@@ -387,18 +449,26 @@ async def test_create_window_commits_client_lookup_before_tmux_create(db_client)
 
 @pytest.mark.asyncio
 async def test_create_window_rolls_back_when_tmux_create_is_cancelled(db_client):
-    client_id = await get_local_client_id(db_client)
-    app.dependency_overrides[get_tmux_manager] = CancellingTmuxManager
+    client = windows_router._RuntimeClient(UUID(await get_local_client_id(db_client)), ClientRuntime.local)
 
-    with pytest.raises(asyncio.CancelledError):
-        await db_client.post(
-            f"/api/clients/{client_id}/windows",
-            json={"cwd": "/tmp", "shell_command": "/bin/bash"},
-        )
+    async with db_client.session_factory() as session:
+        with pytest.raises(asyncio.CancelledError):
+            await windows_router._create_virtual_window_for_client(
+                client,
+                WindowCreateIn(cwd="/tmp", shell_command="/bin/bash"),
+                session,
+                CancellingTmuxManager(),
+                session_factory=db_client.session_factory,
+            )
 
     async with db_client.session_factory() as session:
         assert session.in_transaction() is False
-        windows = (await session.execute(select(VirtualWindow))).scalars().all()
+        windows = (
+            await session.execute(
+                select(VirtualWindow).where(VirtualWindow.client_id == client.id)
+            )
+        ).scalars().all()
+
 
     assert windows == []
 
@@ -489,7 +559,7 @@ async def test_create_window_persists_remote_session_and_window_ids(db_client):
 @pytest.mark.asyncio
 async def test_create_window_creates_remote_window_when_client_connection_exists(db_client):
     remote_client_id = await create_remote_client_id(db_client)
-    connection = FakeRemoteConnection()
+    connection = AgentConfigRemoteConnection()
     app.state.client_connections = FakeConnectionRegistry(connection)
 
     response = await db_client.post(
@@ -499,13 +569,17 @@ async def test_create_window_creates_remote_window_when_client_connection_exists
 
     assert response.status_code == 200
     created = response.json()
+    await allow_remote_create_to_finish(connection)
+    persisted = await wait_for_remote_window_ready(db_client, remote_client_id, created["id"])
     create_payload = connection.requests[0].payload
     create_payload.pop("agent_config_selection", None)
     assert created["client_id"] == remote_client_id
     assert created["tmux_session"] is None
     assert created["tmux_window_id"] is None
-    assert created["remote_session_id"] == "remote-session"
-    assert created["remote_window_id"] == "remote-window"
+    assert created["remote_session_id"] is None
+    assert created["remote_window_id"] is None
+    assert persisted.remote_session_id == "remote-session"
+    assert persisted.remote_window_id == "remote-window"
     assert len(connection.requests) == 1
     assert connection.requests[0].type == "create_window"
     assert connection.requests[0].client_id == UUID(remote_client_id)
@@ -513,13 +587,15 @@ async def test_create_window_creates_remote_window_when_client_connection_exists
     assert create_payload == {"cwd": "/tmp/ignored", "shell_command": "/bin/bash"}
     assert created["cwd"] == "/tmp/ignored"
     assert created["shell_command"] == "/bin/bash"
+    assert persisted.cwd == "/tmp/ignored"
+    assert persisted.shell_command == "/bin/bash"
     assert FakeTmuxManager.killed_targets == []
 
 
 @pytest.mark.asyncio
 async def test_create_agent_window_sends_remote_config_selection(db_client):
     remote_client_id = await create_remote_client_id(db_client)
-    connection = FakeRemoteConnection()
+    connection = AgentConfigRemoteConnection()
     app.state.client_connections = FakeConnectionRegistry(connection)
 
     response = await db_client.post(
@@ -544,6 +620,7 @@ async def test_create_agent_window_sends_remote_config_selection(db_client):
 
     assert response.status_code == 200
     created = response.json()
+    await allow_remote_create_to_finish(connection)
     assert created["shell_command"] == "claude"
     assert created["command_capture_supported"] is True
     assert "claude_code" in created["runtime_tags"]
@@ -560,6 +637,28 @@ async def test_create_agent_window_sends_remote_config_selection(db_client):
             ],
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_create_remote_window_returns_before_runtime_create_finishes(db_client):
+    remote_client_id = await create_remote_client_id(db_client)
+    connection = AgentConfigRemoteConnection()
+    app.state.client_connections = FakeConnectionRegistry(connection)
+
+    response = await db_client.post(
+        f"/api/clients/{remote_client_id}/windows",
+        json={"cwd": "/tmp/slow", "shell_command": "/bin/bash"},
+    )
+
+    assert response.status_code == 200
+    created = response.json()
+    assert created["remote_session_id"] is None
+    assert created["remote_window_id"] is None
+
+    await allow_remote_create_to_finish(connection)
+    persisted = await wait_for_remote_window_ready(db_client, remote_client_id, created["id"])
+    assert persisted.remote_session_id == "remote-session"
+    assert persisted.remote_window_id == "remote-window"
 
 
 @pytest.mark.asyncio
@@ -580,6 +679,8 @@ async def test_create_window_commits_client_lookup_before_remote_create(db_clien
             delattr(windows_router, "_TEST_OBSERVED_SESSION")
 
     assert response.status_code == 200
+    await allow_remote_create_to_finish(connection)
+    await wait_for_remote_window_ready(db_client, remote_client_id, response.json()["id"])
     assert ObservingRemoteConnection.observed_in_transaction is False
 
 
@@ -607,42 +708,46 @@ async def test_create_window_returns_503_for_remote_client_until_runtime_exists(
     "remote_exc",
     [ClientConnectionClosed("client disconnected"), asyncio.TimeoutError()],
 )
-async def test_create_window_returns_503_when_remote_create_request_becomes_unavailable(
+async def test_create_window_marks_remote_window_disconnected_when_runtime_create_becomes_unavailable(
     db_client, remote_exc
 ):
     remote_client_id = await create_remote_client_id(db_client)
-    app.state.client_connections = FakeConnectionRegistry(FailingRemoteConnection(remote_exc))
+    connection = FailingRemoteConnection(remote_exc)
+    connection.request_continue.set()
+    app.state.client_connections = FakeConnectionRegistry(connection)
 
     response = await db_client.post(
         f"/api/clients/{remote_client_id}/windows",
         json={"cwd": "/tmp", "shell_command": "/bin/bash"},
     )
 
-    assert response.status_code == 503
-    assert response.json() == {"detail": "remote runtime unavailable"}
+    assert response.status_code == 200
+    created = response.json()
     assert FakeTmuxManager.killed_targets == []
 
-    async with db_client.session_factory() as session:
-        windows = (await session.execute(select(VirtualWindow))).scalars().all()
-    assert windows == []
+    persisted = await wait_for_remote_window_status(db_client, created["id"], "DISCONNECTED")
+    assert persisted.remote_session_id is None
+    assert persisted.remote_window_id is None
 
 
 @pytest.mark.asyncio
-async def test_create_window_returns_502_when_remote_runtime_reports_terminal_error(db_client):
+async def test_create_window_marks_remote_window_error_when_runtime_reports_terminal_error(db_client):
     remote_client_id = await create_remote_client_id(db_client)
-    app.state.client_connections = FakeConnectionRegistry(TerminalErrorRemoteConnection())
+    connection = TerminalErrorRemoteConnection()
+    connection.request_continue.set()
+    app.state.client_connections = FakeConnectionRegistry(connection)
 
     response = await db_client.post(
         f"/api/clients/{remote_client_id}/windows",
         json={"cwd": "/tmp", "shell_command": "/bin/bash"},
     )
 
-    assert response.status_code == 502
-    assert response.json() == {"detail": "tmux command failed"}
+    assert response.status_code == 200
+    created = response.json()
 
-    async with db_client.session_factory() as session:
-        windows = (await session.execute(select(VirtualWindow))).scalars().all()
-    assert windows == []
+    persisted = await wait_for_remote_window_status(db_client, created["id"], "ERROR")
+    assert persisted.remote_session_id is None
+    assert persisted.remote_window_id is None
 
 
 @pytest.mark.asyncio
@@ -1005,6 +1110,8 @@ async def test_delete_remote_window_requests_kill_when_client_is_online(db_clien
         json={"cwd": "/tmp", "shell_command": "/bin/bash"},
     )
     window_id = create_response.json()["id"]
+    await allow_remote_create_to_finish(connection)
+    await wait_for_remote_window_ready(db_client, remote_client_id, window_id)
 
     delete_response = await db_client.delete(f"/api/clients/{remote_client_id}/windows/{window_id}")
 
@@ -1261,6 +1368,8 @@ async def test_remote_window_agent_config_uses_client_agent_request(db_client):
     )
     assert create_response.status_code == 200
     window_id = create_response.json()["id"]
+    await allow_remote_create_to_finish(connection)
+    await wait_for_remote_window_ready(db_client, remote_client_id, window_id)
 
     get_response = await db_client.get(
         f"/api/clients/{remote_client_id}/windows/{window_id}/agent-config"

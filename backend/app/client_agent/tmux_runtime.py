@@ -4,8 +4,10 @@ import asyncio
 import contextlib
 import os
 import re
+import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from uuid import UUID
 
 from app.client_agent.agent_commands import agent_command_for_interactive_shell
@@ -35,14 +37,17 @@ class ClientTmuxRuntime:
         server_url: str,
         pool_session: str,
         default_shell: str | None = None,
+        launcher_dir: Path | None = None,
         runner: Runner | None = None,
     ) -> None:
         self.client_id = str(client_id)
         self.server_url = server_url
         self.pool_session = pool_session
         self.default_shell = default_shell or default_user_shell()
+        self.launcher_dir = launcher_dir or Path.home() / ".web-terminal-acp" / "launchers"
         self._runner = runner
         self._clipboard_configured = False
+        self._pool_lock = asyncio.Lock()
         self._clipboard_lock = asyncio.Lock()
 
     async def _run(self, args: list[str]) -> str:
@@ -61,12 +66,16 @@ class ClientTmuxRuntime:
         return stdout.decode(errors="replace")
 
     async def ensure_pool(self) -> None:
-        try:
-            await self._run(["tmux", "has-session", "-t", self.pool_session])
-        except RuntimeError:
-            await self._run(["tmux", "new-session", "-d", "-s", self.pool_session, self.default_shell])
-        await self._ensure_terminal_session_options(self.pool_session)
-        await self._ensure_clipboard_support()
+        async with self._pool_lock:
+            try:
+                await self._run(["tmux", "has-session", "-t", self.pool_session])
+            except RuntimeError:
+                try:
+                    await self._run(["tmux", "new-session", "-d", "-s", self.pool_session, self.default_shell])
+                except RuntimeError:
+                    await self._run(["tmux", "has-session", "-t", self.pool_session])
+            await self._ensure_terminal_session_options(self.pool_session)
+            await self._ensure_clipboard_support()
 
     async def _ensure_terminal_session_options(self, session_name: str) -> None:
         with contextlib.suppress(RuntimeError):
@@ -112,6 +121,44 @@ class ClientTmuxRuntime:
             project_path=project_path,
         ).command
 
+    def managed_shell_launcher_command(
+        self,
+        window_id: UUID | str,
+        shell_command: str | None = None,
+        project_path: str | None = None,
+    ) -> str:
+        launcher_path = self._write_managed_shell_launcher(
+            window_id,
+            shell_command=shell_command,
+            project_path=project_path,
+        )
+        return f"exec {shlex.quote(str(launcher_path))}"
+
+    def _write_managed_shell_launcher(
+        self,
+        window_id: UUID | str,
+        *,
+        shell_command: str | None = None,
+        project_path: str | None = None,
+    ) -> Path:
+        local_window_id = UUID(str(window_id))
+        self.launcher_dir.mkdir(parents=True, exist_ok=True)
+        launcher_path = self.launcher_dir / f"{local_window_id}.sh"
+        temp_path = self.launcher_dir / f".{local_window_id}.sh.tmp"
+        managed_command = self.managed_shell_command(
+            local_window_id,
+            shell_command=shell_command,
+            project_path=project_path,
+        )
+        temp_path.write_text(f"#!/bin/sh\n{managed_command}\n", encoding="utf-8")
+        temp_path.chmod(0o700)
+        temp_path.replace(launcher_path)
+        return launcher_path
+
+    def _remove_managed_shell_launcher(self, window_id: UUID | str) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            (self.launcher_dir / f"{UUID(str(window_id))}.sh").unlink()
+
     async def create_window(
         self,
         window_id: UUID | str,
@@ -128,6 +175,11 @@ class ClientTmuxRuntime:
         )
         window_shell = self.default_shell if interactive_agent_command is not None else effective_shell
         await self.ensure_pool()
+        launcher_command = self.managed_shell_launcher_command(
+            local_window_id,
+            window_shell,
+            project_path=effective_cwd,
+        )
         remote_window_id = (
             await self._run(
                 [
@@ -140,11 +192,7 @@ class ClientTmuxRuntime:
                     self.pool_session,
                     "-c",
                     effective_cwd,
-                    self.managed_shell_command(
-                        local_window_id,
-                        window_shell,
-                        project_path=effective_cwd,
-                    ),
+                    launcher_command,
                 ]
             )
         ).strip()
@@ -155,6 +203,11 @@ class ClientTmuxRuntime:
             if not _is_missing_tmux_window_error(exc, remote_window_id):
                 raise
             interactive_agent_command = None
+            launcher_command = self.managed_shell_launcher_command(
+                local_window_id,
+                self.default_shell,
+                project_path=effective_cwd,
+            )
             remote_window_id = (
                 await self._run(
                     [
@@ -167,11 +220,7 @@ class ClientTmuxRuntime:
                         self.pool_session,
                         "-c",
                         effective_cwd,
-                        self.managed_shell_command(
-                            local_window_id,
-                            self.default_shell,
-                            project_path=effective_cwd,
-                        ),
+                        launcher_command,
                     ]
                 )
             ).strip()
@@ -270,6 +319,7 @@ class ClientTmuxRuntime:
                     f"{runtime_window.remote_session_id}:{runtime_window.remote_window_id}",
                 ]
             )
+            self._remove_managed_shell_launcher(local_window_id)
             return
 
     async def list_windows(self) -> list[ClientRuntimeWindow]:

@@ -249,6 +249,7 @@
 .theme-skin-linear .terminal-tab,
 .theme-skin-linear .client-card,
 .theme-skin-linear .settings-modal,
+.theme-skin-linear .add-client-modal,
 .theme-skin-linear .terminal-controls-menu,
 .theme-skin-linear .notification-center,
 .theme-skin-linear .terminal-create-modal,
@@ -258,6 +259,7 @@
 .theme-skin-notion .terminal-tab,
 .theme-skin-notion .client-card,
 .theme-skin-notion .settings-modal,
+.theme-skin-notion .add-client-modal,
 .theme-skin-notion .terminal-controls-menu,
 .theme-skin-notion .notification-center,
 .theme-skin-notion .terminal-create-modal,
@@ -267,6 +269,7 @@
 .theme-skin-vercel .terminal-tab,
 .theme-skin-vercel .client-card,
 .theme-skin-vercel .settings-modal,
+.theme-skin-vercel .add-client-modal,
 .theme-skin-vercel .terminal-controls-menu,
 .theme-skin-vercel .notification-center,
 .theme-skin-vercel .terminal-create-modal,
@@ -276,6 +279,7 @@
 .theme-skin-stripe .terminal-tab,
 .theme-skin-stripe .client-card,
 .theme-skin-stripe .settings-modal,
+.theme-skin-stripe .add-client-modal,
 .theme-skin-stripe .terminal-controls-menu,
 .theme-skin-stripe .notification-center,
 .theme-skin-stripe .terminal-create-modal,
@@ -285,6 +289,7 @@
 .theme-skin-raycast .terminal-tab,
 .theme-skin-raycast .client-card,
 .theme-skin-raycast .settings-modal,
+.theme-skin-raycast .add-client-modal,
 .theme-skin-raycast .terminal-controls-menu,
 .theme-skin-raycast .notification-center,
 .theme-skin-raycast .terminal-create-modal,
@@ -379,22 +384,27 @@
 }
 
 .theme-skin-linear .settings-modal-backdrop,
+.theme-skin-linear .add-client-modal-backdrop,
 .theme-skin-linear .terminal-create-modal-backdrop,
 .theme-skin-linear .notification-center-backdrop,
 .theme-skin-linear .agent-record-modal-backdrop,
 .theme-skin-notion .settings-modal-backdrop,
+.theme-skin-notion .add-client-modal-backdrop,
 .theme-skin-notion .terminal-create-modal-backdrop,
 .theme-skin-notion .notification-center-backdrop,
 .theme-skin-notion .agent-record-modal-backdrop,
 .theme-skin-vercel .settings-modal-backdrop,
+.theme-skin-vercel .add-client-modal-backdrop,
 .theme-skin-vercel .terminal-create-modal-backdrop,
 .theme-skin-vercel .notification-center-backdrop,
 .theme-skin-vercel .agent-record-modal-backdrop,
 .theme-skin-stripe .settings-modal-backdrop,
+.theme-skin-stripe .add-client-modal-backdrop,
 .theme-skin-stripe .terminal-create-modal-backdrop,
 .theme-skin-stripe .notification-center-backdrop,
 .theme-skin-stripe .agent-record-modal-backdrop,
 .theme-skin-raycast .settings-modal-backdrop,
+.theme-skin-raycast .add-client-modal-backdrop,
 .theme-skin-raycast .terminal-create-modal-backdrop,
 .theme-skin-raycast .notification-center-backdrop,
 .theme-skin-raycast .agent-record-modal-backdrop {
@@ -1124,7 +1134,8 @@ h2 {
 }
 
 .bootstrap-form,
-.bootstrap-form-actions {
+.bootstrap-form-actions,
+.client-registration-key-form {
   display: grid;
   gap: 8px;
 }
@@ -1138,21 +1149,26 @@ h2 {
 }
 
 .bootstrap-form {
-  margin-bottom: 18px;
   border: 1px solid #334155;
-  border-radius: 12px;
+  border-radius: 8px;
   background: #0f172a;
   padding: 12px;
 }
 
-.bootstrap-form label {
+.bootstrap-form h3,
+.client-registration-key-form h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.bootstrap-form label,
+.client-registration-key-form label {
   color: #cbd5e1;
   font-size: 13px;
   font-weight: 600;
 }
 
 .bootstrap-form-actions {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-top: 4px;
 }
 
@@ -3417,6 +3433,17 @@ html.electron-app .terminal-immersive .workspace {
   background: rgba(2, 6, 23, 0.72);
 }
 
+.add-client-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 65;
+  display: grid;
+  align-items: start;
+  justify-items: center;
+  padding: 8vh 16px 16px;
+  background: rgba(2, 6, 23, 0.72);
+}
+
 .login-shell {
   min-height: 100dvh;
   display: grid;
@@ -3452,6 +3479,19 @@ html.electron-app .terminal-immersive .workspace {
   background: #0f172a;
 }
 
+.add-client-modal {
+  width: min(760px, 100%);
+  max-height: min(84dvh, 820px);
+  display: grid;
+  gap: 14px;
+  overflow-y: auto;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #0f172a;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 45%);
+  padding: 16px;
+}
+
 .settings-modal-wide {
   width: min(820px, 100%);
 }
@@ -3461,6 +3501,42 @@ html.electron-app .terminal-immersive .workspace {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.add-client-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.add-client-modal-header h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+}
+
+.add-client-modal-header p {
+  margin: 0;
+  font-size: 12px;
+}
+
+.add-client-mode-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.add-client-mode-tabs button {
+  min-height: 36px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.add-client-mode-tabs button.active {
+  border-color: #38bdf8;
+  background: #082f49;
+  color: #e2e8f0;
 }
 
 .settings-modal-title {
@@ -3511,11 +3587,6 @@ html.electron-app .terminal-immersive .workspace {
 }
 
 .settings-theme-page {
-  display: grid;
-  gap: 14px;
-}
-
-.settings-client-registration-page {
   display: grid;
   gap: 14px;
 }
@@ -3795,6 +3866,48 @@ html.electron-app .terminal-immersive .workspace {
   margin-top: 0;
   border-top: 0;
   padding-top: 0;
+}
+
+.terminal-create-progress {
+  position: absolute;
+  top: 64px;
+  right: 16px;
+  z-index: 18;
+  display: inline-flex;
+  max-width: min(360px, calc(100% - 32px));
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #0f172a;
+  box-shadow: 0 14px 40px rgb(0 0 0 / 35%);
+  color: #e2e8f0;
+  padding: 9px 12px;
+  font-size: 13px;
+}
+
+.terminal-create-progress span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-create-progress-spinner {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border: 2px solid #475569;
+  border-top-color: #38bdf8;
+  border-radius: 50%;
+  animation: terminal-create-progress-spin 0.8s linear infinite;
+}
+
+@keyframes terminal-create-progress-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .terminal-create-actions {
@@ -4482,6 +4595,13 @@ html.electron-app .terminal-immersive .workspace {
     padding: 7px 8px;
   }
 
+  .terminal-create-progress {
+    top: 52px;
+    right: 8px;
+    left: 8px;
+    max-width: none;
+  }
+
   .terminal-controls-menu {
     width: min(320px, calc(100vw - 12px));
   }
@@ -4530,18 +4650,21 @@ html.electron-app .terminal-immersive .workspace {
     max-height: min(34dvh, 220px);
   }
 
-  .settings-modal-backdrop {
+  .settings-modal-backdrop,
+  .add-client-modal-backdrop {
     padding: 10px;
   }
 
   .settings-modal,
-  .settings-modal-wide {
+  .settings-modal-wide,
+  .add-client-modal {
     width: 100%;
     max-height: calc(100dvh - 20px);
     padding: 14px;
   }
 
   .settings-modal-header,
+  .add-client-modal-header,
   .settings-modal-title {
     align-items: stretch;
   }
@@ -4550,6 +4673,7 @@ html.electron-app .terminal-immersive .workspace {
   .quick-key-settings-item,
   .shortcut-binding-item,
   .settings-agent-command-grid,
+  .add-client-mode-tabs,
   .terminal-create-agent-tabs,
   .project-terminal-picker-agent-tabs {
     grid-template-columns: minmax(0, 1fr);

@@ -188,6 +188,73 @@ async def test_create_window_registers_existing_unified_agent_tool_watcher() -> 
 
 
 @pytest.mark.asyncio
+async def test_create_window_can_run_in_background_without_blocking_control_messages() -> None:
+    create_started = asyncio.Event()
+    create_continue = asyncio.Event()
+    calls: list[str] = []
+    writer = FakeWriter()
+    runtime = BlockingCreateRuntime(calls, create_started, create_continue)
+
+    await _handle_agent_message(
+        writer,
+        FakeBulkWriter(),
+        object(),
+        runtime,
+        FakeTerminal(calls),
+        FakeIdleSupervisor(calls),
+        FakeAgentToolWatcher(calls),
+        {},
+        set(),
+        asyncio.Semaphore(1),
+        {},
+        AgentMessage(
+            type="create_window",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            request_id="create-1",
+            payload={"cwd": "/workspace/project"},
+        ),
+        create_window_tasks=set(),
+    )
+    await asyncio.wait_for(create_started.wait(), timeout=1.0)
+
+    await _handle_agent_message(
+        writer,
+        FakeBulkWriter(),
+        object(),
+        runtime,
+        FakeTerminal(calls),
+        FakeIdleSupervisor(calls),
+        FakeAgentToolWatcher(calls),
+        {},
+        set(),
+        asyncio.Semaphore(1),
+        {},
+        AgentMessage(
+            type="agent_config_get",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            request_id="config-1",
+            payload={"agent": "codex"},
+        ),
+        create_window_tasks=set(),
+    )
+
+    assert writer.messages[-1].type == "agent_config_result"
+    assert calls == ["create_window"]
+
+    create_continue.set()
+    for _ in range(20):
+        if any(message.type == "create_window_result" for message in writer.messages):
+            break
+        await asyncio.sleep(0.01)
+    assert [message.type for message in writer.messages] == [
+        "agent_config_result",
+        "create_window_result",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_create_window_applies_agent_config_selection(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     applied: list[tuple[str, str]] = []
@@ -308,8 +375,47 @@ async def test_terminal_attach_recreates_missing_tmux_window_before_resume() -> 
         "resume_window",
     ]
     assert calls[5] == "attach_with_selection"
-    assert supervisor.resume_calls == [(WINDOW_ID, True)]
+    assert supervisor.resume_calls == [(WINDOW_ID, False)]
     assert writer.messages[-1].payload["remote_window_id"] == "@9"
+
+
+@pytest.mark.asyncio
+async def test_terminal_attach_recreates_with_default_shell_when_resume_is_available() -> None:
+    calls: list[str] = []
+    terminal = FakeTerminal(calls)
+    supervisor = FakeIdleSupervisor(calls)
+    supervisor.resumable_session = True
+    writer = FakeWriter()
+    runtime = FakeRuntime(window_exists=False)
+
+    await handle_message_for_test(
+        writer,
+        FakeBulkWriter(),
+        object(),
+        runtime,
+        terminal,
+        supervisor,
+        FakeAgentToolWatcher(calls),
+        {},
+        {},
+        AgentMessage(
+            type="terminal_attach",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            request_id="request-1",
+            payload={
+                "remote_session_id": "pool",
+                "remote_window_id": "@7",
+                "view_id": str(VIEW_ID),
+                "cwd": "/workspace/project",
+                "shell_command": "codex",
+            },
+        ),
+    )
+
+    assert runtime.recreate_shell_commands == [None]
+    assert supervisor.resume_calls == [(WINDOW_ID, True)]
+    assert writer.messages[-1].payload["shell_command"] == "codex"
 
 
 @pytest.mark.asyncio
@@ -354,8 +460,47 @@ async def test_terminal_select_window_recreates_missing_tmux_window_before_lates
         "resume_window",
         "select_window",
     ]
-    assert supervisor.resume_calls == [(WINDOW_ID, True)]
+    assert supervisor.resume_calls == [(WINDOW_ID, False)]
     assert writer.messages[-1].payload["remote_window_id"] == "@9"
+
+
+@pytest.mark.asyncio
+async def test_terminal_select_window_recreates_with_default_shell_when_resume_is_available() -> None:
+    calls: list[str] = []
+    terminal = FakeTerminal(calls)
+    supervisor = FakeIdleSupervisor(calls)
+    supervisor.resumable_session = True
+    writer = FakeWriter()
+    runtime = FakeRuntime(window_exists=False)
+
+    await handle_message_for_test(
+        writer,
+        FakeBulkWriter(),
+        object(),
+        runtime,
+        terminal,
+        supervisor,
+        FakeAgentToolWatcher(calls),
+        {},
+        {},
+        AgentMessage(
+            type="terminal_select_window",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            request_id="request-1",
+            payload={
+                "remote_session_id": "pool",
+                "remote_window_id": "@7",
+                "view_id": str(VIEW_ID),
+                "cwd": "/workspace/project",
+                "shell_command": "codex",
+            },
+        ),
+    )
+
+    assert runtime.recreate_shell_commands == [None]
+    assert supervisor.resume_calls == [(WINDOW_ID, True)]
+    assert writer.messages[-1].payload["shell_command"] == "codex"
 
 
 @pytest.mark.asyncio
@@ -427,6 +572,7 @@ class FakeRuntime:
         self.calls = calls
         self.window_exists = window_exists
         self.recreated: list[UUID] = []
+        self.recreate_shell_commands: list[str | None] = []
 
     async def create_window(self, window_id, *, cwd=None, shell_command=None):
         if self.calls is not None:
@@ -454,12 +600,38 @@ class FakeRuntime:
         shell_command: str | None = None,
     ) -> ClientRuntimeWindow:
         self.recreated.append(window_id)
+        self.recreate_shell_commands.append(shell_command)
         return ClientRuntimeWindow(
             remote_session_id="pool",
             remote_window_id="@9",
             local_window_id=window_id,
             cwd=cwd,
             shell_command=shell_command,
+            managed_agent_tools=True,
+        )
+
+
+class BlockingCreateRuntime(FakeRuntime):
+    def __init__(
+        self,
+        calls: list[str],
+        started: asyncio.Event,
+        should_continue: asyncio.Event,
+    ) -> None:
+        super().__init__(calls)
+        self.started = started
+        self.should_continue = should_continue
+
+    async def create_window(self, window_id, *, cwd=None, shell_command=None):
+        if self.calls is not None:
+            self.calls.append("create_window")
+        self.started.set()
+        await self.should_continue.wait()
+        return ClientRuntimeWindow(
+            remote_session_id="pool",
+            remote_window_id="@9",
+            local_window_id=window_id,
+            cwd=cwd,
             managed_agent_tools=True,
         )
 
@@ -488,6 +660,7 @@ class FakeIdleSupervisor:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
         self.resume_calls: list[tuple[UUID, bool]] = []
+        self.resumable_session = False
 
     def attach_view(self, view_id: UUID, window_id: UUID) -> None:
         self.calls.append("attach_view")
@@ -500,6 +673,9 @@ class FakeIdleSupervisor:
 
     def register_window(self, window_id: UUID, project_path: str | None) -> None:
         self.calls.append("register_window_supervisor")
+
+    def has_resumable_session(self, window_id: UUID, *, project_path: str | None = None) -> bool:
+        return self.resumable_session
 
     async def resume_window(self, window_id: UUID, *, allow_latest_session: bool = False) -> None:
         self.calls.append("resume_window")

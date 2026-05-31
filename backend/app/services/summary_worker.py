@@ -8,10 +8,11 @@ from typing import Any
 from uuid import UUID
 
 from elasticsearch import AsyncElasticsearch
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Folder, VirtualWindow
+from app.models import Folder, SummaryJob, SummaryJobStatus, VirtualWindow
 from app.repositories.folder_split_jobs import enqueue_folder_split_job
 from app.repositories.folders import (
     count_direct_windows_in_folder,
@@ -49,15 +50,29 @@ async def process_summary_jobs_once(
     es_client: AsyncElasticsearch | None = None,
     ui_event_hub: UiEventHub | None = None,
 ) -> bool:
+    claimed_job_id = await _claim_next_summary_job_id(session_factory)
+    if claimed_job_id is None:
+        return False
+
     async with session_factory() as session:
         try:
-            processed = await process_next_summary_job(session, summarizer, es_client)
+            processed = await process_claimed_summary_job(
+                session,
+                claimed_job_id,
+                summarizer,
+                es_client,
+            )
             await session.commit()
             if ui_event_hub is not None:
                 await _publish_queued_ui_invalidations(session, ui_event_hub)
             return processed
         except Exception:
             await session.rollback()
+            await _mark_claimed_summary_job_retryable(
+                session_factory,
+                claimed_job_id,
+                "summary processing transaction failed",
+            )
             raise
 
 
@@ -85,6 +100,37 @@ async def run_summary_job_worker_loop(
             await asyncio.sleep(interval_seconds)
 
 
+async def _claim_next_summary_job_id(session_factory: SessionFactory) -> UUID | None:
+    async with session_factory() as session:
+        try:
+            job = await claim_next_summary_job(session)
+            if job is None:
+                await session.commit()
+                return None
+            job_id = job.id
+            await session.commit()
+            return job_id
+        except Exception:
+            await session.rollback()
+            raise
+
+
+async def _mark_claimed_summary_job_retryable(
+    session_factory: SessionFactory,
+    job_id: UUID,
+    error: BaseException | str,
+) -> None:
+    async with session_factory() as session:
+        try:
+            job = await session.get(SummaryJob, job_id)
+            if job is not None and job.status == SummaryJobStatus.running:
+                await mark_summary_job_retryable(session, job, error)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logger.exception("failed to release claimed summary job", extra={"summary_job_id": str(job_id)})
+
+
 async def process_next_summary_job(
     session: AsyncSession,
     summarizer: Any | None = None,
@@ -94,6 +140,28 @@ async def process_next_summary_job(
     if job is None:
         return False
 
+    return await _process_summary_job(session, job, summarizer, es_client)
+
+
+async def process_claimed_summary_job(
+    session: AsyncSession,
+    job_id: UUID,
+    summarizer: Any | None = None,
+    es_client: AsyncElasticsearch | None = None,
+) -> bool:
+    job = await session.scalar(select(SummaryJob).where(SummaryJob.id == job_id))
+    if job is None:
+        return False
+
+    return await _process_summary_job(session, job, summarizer, es_client)
+
+
+async def _process_summary_job(
+    session: AsyncSession,
+    job: SummaryJob,
+    summarizer: Any | None = None,
+    es_client: AsyncElasticsearch | None = None,
+) -> bool:
     window = await _get_window(session, job.virtual_window_id)
     if window is None:
         await mark_summary_job_failed(session, job, "window not found")

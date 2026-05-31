@@ -653,8 +653,20 @@ def test_collect_cursor_watch_events_discovers_store_created_after_initial_scan(
         project_path="/workspace/project",
     )
 
-    assert [event.payload["blob_id"] for event in events] == ["user-blob", "assistant-blob"]
+    assert events == []
     assert state.cursor_store_paths == [store]
+    assert state.cursor_last_rowids[store] == 3
+
+    append_cursor_blob(store, "new-assistant-blob", "assistant", "new cursor")
+    events = collect_cursor_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+
+    assert [event.payload["blob_id"] for event in events] == ["new-assistant-blob"]
+    assert events[0].payload["text"] == "new cursor"
 
 
 @pytest.mark.asyncio
@@ -980,7 +992,7 @@ def test_collect_cursor_watch_events_finds_managed_cursor_data_dir_store(
     assert state.cursor_store_paths == [store]
 
 
-def test_cursor_store_paths_for_window_follows_linked_chats_directory(
+def test_cursor_store_paths_for_window_ignores_linked_chats_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -994,7 +1006,7 @@ def test_cursor_store_paths_for_window_follows_linked_chats_directory(
     managed_chats.symlink_to(source_chats)
     monkeypatch.setattr(Path, "home", lambda: home)
 
-    assert watchers.cursor_store_paths_for_window(WINDOW_ID) == [managed_chats / "workspace-hash" / "session-id" / "store.db"]
+    assert watchers.cursor_store_paths_for_window(WINDOW_ID) == []
 
 
 def test_collect_cursor_watch_events_discovers_additional_store_after_first_store(
@@ -1025,8 +1037,19 @@ def test_collect_cursor_watch_events_discovers_additional_store_after_first_stor
     )
 
     assert [event.source_path for event in first] == [str(first_store), str(first_store)]
-    assert [event.source_path for event in second] == [str(second_store), str(second_store)]
+    assert second == []
     assert state.cursor_store_paths == [first_store, second_store]
+
+    append_cursor_blob(second_store, "new-assistant-blob", "assistant", "new cursor")
+    third = collect_cursor_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+
+    assert [event.source_path for event in third] == [str(second_store)]
+    assert [event.payload["blob_id"] for event in third] == ["new-assistant-blob"]
 
 
 @pytest.mark.asyncio

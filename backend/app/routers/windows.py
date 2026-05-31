@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import posixpath
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Literal
@@ -11,7 +12,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import case, desc, func, or_, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.agent_tools import agent_activity_source_types, get_agent_tool_registry
@@ -28,6 +29,7 @@ from app.models import (
     SummaryJob,
     TerminalRecentUsage,
     VirtualWindow,
+    WindowStatus,
 )
 from app.repositories.clients import ensure_local_client, get_client
 from app.repositories.summary_jobs import (
@@ -75,6 +77,7 @@ from app.services.polling_response_cache import (
     CachedJsonResponse,
     begin_response_cache_refresh,
     cached_or_stale_json_response,
+    invalidate_polling_response_cache,
     finish_response_cache_refresh,
     response_cache_scope,
     store_json_response,
@@ -92,6 +95,7 @@ from app.services.window_runtime_tags import agent_from_command, runtime_tags_fo
 
 router = APIRouter(prefix="/api", tags=["windows"])
 logger = logging.getLogger(__name__)
+REMOTE_CREATE_WINDOW_TIMEOUT_SECONDS = 60.0
 
 AgentRecordLimit = Annotated[int, Query(ge=1, le=200)]
 AgentRecordOffset = Annotated[int, Query(ge=0)]
@@ -643,15 +647,39 @@ def _client_connection_registry(request: Request) -> ClientConnectionRegistry:
     return registry
 
 
+def _background_session_factory_for(session: AsyncSession) -> Callable[[], object]:
+    bind = getattr(session, "bind", None)
+    if bind is None:
+        return SessionLocal
+    return async_sessionmaker(bind, expire_on_commit=False, class_=AsyncSession)
+
+
 async def _create_remote_virtual_window_for_client(
     client: _RuntimeClient,
     payload: WindowCreateIn,
     session: AsyncSession,
     registry: ClientConnectionRegistry,
+    *,
+    session_factory: Callable[[], object] = SessionLocal,
+    ui_event_hub=None,
 ) -> WindowOut:
     client_id = client.id
     effective_shell = _agent_command_for_launch(payload)
     agent_config_selection = _agent_config_for_launch(payload)
+    connection = registry.get(client_id)
+    if connection is None or getattr(connection, "closed", False):
+        logger.warning(
+            "remote runtime unavailable during window create",
+            extra={
+                "client_id": str(client_id),
+                "reason": "no_connection" if connection is None else "connection_closed",
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="remote runtime unavailable",
+        )
+
     try:
         window = await create_window(
             session,
@@ -659,48 +687,9 @@ async def _create_remote_virtual_window_for_client(
             cwd=payload.cwd,
             shell_command=effective_shell,
         )
-        remote_runtime = RemoteRuntime(client_id=client_id, registry=registry)
-        runtime_window = await remote_runtime.create_window(
-            cwd=payload.cwd,
-            shell_command=effective_shell,
-            window_id=window.id,
-            agent_config_selection=agent_config_selection.model_dump(mode="json") if agent_config_selection else None,
-        )
-        window.remote_session_id = runtime_window.session_id
-        window.remote_window_id = runtime_window.window_id
-        window.cwd = runtime_window.cwd
-        window.shell_command = runtime_window.shell_command
         await _assign_window_folder_path(session, client_id, window, payload.folder_path)
         await session.commit()
         await session.refresh(window)
-    except RemoteClientUnavailable as exc:
-        with contextlib.suppress(Exception):
-            await session.rollback()
-        logger.warning(
-            "remote runtime unavailable during window create",
-            extra={
-                "client_id": str(client_id),
-                "reason": getattr(exc, "reason", "unknown"),
-            },
-        )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="remote runtime unavailable",
-        ) from exc
-    except RemoteTerminalError as exc:
-        with contextlib.suppress(Exception):
-            await session.rollback()
-        logger.warning(
-            "remote runtime failed during window create",
-            extra={
-                "client_id": str(client_id),
-                "error": str(exc),
-            },
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(exc),
-        ) from exc
     except asyncio.CancelledError:
         with contextlib.suppress(Exception):
             await session.rollback()
@@ -709,6 +698,18 @@ async def _create_remote_virtual_window_for_client(
         with contextlib.suppress(Exception):
             await session.rollback()
         raise
+    _schedule_remote_window_runtime_start(
+        client_id=client_id,
+        window_id=window.id,
+        cwd=payload.cwd,
+        shell_command=effective_shell,
+        agent_config_selection=(
+            agent_config_selection.model_dump(mode="json") if agent_config_selection else None
+        ),
+        registry=registry,
+        session_factory=session_factory,
+        ui_event_hub=ui_event_hub,
+    )
     return to_window_out(
         window,
         runtime_tags=runtime_tags_for_window(
@@ -724,6 +725,9 @@ async def _create_virtual_window_for_client(
     session: AsyncSession,
     tmux_manager: TmuxManager,
     registry: ClientConnectionRegistry | None = None,
+    *,
+    session_factory: Callable[[], object] = SessionLocal,
+    ui_event_hub=None,
 ) -> WindowOut:
     if client.runtime is not ClientRuntime.local:
         if registry is None:
@@ -731,7 +735,14 @@ async def _create_virtual_window_for_client(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="remote runtime unavailable",
             )
-        return await _create_remote_virtual_window_for_client(client, payload, session, registry)
+        return await _create_remote_virtual_window_for_client(
+            client,
+            payload,
+            session,
+            registry,
+            session_factory=session_factory,
+            ui_event_hub=ui_event_hub,
+        )
 
     tmux_target = None
     window_id = uuid4()
@@ -796,6 +807,191 @@ async def _create_virtual_window_for_client(
     )
 
 
+def _schedule_remote_window_runtime_start(
+    *,
+    client_id: UUID,
+    window_id: UUID,
+    cwd: str | None,
+    shell_command: str | None,
+    agent_config_selection: dict[str, object] | None,
+    registry: ClientConnectionRegistry,
+    session_factory: Callable[[], object],
+    ui_event_hub,
+) -> None:
+    task = asyncio.create_task(
+        _start_remote_window_runtime(
+            client_id=client_id,
+            window_id=window_id,
+            cwd=cwd,
+            shell_command=shell_command,
+            agent_config_selection=agent_config_selection,
+            registry=registry,
+            session_factory=session_factory,
+            ui_event_hub=ui_event_hub,
+        )
+    )
+    task.add_done_callback(_log_remote_window_runtime_start_failure)
+
+
+def _log_remote_window_runtime_start_failure(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "remote window runtime start task crashed",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+
+async def _start_remote_window_runtime(
+    *,
+    client_id: UUID,
+    window_id: UUID,
+    cwd: str | None,
+    shell_command: str | None,
+    agent_config_selection: dict[str, object] | None,
+    registry: ClientConnectionRegistry,
+    session_factory: Callable[[], object],
+    ui_event_hub,
+) -> None:
+    remote_runtime = RemoteRuntime(
+        client_id=client_id,
+        registry=registry,
+        request_timeout=REMOTE_CREATE_WINDOW_TIMEOUT_SECONDS,
+    )
+    try:
+        runtime_window = await remote_runtime.create_window(
+            cwd=cwd,
+            shell_command=shell_command,
+            window_id=window_id,
+            agent_config_selection=agent_config_selection,
+        )
+    except RemoteClientUnavailable as exc:
+        logger.warning(
+            "remote runtime unavailable during async window start",
+            extra={
+                "client_id": str(client_id),
+                "window_id": str(window_id),
+                "reason": getattr(exc, "reason", "unknown"),
+            },
+        )
+        await _update_remote_window_status(
+            session_factory,
+            client_id,
+            window_id,
+            WindowStatus.disconnected,
+            ui_event_hub=ui_event_hub,
+            reason="window_runtime_unavailable",
+        )
+        return
+    except RemoteTerminalError as exc:
+        logger.warning(
+            "remote runtime failed during async window start",
+            extra={
+                "client_id": str(client_id),
+                "window_id": str(window_id),
+                "error": str(exc),
+            },
+        )
+        await _update_remote_window_status(
+            session_factory,
+            client_id,
+            window_id,
+            WindowStatus.error,
+            ui_event_hub=ui_event_hub,
+            reason="window_runtime_error",
+        )
+        return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "remote runtime crashed during async window start",
+            extra={"client_id": str(client_id), "window_id": str(window_id)},
+        )
+        await _update_remote_window_status(
+            session_factory,
+            client_id,
+            window_id,
+            WindowStatus.error,
+            ui_event_hub=ui_event_hub,
+            reason="window_runtime_error",
+        )
+        return
+
+    updated = await _persist_remote_runtime_window(
+        session_factory,
+        client_id,
+        window_id,
+        runtime_window,
+    )
+    invalidate_polling_response_cache(["tree", "window"], client_id=client_id)
+    if not updated:
+        with contextlib.suppress(RemoteClientUnavailable, RemoteTerminalError):
+            await remote_runtime.kill_window(
+                window_id=window_id,
+                remote_session_id=runtime_window.session_id,
+                remote_window_id=runtime_window.window_id,
+            )
+        return
+
+    if ui_event_hub is not None:
+        with contextlib.suppress(Exception):
+            await ui_event_hub.publish_invalidation(
+                ["tree", "window"],
+                client_id=client_id,
+                window_id=window_id,
+                reason="window_runtime_ready",
+            )
+
+
+async def _persist_remote_runtime_window(
+    session_factory: Callable[[], object],
+    client_id: UUID,
+    window_id: UUID,
+    runtime_window,
+) -> bool:
+    async with session_factory() as session:
+        window = await get_window_for_client(session, client_id, window_id)
+        if window is None:
+            return False
+        window.remote_session_id = runtime_window.session_id
+        window.remote_window_id = runtime_window.window_id
+        window.cwd = runtime_window.cwd
+        window.shell_command = runtime_window.shell_command
+        window.status = WindowStatus.active
+        await session.commit()
+        return True
+
+
+async def _update_remote_window_status(
+    session_factory: Callable[[], object],
+    client_id: UUID,
+    window_id: UUID,
+    status_value: WindowStatus,
+    *,
+    ui_event_hub,
+    reason: str,
+) -> bool:
+    async with session_factory() as session:
+        window = await get_window_for_client(session, client_id, window_id)
+        if window is None:
+            return False
+        window.status = status_value
+        await session.commit()
+    invalidate_polling_response_cache(["tree", "window"], client_id=client_id)
+    if ui_event_hub is not None:
+        with contextlib.suppress(Exception):
+            await ui_event_hub.publish_invalidation(
+                ["tree", "window"],
+                client_id=client_id,
+                window_id=window_id,
+                reason=reason,
+            )
+    return True
+
+
 async def _kill_runtime_window(
     client: Client,
     window: VirtualWindow,
@@ -858,6 +1054,8 @@ async def create_virtual_window(
         session,
         tmux_manager,
         _client_connection_registry(request),
+        session_factory=_background_session_factory_for(session),
+        ui_event_hub=ui_event_hub_from_state(request.app.state),
     )
     await ui_event_hub_from_state(request.app.state).publish_invalidation(
         ["tree", "window", "search"],
@@ -877,7 +1075,14 @@ async def create_local_virtual_window(
 ) -> WindowOut:
     client = _runtime_client_from_model(await ensure_local_client(session))
     await session.commit()
-    created = await _create_virtual_window_for_client(client, payload, session, tmux_manager)
+    created = await _create_virtual_window_for_client(
+        client,
+        payload,
+        session,
+        tmux_manager,
+        session_factory=_background_session_factory_for(session),
+        ui_event_hub=ui_event_hub_from_state(request.app.state),
+    )
     await ui_event_hub_from_state(request.app.state).publish_invalidation(
         ["tree", "window", "search"],
         client_id=client.id,

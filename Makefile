@@ -1,9 +1,15 @@
-.PHONY: preflight/init preflight/check-vm-max-map-count build-images services-up deploy-up deploy-recreate app-recreate services-down backend-test backend-smoke backend-dev frontend-install frontend-build frontend-dev smoke
+.PHONY: preflight/init preflight/check-vm-max-map-count build-images services-up deploy-up deploy-recreate app-recreate services-down postgres-vacuum backend-test backend-smoke backend-dev frontend-install frontend-build frontend-dev smoke
 
 DATA_ROOT ?= ./data
 ES_VM_MAX_MAP_COUNT_MIN ?= 262144
 COMPOSE ?= docker compose --env-file .env
 APP_SERVICES ?= backend frontend
+POSTGRES_SERVICE ?= postgres
+POSTGRES_DB ?= web_terminal_acp
+POSTGRES_USER ?= web_terminal
+POSTGRES_PASSWORD ?= dev_password
+POSTGRES_VACUUM_TABLES ?= events virtual_windows ai_sessions summary_jobs
+POSTGRES_VACUUM_PARALLEL ?= 0
 
 preflight/init:
 	sudo install -d -m 0755 "$(DATA_ROOT)" "$(DATA_ROOT)/postgres"
@@ -34,6 +40,14 @@ app-recreate: preflight/init preflight/check-vm-max-map-count
 
 services-down:
 	docker compose down
+
+postgres-vacuum:
+	@tables="$(POSTGRES_VACUUM_TABLES)"; \
+	for table in $$tables; do \
+		printf '%s\n' "Vacuuming $$table..."; \
+		$(COMPOSE) exec -T $(POSTGRES_SERVICE) sh -lc \
+			'PGPASSWORD="$${POSTGRES_PASSWORD:-$(POSTGRES_PASSWORD)}" psql -U "$${POSTGRES_USER:-$(POSTGRES_USER)}" -d "$${POSTGRES_DB:-$(POSTGRES_DB)}" -v ON_ERROR_STOP=1 -c "VACUUM (ANALYZE, VERBOSE, PARALLEL $(POSTGRES_VACUUM_PARALLEL)) '"$$table"';"'; \
+	done
 
 backend-test:
 	cd backend && uv run pytest -q

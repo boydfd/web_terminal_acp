@@ -40,10 +40,6 @@ function renderSettingsModal(options: {
         onKeyboardShortcutBindingsChange={options.onKeyboardShortcutBindingsChange ?? (() => {})}
         onCustomQuickKeysChange={options.onCustomQuickKeysChange ?? (() => {})}
         authEnabled
-        registrationKey={null}
-        registrationKeyPending={false}
-        registrationKeyError={null}
-        onGenerateRegistrationKey={() => {}}
         onboardingEnabled={options.onboardingEnabled ?? true}
         onStartOnboarding={() => {}}
         onLogout={() => {}}
@@ -57,20 +53,11 @@ afterEach(() => {
     root?.unmount();
   });
   container?.remove();
-  delete (window as Window & { __WEB_TERMINAL_API_BASE?: string }).__WEB_TERMINAL_API_BASE;
   root = null;
   container = null;
   window.localStorage.clear();
   vi.restoreAllMocks();
 });
-
-function changeInputValue(target: HTMLInputElement, value: string): void {
-  const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
-  act(() => {
-    descriptor?.set?.call(target, value);
-    target.dispatchEvent(new Event("input", { bubbles: true }));
-  });
-}
 
 describe("SettingsModal", () => {
   it("closes when Escape is pressed", () => {
@@ -106,109 +93,6 @@ describe("SettingsModal", () => {
     expect(container?.querySelector(".settings-skin-preview-grid")).not.toBeNull();
     expect(container?.textContent).toContain("当前皮肤");
     expect(container?.textContent).toContain("返回");
-  });
-
-  it("opens client registration controls and requests a one-time key", () => {
-    const onGenerateRegistrationKey = vi.fn();
-    (window as Window & { __WEB_TERMINAL_API_BASE?: string }).__WEB_TERMINAL_API_BASE = "http://control.example.com:5173";
-    container = document.createElement("div");
-    document.body.appendChild(container);
-    root = createRoot(container);
-    act(() => {
-      root?.render(
-        <SettingsModal
-          isOpen
-          onClose={() => {}}
-          summaryOutputLanguage="中文"
-          terminalGroupingMode="project-topic"
-          themeSkin="default"
-          desktopNotificationsEnabled
-          keyboardShortcutBindings={{}}
-          customQuickKeys={[]}
-          onSummaryOutputLanguageChange={() => {}}
-          onTerminalGroupingModeChange={() => {}}
-          onThemeSkinChange={() => {}}
-          onDesktopNotificationsEnabledChange={() => {}}
-          onKeyboardShortcutBindingsChange={() => {}}
-          onCustomQuickKeysChange={() => {}}
-          authEnabled
-          registrationKey="wtr_test_key"
-          registrationKeyPending={false}
-          registrationKeyError={null}
-          onGenerateRegistrationKey={onGenerateRegistrationKey}
-          onboardingEnabled
-          onStartOnboarding={() => {}}
-          onLogout={() => {}}
-        />
-      );
-    });
-
-    const registrationRow = Array.from(container?.querySelectorAll(".settings-nav-row") ?? [])
-      .find((row) => row.textContent?.includes("Client 注册"));
-    expect(registrationRow).toBeInstanceOf(HTMLButtonElement);
-
-    act(() => {
-      (registrationRow as HTMLButtonElement).click();
-    });
-
-    expect(container?.textContent).toContain("一次性注册 Key");
-    expect(container?.textContent).toContain("wtr_test_key");
-    const clientNameInput = Array.from(container?.querySelectorAll("input") ?? [])
-      .find((input) => input.placeholder === "例如：office-mac-mini");
-    expect(clientNameInput).toBeInstanceOf(HTMLInputElement);
-    changeInputValue(clientNameInput as HTMLInputElement, "office-mac-mini");
-    const scriptTextarea = Array.from(container?.querySelectorAll("textarea") ?? [])
-      .find((textarea) => textarea.value.includes("register-client-direct.sh"));
-    expect(scriptTextarea?.value).toContain("http://control.example.com:5173/api/clients/register-script");
-    expect(scriptTextarea?.value).toContain("WEB_TERMINAL_SERVER_URL='http://control.example.com:5173'");
-    expect(scriptTextarea?.value).toContain("WEB_TERMINAL_REGISTRATION_KEY='wtr_test_key'");
-    expect(scriptTextarea?.value).toContain("WEB_TERMINAL_CLIENT_NAME='office-mac-mini'");
-    expect(scriptTextarea?.value).not.toContain("raw.githubusercontent.com");
-    const generateButton = Array.from(container?.querySelectorAll("button") ?? [])
-      .find((button) => button.textContent?.includes("生成一次性注册 Key"));
-    act(() => {
-      generateButton?.click();
-    });
-    expect(onGenerateRegistrationKey).toHaveBeenCalledWith("office-mac-mini");
-  });
-
-  it("can open directly to client registration controls", () => {
-    container = document.createElement("div");
-    document.body.appendChild(container);
-    root = createRoot(container);
-    act(() => {
-      root?.render(
-        <SettingsModal
-          isOpen
-          onClose={() => {}}
-          initialView="clients"
-          summaryOutputLanguage="中文"
-          terminalGroupingMode="project-topic"
-          themeSkin="default"
-          desktopNotificationsEnabled
-          keyboardShortcutBindings={{}}
-          customQuickKeys={[]}
-          onSummaryOutputLanguageChange={() => {}}
-          onTerminalGroupingModeChange={() => {}}
-          onThemeSkinChange={() => {}}
-          onDesktopNotificationsEnabledChange={() => {}}
-          onKeyboardShortcutBindingsChange={() => {}}
-          onCustomQuickKeysChange={() => {}}
-          authEnabled
-          registrationKey="wtr_direct_key"
-          registrationKeyPending={false}
-          registrationKeyError={null}
-          onGenerateRegistrationKey={() => {}}
-          onboardingEnabled
-          onStartOnboarding={() => {}}
-          onLogout={() => {}}
-        />
-      );
-    });
-
-    expect(container?.textContent).toContain("Client 注册");
-    expect(container?.textContent).toContain("一次性注册 Key");
-    expect(container?.querySelector("[data-onboarding-id='remote-registration-panel']")).not.toBeNull();
   });
 
   it("records a new built-in shortcut binding", () => {
@@ -298,10 +182,6 @@ describe("SettingsModal", () => {
           onKeyboardShortcutBindingsChange={() => {}}
           onCustomQuickKeysChange={() => {}}
           authEnabled
-          registrationKey={null}
-          registrationKeyPending={false}
-          registrationKeyError={null}
-          onGenerateRegistrationKey={() => {}}
           onboardingEnabled
           onStartOnboarding={onStartOnboarding}
           onLogout={() => {}}
