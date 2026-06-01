@@ -3,12 +3,13 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import event, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.config import Settings
 from app.model_base import Base
 from app.models import Event, EventSourceType, SummaryJob, SummaryJobStatus, VirtualWindow, WindowStatus
-from app.repositories.summary_jobs import claim_next_summary_job
+from app.repositories.summary_jobs import claim_next_summary_job, enqueue_summary_job
 from app.services.summary_scheduler import (
     AGENT_IDLE_REASON,
     schedule_summary_after_agent_activity,
@@ -645,3 +646,66 @@ async def test_running_job_is_not_preempted_and_new_pending_job_can_follow(db_se
     assert job.status == SummaryJobStatus.pending
     assert job.run_after == now + timedelta(seconds=20)
     assert running.status == SummaryJobStatus.running
+
+
+@pytest.mark.asyncio
+async def test_enqueue_summary_job_updates_existing_after_concurrent_insert():
+    window_id = uuid4()
+    existing = SummaryJob(
+        virtual_window_id=window_id,
+        status=SummaryJobStatus.pending,
+        run_after=datetime(2026, 5, 21, 12, 30, tzinfo=timezone.utc),
+        trigger_reason="old_reason",
+        input_generation=1,
+    )
+
+    class FailedNestedTransaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        def __init__(self):
+            self.flush_calls = 0
+            self.scalar_calls = 0
+            self.added: list[SummaryJob] = []
+            self.rolled_back = False
+
+        async def scalar(self, _statement):
+            self.scalar_calls += 1
+            return None if self.scalar_calls == 1 else existing
+
+        def begin_nested(self):
+            return FailedNestedTransaction()
+
+        def add(self, job: SummaryJob):
+            self.added.append(job)
+
+        async def flush(self):
+            self.flush_calls += 1
+            if self.flush_calls == 1:
+                raise IntegrityError("INSERT INTO summary_jobs", {}, Exception("duplicate"))
+
+        async def rollback(self):
+            self.rolled_back = True
+
+    session = FakeSession()
+
+    run_after = datetime(2026, 5, 21, 12, 0, 20, tzinfo=timezone.utc)
+    job = await enqueue_summary_job(
+        session,  # type: ignore[arg-type]
+        window_id,
+        trigger_reason=AGENT_IDLE_REASON,
+        input_generation=2,
+        run_after=run_after,
+        update_existing=True,
+    )
+
+    assert job is existing
+    assert job.run_after == run_after
+    assert job.trigger_reason == AGENT_IDLE_REASON
+    assert job.input_generation == 2
+    assert session.flush_calls == 2
+    assert not session.rolled_back

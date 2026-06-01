@@ -61,15 +61,18 @@ async def enqueue_summary_job(
     run_after: datetime | None = None,
     update_existing: bool = False,
 ) -> SummaryJob:
+    async def update_job(job: SummaryJob) -> None:
+        job.status = SummaryJobStatus.pending
+        job.trigger_reason = trigger_reason
+        job.allow_title_folder_override = allow_title_folder_override
+        job.input_generation = input_generation
+        job.run_after = run_after
+        await session.flush()
+
     existing_job = await session.scalar(_active_summary_job_query(virtual_window_id))
     if existing_job is not None:
         if update_existing:
-            existing_job.status = SummaryJobStatus.pending
-            existing_job.trigger_reason = trigger_reason
-            existing_job.allow_title_folder_override = allow_title_folder_override
-            existing_job.input_generation = input_generation
-            existing_job.run_after = run_after
-            await session.flush()
+            await update_job(existing_job)
         return existing_job
 
     job = SummaryJob(
@@ -87,6 +90,8 @@ async def enqueue_summary_job(
     except IntegrityError as exc:
         existing_job = await session.scalar(_active_summary_job_query(virtual_window_id))
         if existing_job is not None:
+            if update_existing:
+                await update_job(existing_job)
             return existing_job
         await session.rollback()
         raise exc

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent_tools import agent_activity_source_types, get_agent_tool_registry
 from app.config import get_settings
 from app.models import Event, SummaryJob, SummaryJobStatus, VirtualWindow
+from app.repositories.summary_jobs import enqueue_summary_job
 from app.services.agent_activity_projection import (
     event_activity_time,
     event_is_agent_activity,
@@ -71,19 +72,14 @@ async def schedule_summary_after_terminal_input(
         trigger_reason = INPUT_REPEAT_REASON if repeat_run_after <= idle_run_after else INPUT_IDLE_REASON
 
     input_generation = input_activity.total
-    pending_job = await _pending_summary_job(session, window.id)
-    if pending_job is None:
-        pending_job = SummaryJob(
-            virtual_window_id=window.id,
-            status=SummaryJobStatus.pending,
-        )
-        session.add(pending_job)
-
-    pending_job.run_after = run_after
-    pending_job.trigger_reason = trigger_reason
-    pending_job.input_generation = input_generation
-    await session.flush()
-    return pending_job
+    return await enqueue_summary_job(
+        session,
+        window.id,
+        trigger_reason=trigger_reason,
+        input_generation=input_generation,
+        run_after=run_after,
+        update_existing=True,
+    )
 
 
 async def schedule_summary_after_agent_activity(
@@ -123,19 +119,14 @@ async def schedule_summary_after_agent_activity(
     settings = get_settings()
     run_after = last_activity_at + timedelta(seconds=settings.terminal_summary_idle_seconds)
 
-    pending_job = await _pending_summary_job(session, window.id)
-    if pending_job is None:
-        pending_job = SummaryJob(
-            virtual_window_id=window.id,
-            status=SummaryJobStatus.pending,
-        )
-        session.add(pending_job)
-
-    pending_job.run_after = run_after
-    pending_job.trigger_reason = AGENT_IDLE_REASON
-    pending_job.input_generation = window.agent_activity_generation
-    await session.flush()
-    return pending_job
+    return await enqueue_summary_job(
+        session,
+        window.id,
+        trigger_reason=AGENT_IDLE_REASON,
+        input_generation=window.agent_activity_generation,
+        run_after=run_after,
+        update_existing=True,
+    )
 
 
 async def _schedule_after_latest_agent_user_message(
@@ -155,19 +146,14 @@ async def _schedule_after_latest_agent_user_message(
     settings = get_settings()
     run_after = latest_user_message_at + timedelta(seconds=settings.terminal_summary_idle_seconds)
 
-    pending_job = await _pending_summary_job(session, window.id)
-    if pending_job is None:
-        pending_job = SummaryJob(
-            virtual_window_id=window.id,
-            status=SummaryJobStatus.pending,
-        )
-        session.add(pending_job)
-
-    pending_job.run_after = run_after
-    pending_job.trigger_reason = AGENT_IDLE_REASON
-    pending_job.input_generation = window.agent_activity_generation
-    await session.flush()
-    return pending_job
+    return await enqueue_summary_job(
+        session,
+        window.id,
+        trigger_reason=AGENT_IDLE_REASON,
+        input_generation=window.agent_activity_generation,
+        run_after=run_after,
+        update_existing=True,
+    )
 
 
 async def _terminal_input_activity(
@@ -429,18 +415,6 @@ async def _last_summary_at(session: AsyncSession, window_id: UUID) -> datetime |
     if job is None:
         return None
     return _ensure_aware(job.updated_at or job.created_at)
-
-
-async def _pending_summary_job(session: AsyncSession, window_id: UUID) -> SummaryJob | None:
-    return await session.scalar(
-        select(SummaryJob)
-        .where(
-            SummaryJob.virtual_window_id == window_id,
-            SummaryJob.status == SummaryJobStatus.pending,
-        )
-        .order_by(SummaryJob.created_at, SummaryJob.id)
-        .limit(1)
-    )
 
 
 def _ensure_aware(value: datetime) -> datetime:
