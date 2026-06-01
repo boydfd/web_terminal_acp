@@ -36,6 +36,7 @@ AGENT_WATCH_IDLE_INTERVAL_SECONDS = 2.0
 AGENT_WATCH_MAX_INTERVAL_SECONDS = 5.0
 AGENT_WATCH_SLOW_SCAN_SECONDS = 1.0
 AGENT_WATCH_DISCOVERY_INTERVAL_SECONDS = 30.0
+CODEX_ACTIVE_SESSION_BOOTSTRAP_SECONDS = 10 * 60
 CLAUDE_HISTORY_PENDING_RETRY_SECONDS = 2.0
 AGENT_WATCH_COLLECTION_CONCURRENCY = 2
 AGENT_WATCH_PROCESS_SCAN_INTERVAL_SECONDS = 30.0
@@ -360,9 +361,10 @@ class UnifiedAgentToolWatcher:
 def initialize_agent_tool_watcher_state(state: AgentToolWatcherState, *, window_id: UUID) -> None:
     state.codex_session_files = iter_codex_session_files(window_id)
     state.codex_session_files_refreshed_at = time.monotonic()
+    bootstrap_codex_path = _recent_latest_codex_session_file(state.codex_session_files)
     for path in state.codex_session_files:
         try:
-            state.codex_offsets[path] = path.stat().st_size
+            state.codex_offsets[path] = 0 if path == bootstrap_codex_path else _jsonl_tail_resume_offset(path)
         except FileNotFoundError:
             state.codex_offsets.pop(path, None)
 
@@ -370,12 +372,12 @@ def initialize_agent_tool_watcher_state(state: AgentToolWatcherState, *, window_
     state.claude_code_jsonl_files_refreshed_at = time.monotonic()
     for path in state.claude_code_jsonl_files:
         try:
-            state.claude_code_offsets[path] = path.stat().st_size
+            state.claude_code_offsets[path] = _jsonl_tail_resume_offset(path)
         except FileNotFoundError:
             state.claude_code_offsets.pop(path, None)
     history_file = claude_code_history_file(window_id)
     try:
-        state.claude_code_history_offset = history_file.stat().st_size
+        state.claude_code_history_offset = _jsonl_tail_resume_offset(history_file)
     except FileNotFoundError:
         state.claude_code_history_offset = 0
 
@@ -384,6 +386,45 @@ def initialize_agent_tool_watcher_state(state: AgentToolWatcherState, *, window_
         state.cursor_last_rowids[path] = _cursor_store_max_rowid(path)
         state.cursor_seen_blob_ids.setdefault(path, set())
     state.cursor_discovery_started = True
+
+
+def _recent_latest_codex_session_file(paths: list[Path]) -> Path | None:
+    latest_path: Path | None = None
+    latest_mtime = 0.0
+    now = time.time()
+    for path in paths:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        if now - stat.st_mtime > CODEX_ACTIVE_SESSION_BOOTSTRAP_SECONDS:
+            continue
+        if latest_path is None or stat.st_mtime > latest_mtime:
+            latest_path = path
+            latest_mtime = stat.st_mtime
+    return latest_path
+
+
+def _jsonl_tail_resume_offset(path: Path) -> int:
+    size = path.stat().st_size
+    if size == 0:
+        return 0
+
+    with path.open("rb") as handle:
+        handle.seek(size - 1)
+        if handle.read(1) == b"\n":
+            return size
+
+        cursor = size
+        while cursor > 0:
+            chunk_size = min(8192, cursor)
+            cursor -= chunk_size
+            handle.seek(cursor)
+            chunk = handle.read(chunk_size)
+            newline_index = chunk.rfind(b"\n")
+            if newline_index >= 0:
+                return cursor + newline_index + 1
+    return 0
 
 
 def _cursor_store_max_rowid(path: Path) -> int:

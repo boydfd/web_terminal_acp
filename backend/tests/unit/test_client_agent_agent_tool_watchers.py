@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -121,7 +122,7 @@ def test_collect_codex_watch_events_preserves_payload_shape_and_project_attribut
     assert state.codex_offsets[session_file] == session_file.stat().st_size
 
 
-def test_initialize_agent_tool_watcher_state_starts_jsonl_collectors_at_eof(
+def test_initialize_agent_tool_watcher_state_starts_stale_jsonl_collectors_at_eof(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -146,6 +147,10 @@ def test_initialize_agent_tool_watcher_state_starts_jsonl_collectors_at_eof(
         json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "old claude"}}) + "\n",
         encoding="utf-8",
     )
+    now = 1_780_000_000.0
+    old = now - watchers.CODEX_ACTIVE_SESSION_BOOTSTRAP_SECONDS - 1
+    os.utime(codex_session, (old, old))
+    monkeypatch.setattr(watchers.time, "time", lambda: now)
     monkeypatch.setattr(
         "app.client_agent.agent_tool_watchers.iter_codex_session_files",
         lambda window_id: [codex_session],
@@ -213,6 +218,96 @@ def test_initialize_agent_tool_watcher_state_starts_jsonl_collectors_at_eof(
     assert codex_events[0].payload["payload"]["content"][0]["text"] == "new codex"
     assert [event.offset for event in claude_events] == [claude_new_offset]
     assert claude_events[0].payload["message"]["content"] == "new claude"
+
+
+def test_initialize_agent_tool_watcher_state_bootstraps_latest_recent_codex_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_session = tmp_path / "rollout-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+    active_session = tmp_path / "rollout-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.jsonl"
+    stale_session.write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "old skipped"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    active_session.write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "bootstrap me"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    now = 1_780_000_000.0
+    old = now - watchers.CODEX_ACTIVE_SESSION_BOOTSTRAP_SECONDS - 1
+    os.utime(stale_session, (old, old))
+    os.utime(active_session, (now - 1, now - 1))
+    monkeypatch.setattr(watchers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        "app.client_agent.agent_tool_watchers.iter_codex_session_files",
+        lambda window_id: [stale_session, active_session],
+    )
+    state = AgentToolWatcherState()
+
+    initialize_agent_tool_watcher_state(state, window_id=WINDOW_ID)
+    events = collect_codex_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+
+    assert [event.offset for event in events] == [0]
+    assert events[0].source_path == str(active_session)
+    assert events[0].payload["payload"]["content"][0]["text"] == "bootstrap me"
+    assert state.codex_offsets[stale_session] == stale_session.stat().st_size
+
+
+def test_initialize_agent_tool_watcher_state_resumes_stale_codex_session_at_complete_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_file = tmp_path / "rollout-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+    first_line = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "complete"}],
+            },
+        }
+    )
+    session_file.write_text(first_line + "\n" + '{"type":"response_item"', encoding="utf-8")
+    now = 1_780_000_000.0
+    old = now - watchers.CODEX_ACTIVE_SESSION_BOOTSTRAP_SECONDS - 1
+    os.utime(session_file, (old, old))
+    monkeypatch.setattr(watchers.time, "time", lambda: now)
+    monkeypatch.setattr(
+        "app.client_agent.agent_tool_watchers.iter_codex_session_files",
+        lambda window_id: [session_file],
+    )
+    state = AgentToolWatcherState()
+
+    initialize_agent_tool_watcher_state(state, window_id=WINDOW_ID)
+
+    assert state.codex_offsets[session_file] == len((first_line + "\n").encode("utf-8"))
 
 
 def test_collect_codex_watch_events_resets_offset_after_truncation(
