@@ -433,8 +433,21 @@ class TerminalRecentOut(BaseModel):
     last_used_at: datetime
 
 
+class GlobalTerminalRecentOut(TerminalRecentOut):
+    client_id: UUID
+    client_name: str
+
+
 class TerminalRecentPageOut(BaseModel):
     items: list[TerminalRecentOut]
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+
+class GlobalTerminalRecentPageOut(BaseModel):
+    items: list[GlobalTerminalRecentOut]
     page: int
     page_size: int
     total: int

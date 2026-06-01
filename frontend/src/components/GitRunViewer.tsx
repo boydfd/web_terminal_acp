@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { CSSProperties } from "react";
 
@@ -18,6 +18,7 @@ import {
   treeFileLabel
 } from "../gitDiff";
 import type { GitDiffCommit, GitDiffFile, GitWorktreeRun } from "../types";
+import { useOverlayFocus } from "./useOverlayFocus";
 
 type GitRunViewerProps = {
   clientId: string;
@@ -320,10 +321,21 @@ function GitFileButton({
 
 function GitDiffModal({ selection, onClose }: { selection: SelectedDiff; onClose: () => void }) {
   const { commit, file } = selection;
+  const panelRef = useRef<HTMLElement | null>(null);
+  const handleEscape = useCallback(() => {
+    onClose();
+  }, [onClose]);
+
+  useOverlayFocus({
+    isOpen: true,
+    ref: panelRef,
+    onEscape: handleEscape
+  });
+
   return (
     <div className="git-diff-modal" role="dialog" aria-modal="true" aria-label="Git file diff">
       <button type="button" className="git-diff-modal-backdrop" aria-label="Close diff" onClick={onClose} />
-      <section className={`git-diff-modal-panel ${fileStatusTone(file.status)}`}>
+      <section ref={panelRef} className={`git-diff-modal-panel ${fileStatusTone(file.status)}`}>
         <header>
           <div>
             <strong>{displayPath(file)}</strong>

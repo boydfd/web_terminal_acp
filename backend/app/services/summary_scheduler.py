@@ -14,8 +14,9 @@ from app.services.agent_activity_projection import (
     event_activity_time,
     event_is_agent_activity,
     event_is_agent_completion,
+    event_is_agent_user_input,
 )
-from app.services.window_runtime_tags import agent_from_command
+from app.services.window_runtime_tags import agent_command_has_inline_task, agent_from_command
 
 INPUT_IDLE_REASON = "input_idle"
 INPUT_INITIAL_MAX_WAIT_REASON = "input_initial_max_wait"
@@ -254,11 +255,19 @@ def _event_input_time(event: Event) -> datetime:
 def _touch_agent_activity_state(window: VirtualWindow, event: Event, activity_at: datetime) -> None:
     current = _ensure_aware(activity_at)
     latest = _ensure_aware(window.agent_activity_latest_at) if window.agent_activity_latest_at else None
+    is_completion = event_is_agent_completion(event)
+    is_user_input = event_is_agent_user_input(event)
     if latest is not None and current < latest:
-        if event_is_agent_completion(event):
+        if is_completion:
             _touch_agent_completion_state(window, event)
+        if is_user_input:
+            _touch_agent_user_input_state(window, event)
         return
     if latest is not None and current == latest and event.id == window.agent_activity_latest_event_id:
+        if is_completion:
+            _touch_agent_completion_state(window, event)
+        if is_user_input:
+            _touch_agent_user_input_state(window, event)
         return
     gap = timedelta(seconds=SUMMARY_AGENT_BURST_GAP_SECONDS)
     if latest is None or current - latest > gap:
@@ -266,8 +275,10 @@ def _touch_agent_activity_state(window: VirtualWindow, event: Event, activity_at
     window.agent_activity_latest_at = current
     if event.id is not None:
         window.agent_activity_latest_event_id = event.id
-    if event_is_agent_completion(event):
+    if is_completion:
         _touch_agent_completion_state(window, event)
+    if is_user_input:
+        _touch_agent_user_input_state(window, event)
     window.agent_activity_generation += 1
 
 
@@ -282,6 +293,17 @@ def _touch_agent_completion_state(window: VirtualWindow, event: Event) -> None:
         window.agent_activity_latest_completed_at = completed_at
 
 
+def _touch_agent_user_input_state(window: VirtualWindow, event: Event) -> None:
+    user_input_at = event_activity_time(event)
+    latest_user_input = (
+        _ensure_aware(window.agent_activity_latest_user_input_at)
+        if window.agent_activity_latest_user_input_at
+        else None
+    )
+    if latest_user_input is None or user_input_at >= latest_user_input:
+        window.agent_activity_latest_user_input_at = user_input_at
+
+
 def _agent_activity_time_from_event(event: Event | None) -> datetime | None:
     if event is None or event.created_at is None:
         return None
@@ -289,7 +311,11 @@ def _agent_activity_time_from_event(event: Event | None) -> datetime | None:
         return _ensure_aware(event.created_at)
     if event.source_type in agent_activity_source_types() and event_is_agent_activity(event):
         return event_activity_time(event)
-    if event.kind == TERMINAL_INPUT_COMMAND_KIND and _command_agent(event) is not None:
+    if (
+        event.kind == TERMINAL_INPUT_COMMAND_KIND
+        and _command_agent(event) is not None
+        and _command_has_agent_task(event)
+    ):
         return _event_input_time(event)
     return None
 
@@ -383,6 +409,11 @@ async def _agent_activity_times_before(
         .limit(100)
     )
     return [_ensure_aware(event_activity_time(event)) for event in events if event_is_agent_activity(event)]
+
+
+def _command_has_agent_task(event: Event) -> bool:
+    command = event.payload_json.get("command")
+    return agent_command_has_inline_task(command if isinstance(command, str) else None)
 
 
 async def _last_summary_at(session: AsyncSession, window_id: UUID) -> datetime | None:

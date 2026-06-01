@@ -433,3 +433,31 @@ def test_agent_environment_replaces_legacy_cursor_chats_symlink(tmp_path) -> Non
     assert result.returncode == 0, result.stderr
     assert (cursor_home / "chats").is_dir()
     assert not (cursor_home / "chats").is_symlink()
+
+
+def test_agent_environment_allows_client_without_agent_installs_under_zsh(tmp_path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+
+    env = {
+        "HOME": str(home),
+        "PATH": os.environ["PATH"],
+        "WEB_TERMINAL_CODEX_HOME": "~/.web-terminal-acp/codex-homes/window-1",
+        "WEB_TERMINAL_CLAUDE_CODE_HOME": "~/.web-terminal-acp/claude-code-homes/window-1",
+        "WEB_TERMINAL_CURSOR_HOME": "~/.web-terminal-acp/cursor-homes/window-1",
+        "CODEX_HOME": "",
+    }
+    result = subprocess.run(
+        ["zsh", "-c", _agent_environment_script()],
+        check=False,
+        env=env,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert (home / ".web-terminal-acp" / "codex-homes" / "window-1" / "sessions").is_dir()
+    assert (home / ".web-terminal-acp" / "claude-code-homes" / "window-1" / "projects").is_dir()
+    assert (home / ".web-terminal-acp" / "cursor-homes" / "window-1" / "chats").is_dir()

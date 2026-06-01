@@ -586,6 +586,8 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     let nativeTextInputEventClearTimer: number | null = null;
     let nativeInputFallbackTimer: number | null = null;
     let nativeInputFallbackCompositionActive = false;
+    let nativeInputCompositionStartValue = "";
+    let nativeInputCompositionLatestData = "";
     const recentNativeFallbackInputs: RecentNativeFallbackInput[] = [];
     const recentXtermInputs: RecentXtermInput[] = [];
     const pendingInputs: string[] = [];
@@ -1201,6 +1203,44 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       return recentXtermInputs.some((entry) => entry.data === data);
     };
 
+    const markNativeTextInputEventSerial = () => {
+      nativeTextInputEventSerial += 1;
+      activeNativeTextInputEventSerial = nativeTextInputEventSerial;
+      if (nativeTextInputEventClearTimer !== null) {
+        window.clearTimeout(nativeTextInputEventClearTimer);
+      }
+      const markedInputEventSerial = nativeTextInputEventSerial;
+      nativeTextInputEventClearTimer = window.setTimeout(() => {
+        nativeTextInputEventClearTimer = null;
+        if (activeNativeTextInputEventSerial === markedInputEventSerial) {
+          activeNativeTextInputEventSerial = null;
+        }
+      }, 0);
+      return markedInputEventSerial;
+    };
+
+    const sendNativeTextInputFallback = (
+      data: string,
+      inputEventSerial: number,
+      xtermSerialBeforeFallback: number,
+      { allowAfterComposition = false }: { allowAfterComposition?: boolean } = {},
+    ) => {
+      if (
+        data.length === 0
+        || !isActive()
+        || connectionStatusRef.current !== "connected"
+        || (!allowAfterComposition && nativeInputFallbackCompositionActive)
+        || xtermInputSerial !== xtermSerialBeforeFallback
+        || hasRecentXtermInput(data)
+      ) {
+        return;
+      }
+
+      rememberNativeFallbackInput(data, inputEventSerial);
+      sendOrQueueInput(data);
+      scheduleInputPriorityClaim();
+    };
+
     const disposable = terminal.onData((data) => {
       xtermInputSerial += 1;
       if (consumeMatchingNativeFallbackInput(data)) {
@@ -1298,35 +1338,53 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
 
     const handleNativeInputCompositionStart = () => {
       nativeInputFallbackCompositionActive = true;
+      nativeInputCompositionStartValue = nativeInputTextarea?.value ?? "";
+      nativeInputCompositionLatestData = "";
       if (nativeInputFallbackTimer !== null) {
         window.clearTimeout(nativeInputFallbackTimer);
         nativeInputFallbackTimer = null;
       }
     };
-    const handleNativeInputCompositionEnd = () => {
+    const handleNativeInputCompositionUpdate = (event: CompositionEvent) => {
+      nativeInputCompositionLatestData = event.data;
+    };
+    const handleNativeInputCompositionEnd = (event: CompositionEvent) => {
       nativeInputFallbackCompositionActive = false;
+      nativeInputCompositionLatestData = event.data || nativeInputCompositionLatestData;
+      const compositionStartValue = nativeInputCompositionStartValue;
+      const compositionEventData = event.data;
+      const fallbackInputEventSerial = markNativeTextInputEventSerial();
+      const xtermSerialBeforeFallback = xtermInputSerial;
+      if (nativeInputFallbackTimer !== null) {
+        window.clearTimeout(nativeInputFallbackTimer);
+      }
+      nativeInputFallbackTimer = window.setTimeout(() => {
+        nativeInputFallbackTimer = null;
+        const textareaValue = nativeInputTextarea?.value ?? "";
+        const insertedText = textareaValue.startsWith(compositionStartValue)
+          ? textareaValue.slice(compositionStartValue.length)
+          : "";
+        const data = insertedText || compositionEventData || nativeInputCompositionLatestData;
+        nativeInputCompositionStartValue = "";
+        nativeInputCompositionLatestData = "";
+        sendNativeTextInputFallback(data, fallbackInputEventSerial, xtermSerialBeforeFallback, {
+          allowAfterComposition: true,
+        });
+      }, NATIVE_TEXT_INPUT_FALLBACK_DELAY_MS);
     };
     const markNativeTextInputEvent = (event: InputEvent) => {
       if (
-        event.inputType === "insertText"
+        (event.inputType === "insertText" || event.inputType === "insertCompositionText")
         && event.data !== null
         && event.data.length > 1
       ) {
-        nativeTextInputEventSerial += 1;
-        activeNativeTextInputEventSerial = nativeTextInputEventSerial;
-        if (nativeTextInputEventClearTimer !== null) {
-          window.clearTimeout(nativeTextInputEventClearTimer);
-        }
-        const markedInputEventSerial = nativeTextInputEventSerial;
-        nativeTextInputEventClearTimer = window.setTimeout(() => {
-          nativeTextInputEventClearTimer = null;
-          if (activeNativeTextInputEventSerial === markedInputEventSerial) {
-            activeNativeTextInputEventSerial = null;
-          }
-        }, 0);
+        markNativeTextInputEventSerial();
       }
     };
     const handleNativeTextInputFallback = (event: InputEvent) => {
+      if (event.inputType === "insertCompositionText" && event.data !== null) {
+        nativeInputCompositionLatestData = event.data;
+      }
       if (
         connectionStatusRef.current !== "connected"
         || nativeInputFallbackCompositionActive
@@ -1347,19 +1405,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       }
       nativeInputFallbackTimer = window.setTimeout(() => {
         nativeInputFallbackTimer = null;
-        if (
-          !isActive()
-          || connectionStatusRef.current !== "connected"
-          || nativeInputFallbackCompositionActive
-          || xtermInputSerial !== xtermSerialBeforeFallback
-          || hasRecentXtermInput(data)
-        ) {
-          return;
-        }
-
-        rememberNativeFallbackInput(data, inputEventSerial);
-        sendOrQueueInput(data);
-        scheduleInputPriorityClaim();
+        sendNativeTextInputFallback(data, inputEventSerial, xtermSerialBeforeFallback);
       }, NATIVE_TEXT_INPUT_FALLBACK_DELAY_MS);
     };
 
@@ -1380,9 +1426,11 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       }
       if (textarea !== undefined && nativeInputTextarea !== textarea) {
         nativeInputTextarea?.removeEventListener("compositionstart", handleNativeInputCompositionStart);
+        nativeInputTextarea?.removeEventListener("compositionupdate", handleNativeInputCompositionUpdate);
         nativeInputTextarea?.removeEventListener("compositionend", handleNativeInputCompositionEnd);
         nativeInputTextarea?.removeEventListener("input", handleNativeTextInputFallback as EventListener, true);
         textarea.addEventListener("compositionstart", handleNativeInputCompositionStart);
+        textarea.addEventListener("compositionupdate", handleNativeInputCompositionUpdate);
         textarea.addEventListener("compositionend", handleNativeInputCompositionEnd);
         textarea.addEventListener("input", handleNativeTextInputFallback as EventListener, true);
         nativeInputTextarea = textarea;
@@ -1468,6 +1516,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       nativePasteElement?.removeEventListener("input", markNativeTextInputEvent as EventListener, true);
       nativePasteTextarea?.removeEventListener("paste", handleNativePaste, true);
       nativeInputTextarea?.removeEventListener("compositionstart", handleNativeInputCompositionStart);
+      nativeInputTextarea?.removeEventListener("compositionupdate", handleNativeInputCompositionUpdate);
       nativeInputTextarea?.removeEventListener("compositionend", handleNativeInputCompositionEnd);
       nativeInputTextarea?.removeEventListener("input", handleNativeTextInputFallback as EventListener, true);
       document.removeEventListener("visibilitychange", handleTerminalVisibilityChange);

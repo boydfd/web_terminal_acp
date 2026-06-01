@@ -16,6 +16,8 @@ afterEach(() => {
 describe("keyboardShortcuts", () => {
   it("uses defaults until a binding is overridden", () => {
     expect(keyboardShortcutLabel(effectiveKeyboardShortcut("settings", {}))).toBe("Alt+,");
+    expect(keyboardShortcutLabel(effectiveKeyboardShortcut("switch-terminal-global", {}))).toBe("Alt+Shift+W");
+    expect(keyboardShortcutLabel(effectiveKeyboardShortcut("switch-client", {}))).toBe("Alt+Shift+C");
 
     writeKeyboardShortcutBindings({ settings: { key: "s", ctrl: true } });
 

@@ -129,6 +129,16 @@ function textInputEvent(data: string): InputEvent {
   return event;
 }
 
+function compositionInputEvent(data: string): InputEvent {
+  const event = new Event("input", { bubbles: true, cancelable: true }) as InputEvent;
+  Object.defineProperties(event, {
+    data: { configurable: true, value: data },
+    inputType: { configurable: true, value: "insertCompositionText" },
+    isComposing: { configurable: true, value: true },
+  });
+  return event;
+}
+
 async function waitForNativeInputFallback(): Promise<void> {
   await act(async () => {
     await new Promise((resolve) => window.setTimeout(resolve, 0));
@@ -379,5 +389,71 @@ describe("TerminalPane virtual clipboard controls", () => {
     expect(inputMessages.map((message) => (
       new TextDecoder().decode((message as { data: Uint8Array }).data)
     ))).toEqual(["22", "22"]);
+  });
+
+  it("falls back to composition-end text when Android WebView does not emit xterm data", async () => {
+    installTerminalPaneDomMocks();
+
+    act(() => {
+      root?.render(
+        <TerminalPane
+          clientId="client-1"
+          windowId="window-1"
+        />
+      );
+    });
+
+    const textarea = latestTerminal?.textarea;
+    if (!(textarea instanceof HTMLTextAreaElement)) {
+      throw new Error("Terminal helper textarea was not rendered");
+    }
+
+    act(() => {
+      textarea.value = "";
+      textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "" }));
+      textarea.value = "12345";
+      textarea.dispatchEvent(new CompositionEvent("compositionupdate", { bubbles: true, data: "12345" }));
+      textarea.dispatchEvent(compositionInputEvent("12345"));
+      textarea.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "12345" }));
+    });
+    await waitForNativeInputFallback();
+
+    const inputMessages = workerInstances[0].messages.filter((message) => message.type === "input");
+    expect(inputMessages).toHaveLength(1);
+    expect(new TextDecoder().decode((inputMessages[0] as { data: Uint8Array }).data)).toBe("12345");
+  });
+
+  it("does not duplicate composition-end text when xterm emits it", async () => {
+    installTerminalPaneDomMocks();
+
+    act(() => {
+      root?.render(
+        <TerminalPane
+          clientId="client-1"
+          windowId="window-1"
+        />
+      );
+    });
+
+    const textarea = latestTerminal?.textarea;
+    if (!(textarea instanceof HTMLTextAreaElement)) {
+      throw new Error("Terminal helper textarea was not rendered");
+    }
+
+    textarea.addEventListener("compositionend", () => latestTerminal?.emitData("67890"));
+
+    act(() => {
+      textarea.value = "";
+      textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "" }));
+      textarea.value = "67890";
+      textarea.dispatchEvent(new CompositionEvent("compositionupdate", { bubbles: true, data: "67890" }));
+      textarea.dispatchEvent(compositionInputEvent("67890"));
+      textarea.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "67890" }));
+    });
+    await waitForNativeInputFallback();
+
+    const inputMessages = workerInstances[0].messages.filter((message) => message.type === "input");
+    expect(inputMessages).toHaveLength(1);
+    expect(new TextDecoder().decode((inputMessages[0] as { data: Uint8Array }).data)).toBe("67890");
   });
 });

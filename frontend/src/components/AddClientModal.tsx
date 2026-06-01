@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { BootstrapClientInput } from "../types";
 import { BootstrapClientForm } from "./BootstrapClientForm";
 import { ClientRegistrationKeyForm } from "./ClientRegistrationKeyForm";
+import { useOverlayFocus } from "./useOverlayFocus";
 
 type AddClientMode = "bootstrap" | "registration";
 
@@ -32,6 +33,7 @@ export function AddClientModal({
   onGenerateRegistrationKey
 }: AddClientModalProps) {
   const [mode, setMode] = useState<AddClientMode>(initialMode);
+  const panelRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (isOpen) {
@@ -39,22 +41,15 @@ export function AddClientModal({
     }
   }, [initialMode, isOpen]);
 
-  useEffect(() => {
-    if (!isOpen) {
-      return;
-    }
+  const handleEscape = useCallback(() => {
+    onClose();
+  }, [onClose]);
 
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented) {
-        return;
-      }
-      event.preventDefault();
-      onClose();
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isOpen, onClose]);
+  useOverlayFocus({
+    isOpen,
+    ref: panelRef,
+    onEscape: handleEscape
+  });
 
   if (!isOpen) {
     return null;
@@ -70,6 +65,7 @@ export function AddClientModal({
       }}
     >
       <div
+        ref={panelRef}
         aria-label="Add client"
         aria-modal="true"
         className="add-client-modal"

@@ -58,6 +58,21 @@ def codex_message_payload(text: str, *, timestamp: datetime | None = None) -> di
     return payload
 
 
+def codex_user_message_payload(text: str, *, timestamp: datetime | None = None) -> dict:
+    payload = {
+        "provider": "codex",
+        "raw_type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        },
+    }
+    if timestamp is not None:
+        payload["timestamp"] = timestamp.isoformat()
+    return payload
+
+
 def codex_completion_payload(
     *, event_type: str = "task_completed", timestamp: datetime | None = None
 ) -> dict:
@@ -2447,6 +2462,16 @@ async def test_get_window_returns_working_for_recent_agent_activity(db_client):
                 client_id=client.id,
                 source_type=EventSourceType.agent_tool_record,
                 source_id="codex-session",
+                kind="response_item",
+                virtual_window_id=window.id,
+                payload_json=codex_user_message_payload("fix tests"),
+                fingerprint=f"agent_tool_record:{window.id}:recent-user",
+                created_at=datetime.now(timezone.utc) - timedelta(seconds=15),
+            ),
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session",
                 kind="assistant_message",
                 virtual_window_id=window.id,
                 payload_json={"provider": "codex", "role": "assistant", "content": "working"},
@@ -2466,6 +2491,52 @@ async def test_get_window_returns_working_for_recent_agent_activity(db_client):
     assert work_status["color"] == "orange"
     assert work_status["last_activity_at"] is not None
     assert work_status["last_working_activity_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_get_window_does_not_mark_empty_agent_launch_as_working(db_client):
+    client_id = await get_local_client_id(db_client)
+    now = datetime.now(timezone.utc)
+    async with db_client.session_factory() as session:
+        client = await ensure_local_client(session)
+        window = await create_window(session, client.id, cwd="/tmp", shell_command="/bin/bash")
+        session.add_all(
+            [
+                Event(
+                    client_id=client.id,
+                    source_type=EventSourceType.terminal,
+                    source_id=str(window.id),
+                    kind="terminal_input_command",
+                    virtual_window_id=window.id,
+                    payload_json={"command": "codex", "sequence": 43},
+                    fingerprint=f"terminal_input_command:{window.id}:empty-codex",
+                    created_at=now - timedelta(seconds=30),
+                ),
+                Event(
+                    client_id=client.id,
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="codex-session",
+                    kind="session_meta",
+                    virtual_window_id=window.id,
+                    payload_json={
+                        "provider": "codex",
+                        "raw_type": "session_meta",
+                        "payload": {"id": "codex-session"},
+                    },
+                    fingerprint=f"agent_tool_record:{window.id}:empty-session-meta",
+                    created_at=now - timedelta(seconds=10),
+                ),
+            ]
+        )
+        window_id = window.id
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/windows/{window_id}")
+
+    assert response.status_code == 200
+    work_status = response.json()["work_status"]
+    assert work_status["state"] == "RECENT_ACTIVE"
+    assert work_status["last_working_activity_at"] is None
 
 
 @pytest.mark.asyncio
@@ -2923,6 +2994,16 @@ async def test_windows_activity_returns_work_status_for_windows(db_client):
                 client_id=client.id,
                 source_type=EventSourceType.agent_tool_record,
                 source_id="codex-session",
+                kind="response_item",
+                virtual_window_id=window.id,
+                payload_json=codex_user_message_payload("fix tests"),
+                fingerprint=f"agent_tool_record:{window.id}:activity-user",
+                created_at=datetime.now(timezone.utc) - timedelta(seconds=10),
+            ),
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session",
                 kind="event_msg",
                 virtual_window_id=window.id,
                 payload_json={"provider": "codex", "raw_type": "event_msg", "payload": {"type": "agent_message", "message": "Working"}},
@@ -3025,6 +3106,19 @@ async def test_windows_activity_returns_to_working_after_completion_in_same_runn
                 payload_json=codex_completion_payload(timestamp=now - timedelta(seconds=40)),
                 fingerprint=f"agent_tool_record:{window.id}:codex-first-turn-complete",
                 created_at=now - timedelta(seconds=40),
+            ),
+            Event(
+                client_id=client.id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session",
+                kind="response_item",
+                virtual_window_id=window.id,
+                payload_json=codex_user_message_payload(
+                    "second turn",
+                    timestamp=now - timedelta(seconds=15),
+                ),
+                fingerprint=f"agent_tool_record:{window.id}:codex-second-turn-user",
+                created_at=now - timedelta(seconds=15),
             ),
             Event(
                 client_id=client.id,

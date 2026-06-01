@@ -14,6 +14,7 @@ import type {
   WindowTitleHistory,
   LoginResult,
   SearchResponse,
+  GlobalTerminalRecentPage,
   ProjectSummary,
   TerminalRecent,
   TerminalRecentPage,
@@ -434,6 +435,24 @@ export function fetchTerminalRecents(
   }
   return request<TerminalRecentPage>(
     `/api/clients/${pathSegment(clientId)}/terminal-recents?${params.toString()}`
+  );
+}
+
+export function fetchGlobalTerminalRecents(
+  page = 1,
+  pageSize = 20,
+  query = ""
+): Promise<GlobalTerminalRecentPage> {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize)
+  });
+  const trimmedQuery = query.trim();
+  if (trimmedQuery.length > 0) {
+    params.set("q", trimmedQuery);
+  }
+  return request<GlobalTerminalRecentPage>(
+    `/api/terminal-recents?${params.toString()}`
   );
 }
 

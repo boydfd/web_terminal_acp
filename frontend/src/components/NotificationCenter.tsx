@@ -1,6 +1,7 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 
 import type { TerminalNotification } from "../terminalNotifications";
+import { useOverlayFocus } from "./useOverlayFocus";
 
 type NotificationCenterProps = {
   isOpen: boolean;
@@ -21,17 +22,20 @@ export function NotificationCenter({
 }: NotificationCenterProps) {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const unreadCount = notifications.filter((notification) => !notification.read).length;
+  const handleEscape = useCallback(() => {
+    onClose();
+  }, [onClose]);
+
+  useOverlayFocus({
+    isOpen,
+    ref: panelRef,
+    onEscape: handleEscape
+  });
 
   useEffect(() => {
     if (!isOpen) {
       return;
     }
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        onClose();
-      }
-    };
 
     const handlePointerDown = (event: PointerEvent) => {
       const target = event.target;
@@ -41,10 +45,8 @@ export function NotificationCenter({
       onClose();
     };
 
-    window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("pointerdown", handlePointerDown);
     return () => {
-      window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("pointerdown", handlePointerDown);
     };
   }, [isOpen, onClose]);
@@ -55,7 +57,7 @@ export function NotificationCenter({
 
   return (
     <div className="notification-center-backdrop" role="presentation">
-      <div ref={panelRef} className="notification-center" role="dialog" aria-label="通知中心">
+      <div ref={panelRef} className="notification-center" role="dialog" aria-modal="true" aria-label="通知中心">
         <div className="notification-center-header">
           <div>
             <h2>通知中心</h2>

@@ -13,6 +13,12 @@
 
 在 Web Terminal 中开发时，必须使用 skill **`web-terminal-git-worktree`**（见 [AGENTS.md](./AGENTS.md)）。
 
+## Project Skills
+
+- 项目级 skill 必须同时维护 Claude Code、Codex、Cursor 三份：`.claude/skills/<name>`、`.codex/skills/<name>`、`.cursor/skills/<name>`。
+- 新增或修改项目 skill 时，三份 `SKILL.md`、脚本和必要 metadata 必须保持行为一致；不要只更新其中一个 agent 的版本。
+- Android app 打包使用 `android-app-release` skill；常用入口是 `make android-release`、`make android-local-release`、`make android-debug`。
+
 ## Remote Client Bundle
 
 - Remote client bootstrap/self-update 只上传 `backend/app/services/bootstrap/installer.py::client_app_file_contents()` 中列出的精简包，不会自动包含整个 backend。

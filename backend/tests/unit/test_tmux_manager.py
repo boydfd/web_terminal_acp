@@ -117,7 +117,7 @@ async def test_create_window_maps_host_bind_mount_path_and_returns_actual_cwd(mo
 
 
 @pytest.mark.asyncio
-async def test_create_window_launches_direct_agent_inside_default_shell_with_literal_send_keys():
+async def test_create_window_launches_direct_agent_inside_default_shell_with_literal_send_keys(tmp_path):
     calls: list[list[str]] = []
 
     async def fake_run(args: list[str]) -> str:
@@ -126,7 +126,12 @@ async def test_create_window_launches_direct_agent_inside_default_shell_with_lit
             return "@42\n"
         return ""
 
-    manager = TmuxManager(pool_session="web_terminal_acp_pool", default_shell="/bin/bash", runner=fake_run)
+    manager = TmuxManager(
+        pool_session="web_terminal_acp_pool",
+        default_shell="/bin/bash",
+        launcher_dir=tmp_path / "launchers",
+        runner=fake_run,
+    )
 
     target = await manager.create_window(
         "/tmp/project",
@@ -136,7 +141,10 @@ async def test_create_window_launches_direct_agent_inside_default_shell_with_lit
 
     assert target.shell_command == "claude --resume claude-session"
     new_window_call = next(call for call in calls if call[:3] == ["tmux", "new-window", "-P"])
-    assert "exec /bin/bash --rcfile" in new_window_call[-1]
+    launcher_path = tmp_path / "launchers" / "87654321-4321-8765-4321-876543218765.sh"
+    assert new_window_call[-1] == f"exec {launcher_path}"
+    launcher_text = launcher_path.read_text(encoding="utf-8")
+    assert "exec /bin/bash --rcfile" in launcher_text
     assert "claude --dangerously-skip-permissions --resume claude-session" not in new_window_call[-1]
     assert [
         "tmux",
@@ -151,7 +159,43 @@ async def test_create_window_launches_direct_agent_inside_default_shell_with_lit
 
 
 @pytest.mark.asyncio
-async def test_recreate_window_reuses_window_metadata_with_managed_shell():
+async def test_create_window_uses_short_launcher_script_for_managed_shell(tmp_path):
+    calls: list[list[str]] = []
+
+    async def fake_run(args: list[str]) -> str:
+        calls.append(args)
+        if args[:3] == ["tmux", "new-window", "-P"]:
+            return "@42\n"
+        return ""
+
+    manager = TmuxManager(
+        pool_session="web_terminal_acp_pool",
+        default_shell="/bin/bash",
+        server_url="https://control.example.com/with space/it's-ok",
+        launcher_dir=tmp_path / "launchers",
+        runner=fake_run,
+    )
+
+    await manager.create_window(
+        "/tmp/project",
+        "/bin/bash",
+        window_id="87654321-4321-8765-4321-876543218765",
+    )
+
+    new_window_call = next(call for call in calls if call[:3] == ["tmux", "new-window", "-P"])
+    launcher_command = new_window_call[-1]
+    launcher_path = tmp_path / "launchers" / "87654321-4321-8765-4321-876543218765.sh"
+    assert launcher_command == f"exec {launcher_path}"
+    assert len(launcher_command) < 200
+    launcher_text = launcher_path.read_text(encoding="utf-8")
+    assert launcher_text.startswith("#!/bin/sh\n")
+    assert "WEB_TERMINAL_WINDOW_ID=87654321-4321-8765-4321-876543218765" in launcher_text
+    assert "WEB_TERMINAL_PROJECT_PATH=/tmp/project" in launcher_text
+    assert "exec /bin/bash" in launcher_text
+
+
+@pytest.mark.asyncio
+async def test_recreate_window_reuses_window_metadata_with_managed_shell(tmp_path):
     calls: list[list[str]] = []
 
     async def fake_run(args: list[str]) -> str:
@@ -164,6 +208,7 @@ async def test_recreate_window_reuses_window_metadata_with_managed_shell():
         pool_session="web_terminal_acp_pool",
         default_shell="/bin/bash",
         server_url="https://control.example.com",
+        launcher_dir=tmp_path / "launchers",
         runner=fake_run,
     )
     target = await manager.recreate_window(
@@ -181,6 +226,7 @@ async def test_recreate_window_reuses_window_metadata_with_managed_shell():
         window_id="@43",
         cwd="/tmp/project",
         shell_command="/bin/zsh",
+        local_window_id="87654321-4321-8765-4321-876543218765",
     )
     new_window_call = next(call for call in calls if call[:3] == ["tmux", "new-window", "-P"])
     assert new_window_call[:9] == [
@@ -194,7 +240,11 @@ async def test_recreate_window_reuses_window_metadata_with_managed_shell():
         "-c",
         "/tmp/project",
     ]
-    assert "WEB_TERMINAL_WINDOW_ID=87654321-4321-8765-4321-876543218765" in new_window_call[-1]
+    launcher_path = tmp_path / "launchers" / "87654321-4321-8765-4321-876543218765.sh"
+    assert new_window_call[-1] == f"exec {launcher_path}"
+    assert "WEB_TERMINAL_WINDOW_ID=87654321-4321-8765-4321-876543218765" in launcher_path.read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.asyncio

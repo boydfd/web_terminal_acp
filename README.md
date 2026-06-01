@@ -117,6 +117,34 @@ npm run electron:dist:mac:zip
 
 The desktop app defaults to `http://127.0.0.1:8001` for the backend. To connect it to a different server after launch, open **Settings** and set **Backend address** to the reachable backend URL. This runtime setting is stored locally by the desktop app, so release builds do not need a baked `VITE_API_BASE` for every deployment.
 
+## Android App Builds
+
+Debug and local release APKs can be built from the frontend project:
+
+```bash
+cd frontend
+npm run android:build:debug
+npm run android:build:local-release
+```
+
+Use `android:build:local-release` when you need a release-mode APK that can be installed on a device for local validation. The standard `android:build:release` command is for real release artifacts and requires a release keystore; unsigned release APKs are rejected by Android during installation.
+
+Set these environment variables or matching Gradle properties before building a signed release:
+
+```bash
+export WEB_TERMINAL_ANDROID_RELEASE_STORE_FILE=/path/to/release.keystore
+export WEB_TERMINAL_ANDROID_RELEASE_STORE_PASSWORD=...
+export WEB_TERMINAL_ANDROID_RELEASE_KEY_ALIAS=...
+export WEB_TERMINAL_ANDROID_RELEASE_KEY_PASSWORD=...
+npm run android:build:release
+```
+
+If you intentionally need an unsigned APK for external signing, use:
+
+```bash
+npm run android:build:unsigned-release
+```
+
 ## Install A Remote Client
 
 Remote clients let another machine host shells and agent CLIs while Web Terminal remains the control plane. There are two supported paths.

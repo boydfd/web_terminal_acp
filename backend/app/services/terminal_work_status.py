@@ -14,8 +14,9 @@ from app.services.agent_activity_projection import (
     event_activity_time,
     event_is_agent_activity,
     event_is_agent_completion,
+    event_is_agent_user_input,
 )
-from app.services.window_runtime_tags import agent_from_command
+from app.services.window_runtime_tags import agent_command_has_inline_task, agent_from_command
 
 AGENT_ABORT_IDLE_SECONDS = 60 * 60
 AGENT_EVENT_LATE_ARRIVAL_SECONDS = 30
@@ -69,6 +70,7 @@ class _WindowActivityData:
     latest_working_activity: dict[UUID, datetime]
     latest_agent_active_at: dict[UUID, datetime]
     latest_agent_completed_at: dict[UUID, datetime]
+    latest_agent_user_input_at: dict[UUID, datetime]
     latest_commands: dict[UUID, Event]
     finished_sequences: dict[UUID, dict[str, datetime]]
 
@@ -98,6 +100,7 @@ class _WindowActivityData:
 class _WindowAgentActivityState:
     latest_activity: dict[UUID, datetime]
     latest_completed_at: dict[UUID, datetime]
+    latest_user_input_at: dict[UUID, datetime]
 
 
 def to_work_status_out(status: TerminalWorkStatus) -> WorkStatusOut:
@@ -346,10 +349,30 @@ async def _load_window_activity_data(
         agent_command_windows,
         latest_commands=latest_commands,
     )
+    latest_agent_user_input_at = dict(agent_activity.latest_user_input_at)
+    if _dialect_name(session) != "postgresql":
+        projected_user_input_window_ids = [
+            window_id
+            for window_id in window_ids
+            if window_id in agent_activity.latest_activity
+            and window_id not in latest_agent_user_input_at
+            and (
+                (command := latest_commands.get(window_id)) is None
+                or (_event_agent(command) is not None and not _event_has_agent_task(command))
+            )
+        ]
+        latest_agent_user_input_at.update(
+            await _latest_agent_user_input_at_by_window(
+                session,
+                client_id,
+                projected_user_input_window_ids,
+            )
+        )
     latest_working_activity = _merge_latest_working_activity(
         window_ids,
         latest_commands=latest_commands,
         latest_ai=agent_activity.latest_activity,
+        latest_agent_user_input_at=latest_agent_user_input_at,
         finished_sequences=finished_sequences,
         now=current,
     )
@@ -357,6 +380,7 @@ async def _load_window_activity_data(
         window_ids,
         latest_commands=latest_commands,
         latest_ai=agent_activity.latest_activity,
+        latest_agent_user_input_at=latest_agent_user_input_at,
         finished_sequences=finished_sequences,
     )
     latest_agent_completed_at = agent_activity.latest_completed_at
@@ -373,6 +397,7 @@ async def _load_window_activity_data(
         latest_working_activity=latest_working_activity,
         latest_agent_active_at=latest_agent_active_at,
         latest_agent_completed_at=latest_agent_completed_at,
+        latest_agent_user_input_at=latest_agent_user_input_at,
         latest_commands=latest_commands,
         finished_sequences=finished_sequences,
     )
@@ -513,7 +538,7 @@ async def _agent_activity_state_by_window(
     window_ids: list[UUID],
 ) -> _WindowAgentActivityState:
     if not window_ids:
-        return _WindowAgentActivityState({}, {})
+        return _WindowAgentActivityState({}, {}, {})
 
     rows = await session.execute(
         select(
@@ -521,6 +546,7 @@ async def _agent_activity_state_by_window(
             VirtualWindow.agent_activity_latest_at,
             VirtualWindow.agent_activity_latest_event_id,
             VirtualWindow.agent_activity_latest_completed_at,
+            VirtualWindow.agent_activity_latest_user_input_at,
         ).where(
             VirtualWindow.client_id == client_id,
             VirtualWindow.id.in_(window_ids),
@@ -528,10 +554,11 @@ async def _agent_activity_state_by_window(
     )
     latest_activity: dict[UUID, datetime] = {}
     latest_completed_at: dict[UUID, datetime] = {}
+    latest_user_input_at: dict[UUID, datetime] = {}
     missing_window_ids: list[UUID] = []
     stale_projection_window_ids: list[UUID] = []
     stale_projection_event_ids: dict[UUID, UUID] = {}
-    for window_id, activity_at, latest_event_id, completed_at in rows:
+    for window_id, activity_at, latest_event_id, completed_at, user_input_at in rows:
         if activity_at is None:
             missing_window_ids.append(window_id)
         else:
@@ -543,6 +570,11 @@ async def _agent_activity_state_by_window(
                 stale_projection_window_ids.append(window_id)
                 if latest_event_id is not None:
                     stale_projection_event_ids[window_id] = latest_event_id
+        elif latest_event_id is not None:
+            stale_projection_window_ids.append(window_id)
+            stale_projection_event_ids[window_id] = latest_event_id
+        if user_input_at is not None:
+            latest_user_input_at[window_id] = _aware_utc(user_input_at)
 
     dialect_name = _dialect_name(session)
     if dialect_name == "postgresql":
@@ -554,14 +586,17 @@ async def _agent_activity_state_by_window(
                 latest_activity=latest_activity,
                 latest_completed_at=latest_completed_at,
             )
-        return _WindowAgentActivityState(latest_activity, latest_completed_at)
+        return _WindowAgentActivityState(latest_activity, latest_completed_at, latest_user_input_at)
     else:
         fallback_window_ids = sorted({*missing_window_ids, *stale_projection_window_ids})
 
     fallback_events = await _recent_agent_events_by_window(session, client_id, fallback_window_ids)
     latest_activity.update(_latest_ai_activity_by_window(fallback_events))
     latest_completed_at.update(_latest_agent_completed_at_by_window(fallback_events))
-    return _WindowAgentActivityState(latest_activity, latest_completed_at)
+    latest_user_input_at.update(
+        _latest_agent_user_input_at_by_window_from_events(fallback_events)
+    )
+    return _WindowAgentActivityState(latest_activity, latest_completed_at, latest_user_input_at)
 
 
 async def _repair_stale_projected_agent_activity(
@@ -641,6 +676,32 @@ def _latest_ai_activity_by_window(
     for window_id, events in recent_agent_events.items():
         for event in events:
             if not event_is_agent_activity(event):
+                continue
+            activity_at = event_activity_time(event)
+            if window_id not in latest or activity_at > latest[window_id]:
+                latest[window_id] = activity_at
+    return latest
+
+
+async def _latest_agent_user_input_at_by_window(
+    session: AsyncSession,
+    client_id: UUID,
+    window_ids: list[UUID],
+) -> dict[UUID, datetime]:
+    if not window_ids:
+        return {}
+
+    events = await _recent_agent_events_by_window(session, client_id, window_ids)
+    return _latest_agent_user_input_at_by_window_from_events(events)
+
+
+def _latest_agent_user_input_at_by_window_from_events(
+    recent_agent_events: dict[UUID, list[Event]],
+) -> dict[UUID, datetime]:
+    latest: dict[UUID, datetime] = {}
+    for window_id, events in recent_agent_events.items():
+        for event in events:
+            if not event_is_agent_user_input(event):
                 continue
             activity_at = event_activity_time(event)
             if window_id not in latest or activity_at > latest[window_id]:
@@ -748,6 +809,7 @@ def _merge_latest_working_activity(
     *,
     latest_commands: dict[UUID, Event],
     latest_ai: dict[UUID, datetime],
+    latest_agent_user_input_at: dict[UUID, datetime],
     finished_sequences: dict[UUID, dict[str, datetime]],
     now: datetime,
 ) -> dict[UUID, datetime]:
@@ -760,6 +822,7 @@ def _merge_latest_working_activity(
                 window_id,
                 latest_ai_at=latest_ai_at,
                 latest_commands=latest_commands,
+                latest_agent_user_input_at=latest_agent_user_input_at,
                 finished_sequences=finished_sequences,
                 now=now,
             ):
@@ -774,6 +837,7 @@ def _latest_agent_active_at(
     *,
     latest_commands: dict[UUID, Event],
     latest_ai: dict[UUID, datetime],
+    latest_agent_user_input_at: dict[UUID, datetime],
     finished_sequences: dict[UUID, dict[str, datetime]],
 ) -> dict[UUID, datetime]:
     latest: dict[UUID, datetime] = {}
@@ -782,15 +846,28 @@ def _latest_agent_active_at(
         if command is not None:
             if _event_agent(command) is None:
                 continue
+            if (
+                not _event_has_agent_task(command)
+                and window_id not in latest_ai
+                and window_id not in latest_agent_user_input_at
+            ):
+                continue
             sequence = command.payload_json.get("sequence")
             if sequence is None or str(sequence) not in finished_sequences.get(window_id, {}):
                 candidates = [_aware_utc(command.created_at)]
                 if window_id in latest_ai:
                     candidates.append(_aware_utc(latest_ai[window_id]))
+                if window_id in latest_agent_user_input_at:
+                    candidates.append(_aware_utc(latest_agent_user_input_at[window_id]))
                 latest[window_id] = max(candidates)
             continue
         if window_id in latest_ai:
-            latest[window_id] = _aware_utc(latest_ai[window_id])
+            if window_id not in latest_agent_user_input_at:
+                continue
+            latest[window_id] = max(
+                _aware_utc(latest_ai[window_id]),
+                _aware_utc(latest_agent_user_input_at[window_id]),
+            )
     return latest
 
 
@@ -799,14 +876,20 @@ def _agent_command_allows_ai_activity(
     *,
     latest_ai_at: datetime,
     latest_commands: dict[UUID, Event],
+    latest_agent_user_input_at: dict[UUID, datetime],
     finished_sequences: dict[UUID, dict[str, datetime]],
     now: datetime,
 ) -> bool:
     command = latest_commands.get(window_id)
     if command is None:
-        return True
+        user_input_at = latest_agent_user_input_at.get(window_id)
+        return user_input_at is not None and latest_ai_at >= _aware_utc(user_input_at)
     if _event_agent(command) is None:
         return False
+    if not _event_has_agent_task(command):
+        user_input_at = latest_agent_user_input_at.get(window_id)
+        if user_input_at is None or latest_ai_at < user_input_at:
+            return False
     sequence = command.payload_json.get("sequence")
     if sequence is None:
         return True
@@ -1009,6 +1092,13 @@ def _event_agent(event: Event | None) -> str | None:
         return None
     command = event.payload_json.get("command")
     return agent_from_command(command if isinstance(command, str) else None)
+
+
+def _event_has_agent_task(event: Event | None) -> bool:
+    if event is None:
+        return False
+    command = event.payload_json.get("command")
+    return agent_command_has_inline_task(command if isinstance(command, str) else None)
 
 
 def _aware_utc(value: datetime) -> datetime:

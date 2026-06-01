@@ -1,5 +1,12 @@
 apply plugin: 'com.android.application'
 
+def releaseStoreFilePath = project.findProperty("WEB_TERMINAL_ANDROID_RELEASE_STORE_FILE") ?: System.getenv("WEB_TERMINAL_ANDROID_RELEASE_STORE_FILE")
+def releaseStorePassword = project.findProperty("WEB_TERMINAL_ANDROID_RELEASE_STORE_PASSWORD") ?: System.getenv("WEB_TERMINAL_ANDROID_RELEASE_STORE_PASSWORD")
+def releaseKeyAlias = project.findProperty("WEB_TERMINAL_ANDROID_RELEASE_KEY_ALIAS") ?: System.getenv("WEB_TERMINAL_ANDROID_RELEASE_KEY_ALIAS")
+def releaseKeyPassword = project.findProperty("WEB_TERMINAL_ANDROID_RELEASE_KEY_PASSWORD") ?: System.getenv("WEB_TERMINAL_ANDROID_RELEASE_KEY_PASSWORD")
+def hasReleaseSigningConfig = releaseStoreFilePath && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+def allowUnsignedRelease = (project.findProperty("WEB_TERMINAL_ANDROID_ALLOW_UNSIGNED_RELEASE") ?: System.getenv("WEB_TERMINAL_ANDROID_ALLOW_UNSIGNED_RELEASE") ?: "false").toString().toBoolean()
+
 android {
     namespace = "com.webterminal.acp"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -7,8 +14,8 @@ android {
         applicationId "com.webterminal.acp"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 21723
-        versionName "2.17.23"
+        versionCode 21806
+        versionName "2.18.6"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -16,10 +23,28 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        if (hasReleaseSigningConfig) {
+            release {
+                storeFile file(releaseStoreFilePath)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
     buildTypes {
         release {
+            if (hasReleaseSigningConfig) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+        localRelease {
+            initWith release
+            matchingFallbacks = ['release']
+            signingConfig signingConfigs.debug
         }
     }
 }
@@ -43,6 +68,12 @@ dependencies {
 }
 
 apply from: 'capacitor.build.gradle'
+
+gradle.taskGraph.whenReady { taskGraph ->
+    if (taskGraph.hasTask(":app:assembleRelease") && !hasReleaseSigningConfig && !allowUnsignedRelease) {
+        throw new GradleException("assembleRelease requires release signing credentials. Use assembleLocalRelease for an installable local APK, or set WEB_TERMINAL_ANDROID_ALLOW_UNSIGNED_RELEASE=true when you intentionally need an unsigned APK for external signing.")
+    }
+}
 
 try {
     def servicesJSON = file('google-services.json')

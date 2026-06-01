@@ -1,8 +1,11 @@
 import asyncio
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 
+import app.client_agent.runner as client_agent_runner
+from app.client_agent.config import ClientAgentConfig
 from app.services.agent_config import AgentConfig, AgentConfigItem, AgentConfigSection
 from app.client_agent.runner import _handle_agent_message, _should_restore_agent_tool_watcher
 from app.client_agent.tmux_runtime import ClientRuntimeWindow
@@ -66,6 +69,38 @@ def test_should_restore_agent_tool_watcher_requires_managed_marker() -> None:
             managed_agent_tools=True,
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_run_client_agent_uses_capped_reconnect_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    client_id = UUID("12345678-1234-5678-1234-567812345678")
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def fake_run_once(config: ClientAgentConfig) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 7:
+            raise OSError("network unavailable")
+        return True
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(client_agent_runner, "_run_client_agent_once", fake_run_once)
+    monkeypatch.setattr(client_agent_runner.asyncio, "sleep", fake_sleep)
+
+    config = ClientAgentConfig(
+        client_id=client_id,
+        token="secret-token",
+        server_url="http://control.example.com",
+        name="edge-client",
+        install_path=Path("/opt/web-terminal-acp-client"),
+    )
+
+    await client_agent_runner.run_client_agent(config)
+
+    assert sleeps == [1, 2, 4, 8, 16, 30, 30]
 
 
 @pytest.mark.asyncio

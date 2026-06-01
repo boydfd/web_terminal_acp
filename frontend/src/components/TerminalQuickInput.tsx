@@ -106,6 +106,10 @@ export function TerminalQuickInput({
   }, [localValue]);
 
   const submitValue = (draft: string) => {
+    if (compositionActiveRef.current) {
+      return;
+    }
+
     const submitted = onSubmit(draft);
     if (submitted === true) {
       setLocalValue("");

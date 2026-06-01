@@ -292,7 +292,7 @@ async def test_existing_pending_job_updates_run_after_reason_and_generation(db_s
 async def test_first_agent_activity_after_idle_schedules_summary(db_session):
     window = await create_window(db_session)
     agent_at = datetime(2026, 5, 21, 12, 0, tzinfo=timezone.utc)
-    event = await add_agent_event(db_session, window, agent_at, fingerprint="agent-1")
+    event = await add_agent_event(db_session, window, agent_at, fingerprint="agent-1", kind="user_message")
 
     job = await schedule_summary_after_agent_activity(db_session, window, event=event)
 
@@ -307,7 +307,7 @@ async def test_first_agent_activity_after_idle_schedules_summary(db_session):
 async def test_first_agent_activity_ignores_current_event_in_prior_idle_check(db_session):
     window = await create_window(db_session)
     agent_at = datetime(2026, 5, 21, 12, 0, tzinfo=timezone.utc)
-    event = await add_agent_event(db_session, window, agent_at, fingerprint="agent-current")
+    event = await add_agent_event(db_session, window, agent_at, fingerprint="agent-current", kind="user_message")
 
     job = await schedule_summary_after_agent_activity(db_session, window, event=event)
 
@@ -333,7 +333,12 @@ async def test_agent_activity_scheduler_avoids_terminal_output_scans(counted_db_
     db_session, statements = counted_db_session
     window = await create_window(db_session)
     agent_at = datetime(2026, 5, 21, 12, 0, tzinfo=timezone.utc)
-    event = await add_agent_event(db_session, window, agent_at, fingerprint="agent-no-output-scan")
+    event = await add_agent_event(
+        db_session,
+        window,
+        agent_at,
+        fingerprint="agent-no-output-scan",
+    )
     statements.clear()
 
     job = await schedule_summary_after_agent_activity(db_session, window, event=event)
@@ -362,7 +367,7 @@ async def test_agent_activity_scheduler_avoids_terminal_output_scans(counted_db_
 async def test_duplicate_agent_activity_does_not_advance_generation(db_session):
     window = await create_window(db_session)
     agent_at = datetime(2026, 5, 21, 12, 0, tzinfo=timezone.utc)
-    event = await add_agent_event(db_session, window, agent_at, fingerprint="agent-repeat")
+    event = await add_agent_event(db_session, window, agent_at, fingerprint="agent-repeat", kind="user_message")
 
     first_job = await schedule_summary_after_agent_activity(db_session, window, event=event)
     second_job = await schedule_summary_after_agent_activity(db_session, window, event=event)
@@ -399,6 +404,72 @@ async def test_agent_completion_updates_window_activity_completion_state(db_sess
 
     assert window.agent_activity_latest_at == completed_at
     assert window.agent_activity_latest_completed_at == completed_at
+
+
+@pytest.mark.asyncio
+async def test_agent_user_message_updates_window_user_input_projection(db_session):
+    window = await create_window(db_session)
+    user_input_at = datetime(2026, 5, 21, 12, 0, tzinfo=timezone.utc)
+    event = await add_agent_event(
+        db_session,
+        window,
+        user_input_at,
+        fingerprint="agent-user-input-projection",
+        kind="user_message",
+    )
+
+    await schedule_summary_after_agent_activity(db_session, window, event=event)
+
+    assert window.agent_activity_latest_at == user_input_at
+    assert window.agent_activity_latest_user_input_at == user_input_at
+
+
+@pytest.mark.asyncio
+async def test_late_user_message_updates_projection_without_rewinding_activity(db_session):
+    window = await create_window(db_session)
+    output_at = datetime(2026, 5, 21, 12, 0, 10, tzinfo=timezone.utc)
+    user_input_at = output_at - timedelta(seconds=5)
+    window.agent_activity_latest_at = output_at
+    event = await add_agent_event(
+        db_session,
+        window,
+        user_input_at,
+        fingerprint="late-agent-user-input-projection",
+        kind="user_message",
+    )
+
+    await schedule_summary_after_agent_activity(db_session, window, event=event)
+
+    assert window.agent_activity_latest_at == output_at
+    assert window.agent_activity_latest_user_input_at == user_input_at
+
+
+@pytest.mark.asyncio
+async def test_agent_session_meta_does_not_update_activity_state(db_session):
+    window = await create_window(db_session)
+    event_at = datetime(2026, 5, 21, 12, 0, tzinfo=timezone.utc)
+    event = Event(
+        client_id=window.client_id,
+        source_type=EventSourceType.agent_tool_record,
+        source_id="codex-session-1",
+        kind="session_meta",
+        virtual_window_id=window.id,
+        payload_json={
+            "provider": "codex",
+            "raw_type": "session_meta",
+            "payload": {"id": "codex-session-1"},
+        },
+        fingerprint="agent-session-meta-not-work",
+        created_at=event_at,
+    )
+    db_session.add(event)
+    await db_session.flush()
+
+    job = await schedule_summary_after_agent_activity(db_session, window, event=event)
+
+    assert job is None
+    assert window.agent_activity_latest_at is None
+    assert window.agent_activity_latest_event_id is None
 
 
 @pytest.mark.asyncio
@@ -475,10 +546,16 @@ async def test_repeat_agent_events_in_same_burst_do_not_reschedule_after_summary
             created_at=first_at + timedelta(minutes=3),
         )
     )
-    await add_agent_event(db_session, window, first_at, fingerprint="agent-1")
-    first_event = await add_agent_event(db_session, window, first_at, fingerprint="agent-3")
+    await add_agent_event(db_session, window, first_at, fingerprint="agent-1", kind="user_message")
+    first_event = await add_agent_event(db_session, window, first_at, fingerprint="agent-3", kind="user_message")
     await schedule_summary_after_agent_activity(db_session, window, event=first_event)
-    event = await add_agent_event(db_session, window, second_at, fingerprint="agent-2")
+    event = await add_agent_event(
+        db_session,
+        window,
+        second_at,
+        fingerprint="agent-2",
+        kind="user_message",
+    )
 
     job = await schedule_summary_after_agent_activity(db_session, window, event=event)
 
@@ -498,9 +575,21 @@ async def test_new_agent_burst_after_idle_schedules_again(db_session):
             created_at=first_burst + timedelta(minutes=3),
         )
     )
-    first_event = await add_agent_event(db_session, window, first_burst, fingerprint="agent-1")
+    first_event = await add_agent_event(
+        db_session,
+        window,
+        first_burst,
+        fingerprint="agent-1",
+        kind="user_message",
+    )
     await schedule_summary_after_agent_activity(db_session, window, event=first_event)
-    event = await add_agent_event(db_session, window, second_burst, fingerprint="agent-2")
+    event = await add_agent_event(
+        db_session,
+        window,
+        second_burst,
+        fingerprint="agent-2",
+        kind="user_message",
+    )
 
     job = await schedule_summary_after_agent_activity(db_session, window, event=event)
 

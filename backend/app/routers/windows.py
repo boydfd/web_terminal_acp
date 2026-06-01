@@ -1003,7 +1003,11 @@ async def _kill_runtime_window(
         if window.tmux_session and window.tmux_window_id:
             with contextlib.suppress(Exception):
                 await tmux_manager.kill_window(
-                    TmuxTarget(session=window.tmux_session, window_id=window.tmux_window_id)
+                    TmuxTarget(
+                        session=window.tmux_session,
+                        window_id=window.tmux_window_id,
+                        local_window_id=window.id,
+                    )
                 )
         return
 

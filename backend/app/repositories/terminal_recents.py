@@ -10,7 +10,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import TerminalRecentUsage, VirtualWindow
+from app.models import Client, TerminalRecentUsage, VirtualWindow
 
 MAX_TERMINAL_RECENTS = 1000
 DEFAULT_TERMINAL_RECENTS_PAGE_SIZE = 20
@@ -227,6 +227,67 @@ async def list_terminal_recents(
         .limit(page_size)
     )
     return [(usage, window_title or usage.title) for usage, window_title in rows.all()], total_count
+
+
+def _global_terminal_recents_base_query(query: str | None):
+    stmt = (
+        select(TerminalRecentUsage, VirtualWindow.title, Client.name)
+        .outerjoin(VirtualWindow, TerminalRecentUsage.window_id == VirtualWindow.id)
+        .join(Client, TerminalRecentUsage.client_id == Client.id)
+    )
+    if query:
+        pattern = _recent_title_search_pattern(query)
+        stmt = stmt.where(
+            or_(
+                TerminalRecentUsage.title.ilike(pattern, escape="\\"),
+                VirtualWindow.title.ilike(pattern, escape="\\"),
+                Client.name.ilike(pattern, escape="\\"),
+            )
+        )
+    return stmt
+
+
+async def list_global_terminal_recents(
+    session: AsyncSession,
+    *,
+    page: int,
+    page_size: int,
+    query: str | None = None,
+) -> tuple[list[tuple[TerminalRecentUsage, str, str]], int]:
+    normalized_query = query.strip() if query else None
+    if normalized_query == "":
+        normalized_query = None
+
+    count_stmt = (
+        select(func.count(TerminalRecentUsage.id))
+        .select_from(TerminalRecentUsage)
+        .outerjoin(VirtualWindow, TerminalRecentUsage.window_id == VirtualWindow.id)
+        .join(Client, TerminalRecentUsage.client_id == Client.id)
+    )
+    if normalized_query:
+        pattern = _recent_title_search_pattern(normalized_query)
+        count_stmt = count_stmt.where(
+            or_(
+                TerminalRecentUsage.title.ilike(pattern, escape="\\"),
+                VirtualWindow.title.ilike(pattern, escape="\\"),
+                Client.name.ilike(pattern, escape="\\"),
+            )
+        )
+    total_count = int(await session.scalar(count_stmt) or 0)
+    if total_count == 0:
+        return [], 0
+
+    offset = (page - 1) * page_size
+    rows = await session.execute(
+        _global_terminal_recents_base_query(normalized_query)
+        .order_by(TerminalRecentUsage.last_used_at.desc(), TerminalRecentUsage.id.desc())
+        .offset(offset)
+        .limit(page_size)
+    )
+    return [
+        (usage, window_title or usage.title, client_name)
+        for usage, window_title, client_name in rows.all()
+    ], total_count
 
 
 def total_pages(total: int, page_size: int) -> int:

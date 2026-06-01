@@ -138,7 +138,7 @@ def test_alembic_revision_graph_has_unique_single_head():
     revisions = [revision.revision for revision in script.walk_revisions()]
 
     assert len(revisions) == len(set(revisions))
-    assert script.get_heads() == ["20260531_0029"]
+    assert script.get_heads() == ["20260531_0030"]
 
 
 def test_sqlite_alembic_upgrade_from_ambiguous_0028_creates_terminal_notifications(
@@ -296,6 +296,7 @@ def test_metadata_schema_constraints_match_spec():
     assert VirtualWindow.__table__.c.agent_activity_latest_at.nullable is True
     assert VirtualWindow.__table__.c.agent_activity_latest_event_id.nullable is True
     assert VirtualWindow.__table__.c.agent_activity_latest_completed_at.nullable is True
+    assert VirtualWindow.__table__.c.agent_activity_latest_user_input_at.nullable is True
     assert VirtualWindow.__table__.c.agent_activity_burst_start_at.nullable is True
     assert VirtualWindow.__table__.c.agent_activity_generation.nullable is False
     assert AiSession.__table__.c.client_id.nullable is False

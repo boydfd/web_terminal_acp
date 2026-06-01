@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.db import Base, get_session
 from app.main import app
 from app.models import LOCAL_CLIENT_ID, TerminalRecentUsage
-from app.repositories.clients import ensure_local_client
+from app.repositories.clients import create_client, ensure_local_client
 from app.repositories.windows import create_window
 
 
@@ -183,6 +183,44 @@ async def test_search_terminal_recents_by_query(db_client):
     assert body["total"] == 1
     assert body["items"][0]["window_id"] == str(alpha.id)
     assert body["items"][0]["title"] == "Alpha workspace"
+
+
+@pytest.mark.asyncio
+async def test_list_global_terminal_recents_across_clients(db_client):
+    local_client_id = str(LOCAL_CLIENT_ID)
+    async with db_client.session_factory() as session:
+        remote_client, _token = await create_client(session, name="remote-alpha")
+        local_window = await create_window(session, LOCAL_CLIENT_ID, None, None)
+        local_window.title = "Local terminal"
+        remote_window = await create_window(session, remote_client.id, None, None)
+        remote_window.title = "Remote terminal"
+        remote_client_id = str(remote_client.id)
+        await session.commit()
+
+    local_recent = await db_client.post(
+        f"/api/clients/{local_client_id}/terminal-recents",
+        json={"window_id": str(local_window.id), "title": "Local terminal"},
+    )
+    assert local_recent.status_code == 200
+    remote_recent = await db_client.post(
+        f"/api/clients/{remote_client_id}/terminal-recents",
+        json={"window_id": str(remote_window.id), "title": "Remote terminal"},
+    )
+    assert remote_recent.status_code == 200
+
+    listing = await db_client.get("/api/terminal-recents?page=1&page_size=20")
+    assert listing.status_code == 200
+    body = listing.json()
+    assert body["total"] == 2
+    assert [item["client_id"] for item in body["items"]] == [remote_client_id, local_client_id]
+    assert [item["window_id"] for item in body["items"]] == [str(remote_window.id), str(local_window.id)]
+    assert body["items"][0]["client_name"] == "remote-alpha"
+
+    search = await db_client.get("/api/terminal-recents?q=remote-alpha&page=1&page_size=20")
+    assert search.status_code == 200
+    search_body = search.json()
+    assert search_body["total"] == 1
+    assert search_body["items"][0]["client_id"] == remote_client_id
 
 
 @pytest.mark.asyncio

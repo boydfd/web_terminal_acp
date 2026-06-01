@@ -1,4 +1,4 @@
-.PHONY: preflight/init preflight/check-vm-max-map-count build-images services-up deploy-up deploy-recreate app-recreate services-down postgres-vacuum backend-test backend-smoke backend-dev frontend-install frontend-build frontend-dev smoke
+.PHONY: preflight/init preflight/check-vm-max-map-count build-images services-up deploy-up deploy-recreate app-recreate services-down postgres-vacuum backend-test backend-smoke backend-dev frontend-install frontend-build frontend-dev android-debug android-local-release android-release android-unsigned-release android-release-verify smoke
 
 DATA_ROOT ?= ./data
 ES_VM_MAX_MAP_COUNT_MIN ?= 262144
@@ -66,6 +66,21 @@ frontend-build:
 
 frontend-dev:
 	cd frontend && npm run dev -- --host 127.0.0.1
+
+android-debug:
+	.cursor/skills/android-app-release/scripts/build-android.sh debug
+
+android-local-release:
+	.cursor/skills/android-app-release/scripts/build-android.sh local-release
+
+android-release:
+	.cursor/skills/android-app-release/scripts/build-android.sh release
+
+android-unsigned-release:
+	.cursor/skills/android-app-release/scripts/build-android.sh unsigned-release
+
+android-release-verify:
+	.cursor/skills/android-app-release/scripts/build-android.sh release
 
 smoke:
 	$(MAKE) services-up

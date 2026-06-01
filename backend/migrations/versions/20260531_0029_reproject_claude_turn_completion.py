@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import os
 
 from alembic import op
 import sqlalchemy as sa
@@ -42,6 +43,8 @@ def upgrade() -> None:
     _ensure_terminal_notification_states_table()
 
     if op.get_bind().dialect.name != "postgresql":
+        return
+    if os.environ.get("WEB_TERMINAL_RUN_HEAVY_ACTIVITY_REPROJECTION") != "1":
         return
 
     op.execute(

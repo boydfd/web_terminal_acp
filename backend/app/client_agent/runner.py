@@ -84,11 +84,8 @@ async def _run_client_agent_once(config: ClientAgentConfig) -> bool:
         "client-agent connecting",
         extra={"client_id": str(config.client_id), "websocket_url": config.websocket_url},
     )
-    async with websockets.connect(
-        config.websocket_url,
-        ping_interval=None,
-        **{header_argument: headers},
-    ) as control_websocket:
+    connect_kwargs = _websocket_connect_kwargs(config, headers, header_argument)
+    async with websockets.connect(config.websocket_url, **connect_kwargs) as control_websocket:
         await control_websocket.send(
             encode_agent_message(
                 AgentMessage(
@@ -112,11 +109,7 @@ async def _run_client_agent_once(config: ClientAgentConfig) -> bool:
             "client-agent bulk websocket connecting",
             extra={"client_id": str(config.client_id), "websocket_url": config.bulk_websocket_url},
         )
-        async with websockets.connect(
-            config.bulk_websocket_url,
-            ping_interval=None,
-            **{header_argument: headers},
-        ) as bulk_websocket:
+        async with websockets.connect(config.bulk_websocket_url, **connect_kwargs) as bulk_websocket:
             await bulk_websocket.send(
                 encode_agent_message(
                     AgentMessage(
@@ -237,6 +230,18 @@ async def _run_client_agent_once(config: ClientAgentConfig) -> bool:
                 await bulk_writer.close()
 
     return False
+
+
+def _websocket_connect_kwargs(
+    config: ClientAgentConfig,
+    headers: dict[str, str],
+    header_argument: str,
+) -> dict[str, object]:
+    return {
+        header_argument: headers,
+        "ping_interval": config.websocket_ping_interval_seconds,
+        "ping_timeout": config.websocket_ping_timeout_seconds,
+    }
 
 
 def _should_restore_agent_tool_watcher(window: ClientRuntimeWindow) -> bool:

@@ -1,5 +1,7 @@
 export type KeyboardShortcutId =
   | "switch-terminal"
+  | "switch-terminal-global"
+  | "switch-client"
   | "new-terminal"
   | "new-terminal-project"
   | "quick-input"
@@ -26,6 +28,8 @@ export type KeyboardShortcutBindings = Partial<Record<KeyboardShortcutId, Keyboa
 
 export const KEYBOARD_SHORTCUT_DEFINITIONS: KeyboardShortcutDefinition[] = [
   { id: "switch-terminal", label: "切换终端", defaultShortcut: { key: "w", alt: true } },
+  { id: "switch-terminal-global", label: "跨 Client 切换终端", defaultShortcut: { key: "w", alt: true, shift: true } },
+  { id: "switch-client", label: "切换 Client", defaultShortcut: { key: "c", alt: true, shift: true } },
   { id: "new-terminal", label: "新建终端", defaultShortcut: { key: "n", alt: true } },
   { id: "new-terminal-project", label: "按项目新建", defaultShortcut: { key: "n", alt: true, shift: true } },
   { id: "quick-input", label: "快速输入", defaultShortcut: { key: "i", alt: true } },

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type {
   AgentChatRecord,
@@ -10,6 +10,7 @@ import type {
   AgentSession
 } from "../types";
 import { TerminalQuickInput } from "./TerminalQuickInput";
+import { useOverlayFocus } from "./useOverlayFocus";
 
 type EventTone =
   | "base-instructions"
@@ -652,6 +653,7 @@ export function AgentRecordModal({
   onClose
 }: AgentRecordModalProps) {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
   const sortedSessions = useMemo(() => sortSessionsNewestFirst(sessions), [sessions]);
   const hasMultipleSessions = sortedSessions.length > 1;
   const activeSessionId = selectedSessionId ?? pickLatestSessionId(sortedSessions);
@@ -686,23 +688,16 @@ export function AgentRecordModal({
     setSelectedSessionId(pickLatestSessionId(sortedSessions));
   }, [open, selectedSessionId, sortedSessions]);
 
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
+  const handleEscape = useCallback(() => {
+    onClose();
+  }, [onClose]);
 
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented) {
-        return;
-      }
-      event.preventDefault();
-      event.stopPropagation();
-      onClose();
-    };
-
-    window.addEventListener("keydown", handleKeyDown, { capture: true });
-    return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
-  }, [onClose, open]);
+  useOverlayFocus({
+    isOpen: open,
+    ref: panelRef,
+    onEscape: handleEscape,
+    preserveExistingFocus: true
+  });
 
   const sessionTabs = hasMultipleSessions && activeSessionId
     ? (
@@ -728,7 +723,7 @@ export function AgentRecordModal({
   return (
     <div className="agent-record-modal" role="dialog" aria-modal="true" aria-label="Agent record">
       <button type="button" className="agent-record-modal-backdrop" aria-label="Collapse agent record" onClick={onClose} />
-      <section className="agent-record-modal-panel">
+      <section ref={panelRef} className="agent-record-modal-panel">
         <div className="agent-record-header">
           <div>
             <h3>Agent Record</h3>

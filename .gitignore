@@ -9,9 +9,17 @@ backend/htmlcov/
 frontend/node_modules/
 frontend/dist/
 frontend/release/
+.release/
 .superpowers/
-.claude/
 .learnings/
+# Claude local state (project skills under .claude/skills/ are tracked)
+.claude/*
+!.claude/skills/
+!.claude/skills/**
+# Codex project skills are tracked
+.codex/*
+!.codex/skills/
+!.codex/skills/**
 # Cursor IDE local state (project skills under .cursor/skills/ are tracked)
 .cursor/*
 !.cursor/skills/

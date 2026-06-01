@@ -115,6 +115,34 @@ npm run electron:dist:mac:zip
 
 桌面应用默认连接 `http://127.0.0.1:8001`。如需连接其他 server，启动后打开 **Settings**，把 **后端地址** 设置为可访问的 backend URL。该运行时设置会保存在桌面应用本地，因此发布包不需要为每个部署环境烘焙不同的 `VITE_API_BASE`。
 
+## Android 应用构建
+
+可在 frontend 项目中构建 debug 和本地 release APK：
+
+```bash
+cd frontend
+npm run android:build:debug
+npm run android:build:local-release
+```
+
+需要在真机上安装 release-mode 包做本地验收时，使用 `android:build:local-release`。标准 `android:build:release` 用于正式发布包，需要 release keystore；未签名 release APK 会被 Android 安装器拒绝安装。
+
+正式签名 release 构建前，设置以下环境变量或同名 Gradle properties：
+
+```bash
+export WEB_TERMINAL_ANDROID_RELEASE_STORE_FILE=/path/to/release.keystore
+export WEB_TERMINAL_ANDROID_RELEASE_STORE_PASSWORD=...
+export WEB_TERMINAL_ANDROID_RELEASE_KEY_ALIAS=...
+export WEB_TERMINAL_ANDROID_RELEASE_KEY_PASSWORD=...
+npm run android:build:release
+```
+
+如果明确需要未签名 APK 交给外部签名流程，使用：
+
+```bash
+npm run android:build:unsigned-release
+```
+
 ## 安装 Remote Client
 
 remote client 让另一台机器承载 shell 和 Agent CLI，而 Web Terminal 继续作为控制面。有两种方式。

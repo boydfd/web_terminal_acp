@@ -26,6 +26,8 @@ class ClientAgentConfig(BaseModel):
     client_daemon_session: str = "web_terminal_acp_client"
     reconnect_initial_delay_seconds: float = 1
     reconnect_max_delay_seconds: float = 30
+    websocket_ping_interval_seconds: float | None = 10
+    websocket_ping_timeout_seconds: float | None = 10
     default_shell: str = Field(default_factory=default_user_shell)
 
     @classmethod

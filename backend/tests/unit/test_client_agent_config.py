@@ -103,6 +103,10 @@ def test_load_populates_required_fields_defaults_and_https_websocket_url(tmp_pat
     assert config.install_path == Path("/opt/web-terminal-acp-client")
     assert config.tmux_pool_session == "web_terminal_acp_pool"
     assert config.client_daemon_session == "web_terminal_acp_client"
+    assert config.reconnect_initial_delay_seconds == 1
+    assert config.reconnect_max_delay_seconds == 30
+    assert config.websocket_ping_interval_seconds == 10
+    assert config.websocket_ping_timeout_seconds == 10
     assert config.default_shell == default_user_shell()
     assert config.websocket_url == "wss://control.example.com/api/client-agent/ws"
 
@@ -339,6 +343,7 @@ async def test_run_client_agent_handles_inventory_and_tmux_commands(monkeypatch)
             self._sent_messages.append(json.loads(message))
 
         async def recv(self) -> str:
+            await asyncio.sleep(0)
             return encode_agent_message(self._incoming.pop(0))
 
     class FakeConnection:
@@ -390,12 +395,12 @@ async def test_run_client_agent_handles_inventory_and_tmux_commands(monkeypatch)
         (
             "ws://control.example.com/api/client-agent/ws",
             expected_headers,
-            {"ping_interval": None},
+            {"ping_interval": 10, "ping_timeout": 10},
         ),
         (
             "ws://control.example.com/api/client-agent/bulk-ws",
             expected_headers,
-            {"ping_interval": None},
+            {"ping_interval": 10, "ping_timeout": 10},
         ),
     ]
     assert control_sent_messages[0] == {

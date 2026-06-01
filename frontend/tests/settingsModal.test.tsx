@@ -1,6 +1,6 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SettingsModal } from "../src/components/SettingsModal";
 import type { KeyboardShortcutBindings } from "../src/keyboardShortcuts";
@@ -10,6 +10,10 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
+
+beforeEach(() => {
+  vi.useFakeTimers();
+});
 
 function renderSettingsModal(options: {
   keyboardShortcutBindings?: KeyboardShortcutBindings;
@@ -56,10 +60,44 @@ afterEach(() => {
   root = null;
   container = null;
   window.localStorage.clear();
+  document.body.replaceChildren();
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
 describe("SettingsModal", () => {
+  it("takes focus from a focused terminal textarea and closes before terminal Escape handling", () => {
+    const terminalTextarea = document.createElement("textarea");
+    terminalTextarea.className = "xterm-helper-textarea";
+    const terminalEscapeHandler = vi.fn((event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+    terminalTextarea.addEventListener("keydown", terminalEscapeHandler);
+    document.body.appendChild(terminalTextarea);
+    terminalTextarea.focus();
+
+    const onClose = vi.fn();
+    renderSettingsModal({ onClose });
+
+    act(() => {
+      vi.advanceTimersByTime(16);
+    });
+
+    expect(document.activeElement).toBe(container?.querySelector(".settings-modal"));
+
+    act(() => {
+      terminalTextarea.dispatchEvent(new KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        key: "Escape"
+      }));
+    });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(terminalEscapeHandler).not.toHaveBeenCalled();
+  });
+
   it("closes when Escape is pressed", () => {
     const onClose = vi.fn();
     renderSettingsModal({ onClose });

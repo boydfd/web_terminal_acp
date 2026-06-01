@@ -282,8 +282,7 @@ __web_terminal_prepare_cursor_home() {
     rm -f "$managed_cursor/chats" 2>/dev/null || true
     mkdir -p "$managed_cursor/chats" 2>/dev/null || true
   fi
-  for item in "$source_cursor"/*; do
-    [ -e "$item" ] || continue
+  find "$source_cursor" -mindepth 1 -maxdepth 1 2>/dev/null | while IFS= read -r item; do
     base="${item##*/}"
     case "$base" in
       chats) continue ;;

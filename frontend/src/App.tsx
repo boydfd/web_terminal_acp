@@ -27,6 +27,7 @@ import {
 import { AddClientModal } from "./components/AddClientModal";
 import { AgentRecordModal } from "./components/AgentRecordViewer";
 import { ClientList } from "./components/ClientList";
+import { ClientSwitcher } from "./components/ClientSwitcher";
 import { FolderTree } from "./components/FolderTree";
 import { GitDiffBrowserModal } from "./components/GitDiffBrowserModal";
 import { BackendConnectionGate, LoginGate } from "./components/LoginGate";
@@ -44,7 +45,11 @@ import {
 import { useAgentRecordData } from "./hooks/useAgentRecordData";
 import { readMobileLayout, useMobileLayout } from "./hooks/useMobileLayout";
 import { readInitialSettings, SettingsModal, type SettingsView } from "./components/SettingsModal";
-import { TerminalSwitcher, type TerminalSwitcherMode } from "./components/TerminalSwitcher";
+import {
+  TerminalSwitcher,
+  type TerminalSwitcherMode,
+  type TerminalSwitcherRecentScope
+} from "./components/TerminalSwitcher";
 import { WindowDetail } from "./components/WindowDetail";
 import {
   type SummaryOutputLanguage,
@@ -109,6 +114,8 @@ type TerminalViewportMode = "desktop" | "phone" | "fixed";
 type AddClientMode = "bootstrap" | "registration";
 
 const TERMINAL_VIEWPORT_STORAGE_KEY = "web-terminal-acp:terminal-viewport-mode";
+const CLIENT_WINDOW_SELECTION_STORAGE_KEY = "web-terminal-acp:client-window-selections";
+const CLIENT_RECENCY_STORAGE_KEY = "web-terminal-acp:client-recency";
 const TERMINAL_ENTER_INPUT = "\r";
 const MOBILE_SHORTCUT_DIRECTION_INPUT: Record<MobileShortcutDirection, string> = {
   up: "\x1b[A",
@@ -173,12 +180,12 @@ function buildOnboardingSteps(shortcuts: OnboardingShortcutLabels): OnboardingSt
     },
     {
       id: "new-terminal",
-      title: "新建普通终端或 Agent 终端",
-      body: "New terminal 默认是普通 shell。切到 Codex、Claude Code 或 Cursor 后，会按配置启动 Agent；按项目新建会自动带上项目路径。",
-      path: ["New terminal", "选择 Shell / Codex / Claude Code / Cursor"],
+      title: "直接新建普通终端",
+      body: "New terminal 会立即创建普通 shell，不再先选择 Agent。需要按项目新建或配置 Agent 时，可以使用项目/分组里的配置入口。",
+      path: ["New terminal"],
       shortcutLabels: [shortcuts.newTerminal, `${shortcuts.newTerminalProject} 按项目新建`],
-      targetId: "terminal-create-modal",
-      action: "new-terminal"
+      targetId: "new-terminal-button",
+      action: "details"
     },
     {
       id: "terminal-pane",
@@ -246,6 +253,13 @@ type TerminalRouteSelection = {
   clientId: string | null;
   windowId: string | null;
 };
+
+type ClientWindowSelection = {
+  windowId: string | null;
+  usedAt: number;
+};
+
+type ClientWindowSelections = Record<string, ClientWindowSelection>;
 
 type DeleteWindowVariables = {
   clientId: string;
@@ -459,6 +473,70 @@ function writeTerminalRoute(clientId: string | null, windowId: string | null, mo
   window.history[method]({ clientId, windowId }, "", nextPath);
 }
 
+function readJsonObjectStorage(key: string): Record<string, unknown> {
+  if (typeof window === "undefined") {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(key) ?? "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function readClientWindowSelections(): ClientWindowSelections {
+  const parsed = readJsonObjectStorage(CLIENT_WINDOW_SELECTION_STORAGE_KEY);
+  const selections: ClientWindowSelections = {};
+  for (const [clientId, value] of Object.entries(parsed)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      continue;
+    }
+    const record = value as Record<string, unknown>;
+    selections[clientId] = {
+      windowId: typeof record.windowId === "string" ? record.windowId : null,
+      usedAt: typeof record.usedAt === "number" && Number.isFinite(record.usedAt) ? record.usedAt : 0
+    };
+  }
+  return selections;
+}
+
+function writeClientWindowSelections(selections: ClientWindowSelections): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(CLIENT_WINDOW_SELECTION_STORAGE_KEY, JSON.stringify(selections));
+}
+
+function readClientRecency(): string[] {
+  if (typeof window === "undefined") {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(CLIENT_RECENCY_STORAGE_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeClientRecency(clientIds: string[]): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(CLIENT_RECENCY_STORAGE_KEY, JSON.stringify(clientIds));
+}
+
+function rememberClientRecency(clientIds: string[], clientId: string): string[] {
+  return [clientId, ...clientIds.filter((candidate) => candidate !== clientId)].slice(0, 100);
+}
+
 function isRemoteClientOffline(client: Client | null | undefined): boolean {
   if (client === null || client === undefined) {
     return false;
@@ -630,6 +708,12 @@ function AuthenticatedApp({
   const [updateFailed, setUpdateFailed] = useState(false);
   const [terminalSwitcherOpen, setTerminalSwitcherOpen] = useState(false);
   const [terminalSwitcherMode, setTerminalSwitcherMode] = useState<TerminalSwitcherMode>("recent");
+  const [terminalSwitcherRecentScope, setTerminalSwitcherRecentScope] = useState<TerminalSwitcherRecentScope>("client");
+  const [clientSwitcherOpen, setClientSwitcherOpen] = useState(false);
+  const [clientWindowSelections, setClientWindowSelections] = useState<ClientWindowSelections>(
+    readClientWindowSelections
+  );
+  const [recentClientIds, setRecentClientIds] = useState<string[]>(readClientRecency);
   const [projectTerminalPickerOpen, setProjectTerminalPickerOpen] = useState(false);
   const [terminalCreateContext, setTerminalCreateContext] = useState<TerminalCreateContext | null>(null);
   const [mobileTerminalActive, setMobileTerminalActive] = useState(false);
@@ -810,9 +894,29 @@ function AuthenticatedApp({
     void recordTerminalRecent(clientId, { window_id: windowId, title })
       .then(() => {
         queryClient.invalidateQueries({ queryKey: ["terminal-recents", clientId] });
+        queryClient.invalidateQueries({ queryKey: ["terminal-recents", "global"] });
       })
       .catch(() => {});
   }, [queryClient]);
+
+  const rememberClientWindowSelection = useCallback((clientId: string, windowId: string | null) => {
+    setClientWindowSelections((currentSelections) => {
+      const nextSelections = {
+        ...currentSelections,
+        [clientId]: { windowId, usedAt: Date.now() }
+      };
+      writeClientWindowSelections(nextSelections);
+      return nextSelections;
+    });
+  }, []);
+
+  const rememberClientUse = useCallback((clientId: string) => {
+    setRecentClientIds((currentClientIds) => {
+      const nextClientIds = rememberClientRecency(currentClientIds, clientId);
+      writeClientRecency(nextClientIds);
+      return nextClientIds;
+    });
+  }, []);
 
   const focusSelectedTerminal = useCallback(() => {
     requestAnimationFrame(() => {
@@ -895,6 +999,13 @@ function AuthenticatedApp({
     setTerminalSwitcherOpen(false);
     focusSelectedTerminal();
   }, [focusSelectedTerminal]);
+  const toggleTerminalSwitcherMode = useCallback(() => {
+    setTerminalSwitcherMode((currentMode) => (currentMode === "recent" ? "tree" : "recent"));
+  }, []);
+  const closeClientSwitcher = useCallback(() => {
+    setClientSwitcherOpen(false);
+    focusSelectedTerminal();
+  }, [focusSelectedTerminal]);
   const isMobileLayout = useMobileLayout();
 
   useEffect(() => {
@@ -964,6 +1075,8 @@ function AuthenticatedApp({
   const selectCreatedTerminal = useCallback((window: VirtualWindow, mode: "push" | "replace" = "push") => {
     setSelectedClientId(window.client_id);
     setSelectedWindowId(window.id);
+    rememberClientUse(window.client_id);
+    rememberClientWindowSelection(window.client_id, window.id);
     setRouteSelectionRequest(null);
     setDeferredTreeSelection({ clientId: window.client_id, windowId: window.id });
     setMobileTerminalActive(true);
@@ -971,7 +1084,7 @@ function AuthenticatedApp({
     writeTerminalRoute(window.client_id, window.id, mode);
     persistTerminalRecent(window.client_id, window.id, window.title);
     focusSelectedTerminal();
-  }, [focusSelectedTerminal, persistTerminalRecent]);
+  }, [focusSelectedTerminal, persistTerminalRecent, rememberClientUse, rememberClientWindowSelection]);
   const createMutation = useMutation({
     mutationFn: (variables: CreateWindowVariables) =>
       createWindow(variables.clientId, {
@@ -1042,6 +1155,7 @@ function AuthenticatedApp({
     onSuccess: (_result, { clientId, windowId, nextWindowId }) => {
       queryClient.invalidateQueries({ queryKey: ["tree", clientId] });
       queryClient.invalidateQueries({ queryKey: ["window-activity", clientId] });
+      queryClient.invalidateQueries({ queryKey: ["terminal-recents", "global"] });
       setTerminalNotifications((current) => current.filter((notification) => notification.windowId !== windowId));
       setSelectedWindowId((currentWindowId) => {
         if (currentWindowId !== windowId) {
@@ -1050,6 +1164,7 @@ function AuthenticatedApp({
 
         setDeferredTreeSelection(null);
         setRouteSelectionRequest(null);
+        rememberClientWindowSelection(clientId, nextWindowId);
         writeTerminalRoute(clientId, nextWindowId, "replace");
         if (nextWindowId === null) {
           setMobileTerminalActive(false);
@@ -1068,12 +1183,24 @@ function AuthenticatedApp({
       queryClient.removeQueries({ queryKey: ["window-activity", clientId] });
       queryClient.removeQueries({ queryKey: ["terminal-notifications", clientId] });
       queryClient.removeQueries({ queryKey: ["terminal-recents", clientId] });
+      queryClient.invalidateQueries({ queryKey: ["terminal-recents", "global"] });
       queryClient.removeQueries({ queryKey: ["project-summaries", clientId] });
       queryClient.invalidateQueries({ queryKey: ["clients"] });
       setTerminalNotifications((current) => current.filter((notification) => notification.clientId !== clientId));
       notificationPreviousRef.current = notificationPreviousRef.current.filter(
         (notification) => notification.clientId !== clientId
       );
+      setClientWindowSelections((currentSelections) => {
+        const nextSelections = { ...currentSelections };
+        delete nextSelections[clientId];
+        writeClientWindowSelections(nextSelections);
+        return nextSelections;
+      });
+      setRecentClientIds((currentClientIds) => {
+        const nextClientIds = currentClientIds.filter((candidate) => candidate !== clientId);
+        writeClientRecency(nextClientIds);
+        return nextClientIds;
+      });
       if (selectedClientId !== clientId) {
         return;
       }
@@ -1141,6 +1268,7 @@ function AuthenticatedApp({
         setSelectedWindowId(null);
         setDeferredTreeSelection(null);
         setAgentRecordModalOpen(false);
+        writeTerminalRoute(null, null, "replace");
       }
       return;
     }
@@ -1154,11 +1282,15 @@ function AuthenticatedApp({
         : clients.find((client) => client.id === selectedClientId) ?? null;
       const nextClient = requestedClient ?? currentClient ?? clients.find((client) => client.runtime === "local") ?? clients[0];
       setSelectedClientId(nextClient.id);
-      setSelectedWindowId(requestedClient ? routeSelectionRequest.windowId : null);
+      rememberClientUse(nextClient.id);
+      const nextWindowId = requestedClient
+        ? routeSelectionRequest.windowId
+        : clientWindowSelections[nextClient.id]?.windowId ?? null;
+      setSelectedWindowId(nextWindowId);
       setDeferredTreeSelection(null);
       setAgentRecordModalOpen(false);
       if (requestedClient === null && routeSelectionRequest.clientId !== null) {
-        writeTerminalRoute(nextClient.id, null, "replace");
+        writeTerminalRoute(nextClient.id, nextWindowId, "replace");
       }
       setRouteSelectionRequest(null);
       return;
@@ -1170,20 +1302,41 @@ function AuthenticatedApp({
 
     const preferredClient = clients.find((client) => client.runtime === "local") ?? clients[0];
     setSelectedClientId(preferredClient.id);
-    setSelectedWindowId(null);
+    rememberClientUse(preferredClient.id);
+    setSelectedWindowId(clientWindowSelections[preferredClient.id]?.windowId ?? null);
     setDeferredTreeSelection(null);
     setAgentRecordModalOpen(false);
-  }, [clientsQuery.data, routeSelectionRequest, selectedClientId]);
+  }, [clientWindowSelections, clientsQuery.data, rememberClientUse, routeSelectionRequest, selectedClientId]);
 
-  const triggerTerminalSwitcherShortcut = useCallback(() => {
+  const triggerTerminalSwitcherShortcut = useCallback((scope: TerminalSwitcherRecentScope = "client") => {
     if (terminalSwitcherOpen) {
-      setTerminalSwitcherMode((currentMode) => (currentMode === "recent" ? "tree" : "recent"));
+      setTerminalSwitcherRecentScope(scope);
+      if (terminalSwitcherRecentScope !== scope) {
+        setTerminalSwitcherMode("recent");
+      } else {
+        toggleTerminalSwitcherMode();
+      }
       return;
     }
 
     setTerminalSwitcherMode("recent");
+    setTerminalSwitcherRecentScope(scope);
     setTerminalSwitcherOpen(true);
-  }, [terminalSwitcherOpen]);
+  }, [terminalSwitcherOpen, terminalSwitcherRecentScope, toggleTerminalSwitcherMode]);
+
+  const triggerGlobalTerminalSwitcherShortcut = useCallback(() => {
+    triggerTerminalSwitcherShortcut("global");
+  }, [triggerTerminalSwitcherShortcut]);
+
+  const triggerClientSwitcherShortcut = useCallback(() => {
+    setTerminalSwitcherOpen(false);
+    setProjectTerminalPickerOpen(false);
+    setNotificationCenterOpen(false);
+    setGitDiffBrowserOpen(false);
+    setTerminalControlsOpen(false);
+    setTerminalCreateContext(null);
+    setClientSwitcherOpen(true);
+  }, []);
 
   const triggerNewTerminalShortcut = useCallback(() => {
     if (selectedClientId === null || terminalCreateBusy) {
@@ -1195,12 +1348,11 @@ function AuthenticatedApp({
       return;
     }
 
-    setTerminalCreateContext({
-      title: "New terminal",
-      description: client?.name ?? undefined,
-      showConfigInitially: false
+    createMutation.mutate({
+      clientId: selectedClientId,
+      agent_launch: null
     });
-  }, [clientsQuery.data, selectedClientId, terminalCreateBusy]);
+  }, [clientsQuery.data, createMutation, selectedClientId, terminalCreateBusy]);
 
   const triggerNewTerminalByProjectShortcut = useCallback(() => {
     if (selectedClientId === null || terminalCreateBusy) {
@@ -1265,6 +1417,28 @@ function AuthenticatedApp({
     }
 
     const input = createWindowInputForGroupNode(node);
+    createMutation.mutate({
+      clientId: selectedClientId,
+      cwd: input.cwd,
+      folder_path: input.folder_path,
+      agent_launch: null,
+      afterCreate: () => {
+        setTerminalSwitcherOpen(false);
+      }
+    });
+  }, [clientsQuery.data, createMutation, selectedClientId, terminalCreateBusy]);
+
+  const handleConfigureTerminalAtGroup = useCallback((node: SwitcherGroupNode) => {
+    if (selectedClientId === null || terminalCreateBusy) {
+      return;
+    }
+
+    const client = clientsQuery.data?.find((candidate) => candidate.id === selectedClientId);
+    if (isRemoteClientOffline(client)) {
+      return;
+    }
+
+    const input = createWindowInputForGroupNode(node);
     setTerminalCreateContext({
       title: "New terminal",
       description: node.projectPath ?? node.topicPath ?? node.label,
@@ -1275,8 +1449,6 @@ function AuthenticatedApp({
       }
     });
   }, [clientsQuery.data, selectedClientId, terminalCreateBusy]);
-
-  const handleConfigureTerminalAtGroup = handleCreateTerminalAtGroup;
 
   const handleCreateTerminalSubmit = useCallback((payload: TerminalCreateSubmit) => {
     if (selectedClientId === null || terminalCreateBusy) {
@@ -1350,10 +1522,20 @@ function AuthenticatedApp({
     setNotificationCenterOpen((open) => !open);
   }, []);
 
+  const triggerClientScopedTerminalSwitcherShortcut = useCallback(() => {
+    triggerTerminalSwitcherShortcut("client");
+  }, [triggerTerminalSwitcherShortcut]);
+
   const runKeyboardShortcutAction = useCallback((id: KeyboardShortcutId) => {
     switch (id) {
       case "switch-terminal":
-        triggerTerminalSwitcherShortcut();
+        triggerClientScopedTerminalSwitcherShortcut();
+        return true;
+      case "switch-terminal-global":
+        triggerGlobalTerminalSwitcherShortcut();
+        return true;
+      case "switch-client":
+        triggerClientSwitcherShortcut();
         return true;
       case "new-terminal":
         triggerNewTerminalShortcut();
@@ -1380,12 +1562,14 @@ function AuthenticatedApp({
   }, [
     toggleSettings,
     triggerAgentRecordExpand,
+    triggerClientSwitcherShortcut,
+    triggerClientScopedTerminalSwitcherShortcut,
     triggerGitDiffBrowser,
+    triggerGlobalTerminalSwitcherShortcut,
     triggerLocateSelectedTerminal,
     triggerNewTerminalByProjectShortcut,
     triggerNewTerminalShortcut,
     triggerQuickInput,
-    triggerTerminalSwitcherShortcut
   ]);
 
   useEffect(() => {
@@ -1400,6 +1584,8 @@ function AuthenticatedApp({
 
       for (const definition of [
         "new-terminal-project",
+        "switch-terminal-global",
+        "switch-client",
         "switch-terminal",
         "new-terminal",
         "quick-input",
@@ -1441,6 +1627,7 @@ function AuthenticatedApp({
   useEffect(() => {
     if (!terminalSwitcherOpen) {
       setTerminalSwitcherMode("recent");
+      setTerminalSwitcherRecentScope("client");
     }
   }, [terminalSwitcherOpen]);
 
@@ -1450,7 +1637,18 @@ function AuthenticatedApp({
         return;
       }
 
-      if (terminalSwitcherOpen || notificationCenterOpen || settingsOpen || addClientModalOpen || terminalControlsOpen || gitDiffBrowserOpen) {
+      if (
+        terminalSwitcherOpen
+        || clientSwitcherOpen
+        || projectTerminalPickerOpen
+        || terminalCreateContext !== null
+        || notificationCenterOpen
+        || settingsOpen
+        || addClientModalOpen
+        || terminalControlsOpen
+        || gitDiffBrowserOpen
+        || agentRecordModalOpen
+      ) {
         return;
       }
 
@@ -1476,17 +1674,22 @@ function AuthenticatedApp({
   }, [
     focusSelectedTerminal,
     gitDiffBrowserOpen,
+    clientSwitcherOpen,
     notificationCenterOpen,
+    projectTerminalPickerOpen,
     selectedClientId,
     selectedWindowId,
     settingsOpen,
     addClientModalOpen,
+    agentRecordModalOpen,
+    terminalCreateContext,
     terminalControlsOpen,
     terminalSwitcherOpen
   ]);
 
   useEffect(() => {
     setTerminalSwitcherOpen(false);
+    setClientSwitcherOpen(false);
     setProjectTerminalPickerOpen(false);
     setTerminalControlsOpen(false);
     setTerminalImmersive(false);
@@ -1570,12 +1773,15 @@ function AuthenticatedApp({
   useEffect(() => {
     if (
       deferredTreeSelection !== null &&
+      deferredTreeSelection.clientId !== null &&
+      deferredTreeSelection.windowId !== null &&
       selectedClientId === deferredTreeSelection.clientId &&
       selectedWindowId === deferredTreeSelection.windowId
     ) {
       if (!treeContainsWindow(treeFolders, selectedWindowId)) {
         return;
       }
+      rememberClientWindowSelection(deferredTreeSelection.clientId, deferredTreeSelection.windowId);
       setDeferredTreeSelection(null);
     }
 
@@ -1593,9 +1799,11 @@ function AuthenticatedApp({
     setSelectedWindowId(null);
     setDeferredTreeSelection(null);
     setAgentRecordModalOpen(false);
+    rememberClientWindowSelection(selectedClientId, null);
     writeTerminalRoute(selectedClientId, null, "replace");
   }, [
     deferredTreeSelection,
+    rememberClientWindowSelection,
     routeSelectionRequest,
     selectedClientId,
     selectedWindowId,
@@ -1656,32 +1864,40 @@ function AuthenticatedApp({
   }, [terminalControlsOpen]);
 
   const selectClient = (clientId: string) => {
+    const rememberedWindowId = clientWindowSelections[clientId]?.windowId ?? null;
     setRouteSelectionRequest(null);
     setDeferredTreeSelection(null);
     setSelectedClientId(clientId);
-    setSelectedWindowId(null);
+    setSelectedWindowId(rememberedWindowId);
+    rememberClientUse(clientId);
     setMobileTerminalActive(false);
     setDetailPanelOpen(false);
     setTerminalImmersive(false);
     setAgentRecordModalOpen(false);
-    writeTerminalRoute(clientId, null, "push");
+    writeTerminalRoute(clientId, rememberedWindowId, "push");
   };
 
-  const selectWindow = (windowId: string) => {
-    if (selectedClientId === null) {
+  const selectWindow = (windowId: string, clientId = selectedClientId) => {
+    if (clientId === null) {
       return;
     }
-    const selectedTitle = windowId === selectedWindowId ? findWindowTitle(treeFolders, windowId) : null;
-    if (selectedTitle !== null) {
-      persistTerminalRecent(selectedClientId, windowId, selectedTitle);
+    const selectingCurrentClient = clientId === selectedClientId;
+    const selectedTitle = selectingCurrentClient && windowId === selectedWindowId
+      ? findWindowTitle(treeFolders, windowId)
+      : null;
+    if (selectedTitle !== null && selectingCurrentClient) {
+      persistTerminalRecent(clientId, windowId, selectedTitle);
     }
 
     setRouteSelectionRequest(null);
     setDeferredTreeSelection(null);
+    setSelectedClientId(clientId);
     setSelectedWindowId(windowId);
+    rememberClientUse(clientId);
+    rememberClientWindowSelection(clientId, windowId);
     setDetailPanelOpen(false);
     setAgentRecordModalOpen(false);
-    writeTerminalRoute(selectedClientId, windowId, "push");
+    writeTerminalRoute(clientId, windowId, "push");
     focusSelectedTerminal();
   };
 
@@ -1693,17 +1909,28 @@ function AuthenticatedApp({
     setRouteSelectionRequest(null);
     setDeferredTreeSelection(null);
     setSelectedWindowId(windowId);
+    rememberClientUse(selectedClientId);
+    rememberClientWindowSelection(selectedClientId, windowId);
     setAgentRecordModalOpen(false);
     writeTerminalRoute(selectedClientId, windowId, "replace");
-  }, [selectedClientId]);
+  }, [rememberClientUse, rememberClientWindowSelection, selectedClientId]);
 
   useEffect(() => {
     if (selectedClientId === null || selectedWindowId === null || selectedWindowTitle === null) {
       return;
     }
 
+    rememberClientUse(selectedClientId);
+    rememberClientWindowSelection(selectedClientId, selectedWindowId);
     persistTerminalRecent(selectedClientId, selectedWindowId, selectedWindowTitle);
-  }, [persistTerminalRecent, selectedClientId, selectedWindowId, selectedWindowTitle]);
+  }, [
+    persistTerminalRecent,
+    rememberClientUse,
+    rememberClientWindowSelection,
+    selectedClientId,
+    selectedWindowId,
+    selectedWindowTitle
+  ]);
 
   const submitBootstrap = (payload: BootstrapClientInput) => {
     bootstrapMutation.mutate(payload);
@@ -1735,6 +1962,10 @@ function AuthenticatedApp({
     ? deleteClientMutation.error.message
     : "Failed to delete client.";
   const switchTerminalShortcut = effectiveKeyboardShortcut("switch-terminal", keyboardShortcutBindings);
+  const switchGlobalTerminalShortcut = effectiveKeyboardShortcut("switch-terminal-global", keyboardShortcutBindings);
+  const activeTerminalSwitcherShortcut = terminalSwitcherRecentScope === "global"
+    ? switchGlobalTerminalShortcut
+    : switchTerminalShortcut;
   const newTerminalShortcutLabel = keyboardShortcutLabel(effectiveKeyboardShortcut("new-terminal", keyboardShortcutBindings));
   const quickInputShortcutLabel = keyboardShortcutLabel(effectiveKeyboardShortcut("quick-input", keyboardShortcutBindings));
   const gitDiffShortcutLabel = keyboardShortcutLabel(effectiveKeyboardShortcut("git-diff", keyboardShortcutBindings));
@@ -1816,12 +2047,20 @@ function AuthenticatedApp({
     }
     setDeferredTreeSelection(null);
     setSelectedWindowId(notification.windowId);
+    rememberClientUse(notification.clientId);
+    rememberClientWindowSelection(notification.clientId, notification.windowId);
     setDetailPanelOpen(false);
     setAgentRecordModalOpen(false);
     setMobileTerminalActive(true);
     writeTerminalRoute(notification.clientId, notification.windowId, "push");
     focusSelectedTerminal();
-  }, [focusSelectedTerminal, queryClient, selectedClientId]);
+  }, [
+    focusSelectedTerminal,
+    queryClient,
+    rememberClientUse,
+    rememberClientWindowSelection,
+    selectedClientId
+  ]);
 
   const handleDeleteNotification = useCallback((notification: TerminalNotification) => {
     void dismissTerminalNotification(
@@ -1906,19 +2145,13 @@ function AuthenticatedApp({
         setAddClientModalOpen(false);
         setSettingsOpen(false);
         setSettingsInitialView("general");
+        setTerminalCreateContext(null);
         setTerminalSwitcherOpen(false);
         setProjectTerminalPickerOpen(false);
         setNotificationCenterOpen(false);
         setGitDiffBrowserOpen(false);
         setTerminalControlsOpen(false);
         setTerminalQuickInputOpen(false);
-        if (selectedClientId !== null && !selectedClientOffline) {
-          setTerminalCreateContext({
-            title: "New terminal",
-            description: selectedClient?.name ?? undefined,
-            showConfigInitially: false
-          });
-        }
         return;
       case "quick-input":
         setAddClientModalOpen(false);
@@ -1946,6 +2179,7 @@ function AuthenticatedApp({
         setTerminalControlsOpen(false);
         setTerminalQuickInputOpen(false);
         setTerminalSwitcherMode("recent");
+        setTerminalSwitcherRecentScope("client");
         setTerminalSwitcherOpen(true);
         return;
       case "settings":
@@ -1986,7 +2220,7 @@ function AuthenticatedApp({
         id: "switch-terminal",
         label: "切换终端",
         hint: keyboardShortcutLabel(effectiveKeyboardShortcut("switch-terminal", keyboardShortcutBindings)),
-        onPress: triggerTerminalSwitcherShortcut
+        onPress: triggerClientScopedTerminalSwitcherShortcut
       },
       {
         id: "new-terminal",
@@ -2062,12 +2296,12 @@ function AuthenticatedApp({
       terminalCreateBusy,
       terminalConnectionStatus,
       triggerAgentRecordExpand,
+      triggerClientScopedTerminalSwitcherShortcut,
       triggerGitDiffBrowser,
       triggerLocateSelectedTerminal,
       triggerNewTerminalByProjectShortcut,
       triggerNewTerminalShortcut,
       triggerQuickInput,
-      triggerTerminalSwitcherShortcut,
       toggleNotificationCenter,
       toggleSettings,
       unreadNotificationCount
@@ -2391,6 +2625,7 @@ function AuthenticatedApp({
         clientId={selectedClientId}
         folders={treeFolders}
         mode={terminalSwitcherMode}
+        recentScope={terminalSwitcherRecentScope}
         terminalGroupingMode={terminalGroupingMode}
         summaryOutputLanguage={summaryOutputLanguage}
         isOpen={terminalSwitcherOpen}
@@ -2398,12 +2633,21 @@ function AuthenticatedApp({
         hasUnreadNotification={hasUnreadNotification}
         onClose={closeTerminalSwitcher}
         onSelectWindow={selectWindow}
+        onToggleModeShortcut={toggleTerminalSwitcherMode}
         onCreateTerminalAtGroup={handleCreateTerminalAtGroup}
         onConfigureTerminalAtGroup={handleConfigureTerminalAtGroup}
         creatingTerminal={terminalCreateBusy}
         createTerminalDisabled={selectedClientOffline}
-        switchShortcut={switchTerminalShortcut}
-        switchShortcutLabel={keyboardShortcutLabel(switchTerminalShortcut)}
+        switchShortcut={activeTerminalSwitcherShortcut}
+        switchShortcutLabel={keyboardShortcutLabel(activeTerminalSwitcherShortcut)}
+      />
+      <ClientSwitcher
+        clients={clientsQuery.data ?? []}
+        selectedClientId={selectedClientId}
+        recentClientIds={recentClientIds}
+        isOpen={clientSwitcherOpen}
+        onClose={closeClientSwitcher}
+        onSelectClient={selectClient}
       />
       <ProjectTerminalPicker
         isOpen={projectTerminalPickerOpen}
@@ -2433,7 +2677,10 @@ function AuthenticatedApp({
       />
       <SettingsModal
         isOpen={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+        onClose={() => {
+          setSettingsOpen(false);
+          focusSelectedTerminal();
+        }}
         initialView={settingsInitialView}
         summaryOutputLanguage={summaryOutputLanguage}
         terminalGroupingMode={terminalGroupingMode}
@@ -2488,6 +2735,7 @@ function AuthenticatedApp({
         visible={
           isMobileLayout
           && !terminalSwitcherOpen
+          && !clientSwitcherOpen
           && !projectTerminalPickerOpen
           && !notificationCenterOpen
           && !settingsOpen

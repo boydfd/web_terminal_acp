@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { fetchClientAgentConfig } from "../api";
@@ -13,6 +13,7 @@ import {
 import type { AgentLaunchMode } from "../agentLaunch";
 import type { AgentConfigSelection, AgentLaunchConfig, AgentLaunchKind } from "../types";
 import { AgentConfigPicker } from "./AgentConfigPicker";
+import { useOverlayFocus } from "./useOverlayFocus";
 
 export type TerminalCreateContext = {
   title: string;
@@ -60,6 +61,7 @@ export function TerminalCreateModal({
   const [commands, setCommands] = useState<Record<AgentLaunchKind, string>>(() => readDefaultAgentCommands());
   const [configPanelOpen, setConfigPanelOpen] = useState(false);
   const [selection, setSelection] = useState<AgentConfigSelection | null>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
   const configQuery = useQuery({
     queryKey: ["client-agent-config", clientId, mode],
     queryFn: () => fetchClientAgentConfig(clientId as string, mode as AgentLaunchKind),
@@ -98,6 +100,14 @@ export function TerminalCreateModal({
   }, [configQuery.data, mode]);
 
   const command = isAgentLaunchKind(mode) ? commands[mode] : "";
+  const handleEscape = useCallback(() => {
+    onClose();
+  }, [onClose]);
+  useOverlayFocus({
+    isOpen: isOpen && context !== null,
+    ref: panelRef,
+    onEscape: handleEscape
+  });
   const configSummary = useMemo(() => {
     if (!isAgentLaunchKind(mode)) {
       return "未配置";
@@ -142,6 +152,7 @@ export function TerminalCreateModal({
       }}
     >
       <section
+        ref={panelRef}
         className="terminal-create-modal"
         data-onboarding-id="terminal-create-modal"
         role="dialog"

@@ -17,6 +17,12 @@
 
 禁止在主仓库 checkout 直接改功能代码；禁止让用户代替 agent 手工 `git worktree add`。worktree 创建、进入、注册与清理均按该 skill 中的脚本与流程执行。**任务完成后必须把 `agent/<suffix>` 合并回 `main`**（见 skill Step 4），不要只留在 worktree 分支上。
 
+## Project Skills
+
+- 项目级 skill 必须同时维护 Codex、Claude Code、Cursor 三份：`.codex/skills/<name>`、`.claude/skills/<name>`、`.cursor/skills/<name>`。
+- 新增或修改项目 skill 时，三份 `SKILL.md`、脚本和必要 metadata 必须保持行为一致；不要只更新其中一个 agent 的版本。
+- Android app 打包使用 `android-app-release` skill；常用入口是 `make android-release`、`make android-local-release`、`make android-debug`。
+
 ## Remote Client Bundle
 
 - Remote client bootstrap 和 self-update 使用 `backend/app/services/bootstrap/installer.py` 里的 `client_app_file_contents()` 精简包清单，不会自动包含整个 backend 源码。

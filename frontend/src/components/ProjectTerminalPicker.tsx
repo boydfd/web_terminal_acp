@@ -8,6 +8,7 @@ import {
 import type { AgentLaunchMode } from "../agentLaunch";
 import type { AgentLaunchKind, AgentLaunchConfig, ProjectSummary } from "../types";
 import { projectGroupLabel } from "../terminalGrouping";
+import { useOverlayFocus } from "./useOverlayFocus";
 
 type ProjectTerminalPickerProps = {
   isOpen: boolean;
@@ -40,7 +41,7 @@ export function ProjectTerminalPicker({
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const [selectedMode, setSelectedMode] = useState<AgentLaunchMode>("shell");
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
   const projectSummaryLookup = useMemo(() => {
     const lookup = new Map<string, ProjectSummary>();
     for (const summary of projectSummaries) {
@@ -72,10 +73,7 @@ export function ProjectTerminalPicker({
       setQuery("");
       setActiveIndex(0);
       setSelectedMode("shell");
-      return;
     }
-
-    requestAnimationFrame(() => inputRef.current?.focus());
   }, [isOpen]);
 
   useEffect(() => {
@@ -99,12 +97,6 @@ export function ProjectTerminalPicker({
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onClose();
-        return;
-      }
-
       if (filteredOptions.length === 0) {
         return;
       }
@@ -143,17 +135,27 @@ export function ProjectTerminalPicker({
       }
     };
 
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
+    return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
   }, [
     activeIndex,
     createTerminalDisabled,
     creatingTerminal,
     filteredOptions,
     isOpen,
-    createTerminalForProject,
-    onClose
+    createTerminalForProject
   ]);
+
+  const handleEscape = useCallback(() => {
+    onClose();
+  }, [onClose]);
+
+  useOverlayFocus({
+    isOpen,
+    ref: panelRef,
+    onEscape: handleEscape,
+    initialFocusSelector: "input"
+  });
 
   if (!isOpen) {
     return null;
@@ -168,7 +170,7 @@ export function ProjectTerminalPicker({
         }
       }}
     >
-      <div aria-modal="true" className="project-terminal-picker" role="dialog">
+      <div ref={panelRef} aria-modal="true" className="project-terminal-picker" role="dialog">
         <div className="project-terminal-picker-header">
           <div>
             <h2>New terminal by project path</h2>
@@ -214,7 +216,6 @@ export function ProjectTerminalPicker({
         </div>
 
         <input
-          ref={inputRef}
           aria-label="Search project paths"
           value={query}
           onChange={(event) => {

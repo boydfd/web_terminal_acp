@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 
 import { isOnboardingEnabled, readOnboardingCompleted, writeOnboardingCompleted } from "../onboarding";
+import { useOverlayFocus } from "./useOverlayFocus";
 
 export type OnboardingAction =
   | "remote-bootstrap"
@@ -118,6 +119,7 @@ export function OnboardingTour({ steps, onStepAction }: OnboardingTourProps) {
   const [visible, setVisible] = useState(() => enabled && !readOnboardingCompleted());
   const [index, setIndex] = useState(0);
   const [targetRect, setTargetRect] = useState<TargetRect | null>(null);
+  const cardRef = useRef<HTMLElement | null>(null);
   const step = steps[index] ?? steps[0];
   const isLast = index >= steps.length - 1;
 
@@ -206,6 +208,12 @@ export function OnboardingTour({ steps, onStepAction }: OnboardingTourProps) {
     }
   }, [enabled, step, visible]);
 
+  useOverlayFocus({
+    isOpen: enabled && visible && step !== undefined,
+    ref: cardRef,
+    onEscape: complete
+  });
+
   const highlightStyle = useMemo<CSSProperties | null>(() => {
     if (targetRect === null) {
       return null;
@@ -232,6 +240,7 @@ export function OnboardingTour({ steps, onStepAction }: OnboardingTourProps) {
       <div className="onboarding-scrim" />
       {highlightStyle !== null && <div className="onboarding-highlight" style={highlightStyle} />}
       <section
+        ref={cardRef}
         className="onboarding-card"
         role="dialog"
         aria-modal="true"

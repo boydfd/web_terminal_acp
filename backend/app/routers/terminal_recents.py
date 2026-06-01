@@ -11,13 +11,21 @@ from app.routers.ui_events import ui_event_hub_from_state
 from app.repositories.clients import get_client
 from app.repositories.terminal_recents import (
     DEFAULT_TERMINAL_RECENTS_PAGE_SIZE,
+    list_global_terminal_recents,
     list_terminal_recents,
     total_pages,
     touch_terminal_recent,
 )
-from app.schemas import TerminalRecentPageOut, TerminalRecentOut, TerminalRecentTouchIn
+from app.schemas import (
+    GlobalTerminalRecentOut,
+    GlobalTerminalRecentPageOut,
+    TerminalRecentPageOut,
+    TerminalRecentOut,
+    TerminalRecentTouchIn,
+)
 
 router = APIRouter(prefix="/api/clients", tags=["terminal-recents"])
+global_router = APIRouter(prefix="/api/terminal-recents", tags=["terminal-recents"])
 
 
 async def _require_client(session: AsyncSession, client_id: UUID) -> Client:
@@ -51,6 +59,37 @@ async def get_terminal_recents(
                 last_used_at=item.last_used_at,
             )
             for item, title in items
+        ],
+        page=page,
+        page_size=page_size,
+        total=total,
+        total_pages=total_pages(total, page_size),
+    )
+
+
+@global_router.get("", response_model=GlobalTerminalRecentPageOut)
+async def get_global_terminal_recents(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=DEFAULT_TERMINAL_RECENTS_PAGE_SIZE, ge=1, le=100),
+    q: str | None = Query(default=None, max_length=255),
+    session: AsyncSession = Depends(get_session),
+) -> GlobalTerminalRecentPageOut:
+    items, total = await list_global_terminal_recents(
+        session,
+        page=page,
+        page_size=page_size,
+        query=q,
+    )
+    return GlobalTerminalRecentPageOut(
+        items=[
+            GlobalTerminalRecentOut(
+                client_id=item.client_id,
+                client_name=client_name,
+                window_id=item.window_id,
+                title=title,
+                last_used_at=item.last_used_at,
+            )
+            for item, title, client_name in items
         ],
         page=page,
         page_size=page_size,

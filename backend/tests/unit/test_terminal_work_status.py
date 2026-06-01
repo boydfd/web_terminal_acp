@@ -45,6 +45,21 @@ def codex_message_payload(text: str, *, timestamp: datetime | None = None) -> di
     return payload
 
 
+def codex_user_message_payload(text: str, *, timestamp: datetime | None = None) -> dict:
+    payload = {
+        "provider": "codex",
+        "raw_type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        },
+    }
+    if timestamp is not None:
+        payload["timestamp"] = timestamp.isoformat()
+    return payload
+
+
 def claude_completion_payload() -> dict:
     return {
         "provider": "claude_code",
@@ -389,12 +404,15 @@ async def test_load_work_statuses_uses_window_agent_activity_state(counted_db_se
 
     statuses = await load_work_statuses(db_session, client_id, [window.id], now=now)
 
-    assert statuses[window.id].state == "WORKING"
-    assert not [
+    assert statuses[window.id].state == "LONG_IDLE"
+    agent_event_queries = [
         statement
         for statement in statements
         if "FROM events" in statement and "events.source_type IN" in statement
     ]
+    assert len(agent_event_queries) == 1
+    assert "row_number" in agent_event_queries[0].lower()
+    assert "partition by" in agent_event_queries[0].lower()
 
 
 @pytest.mark.asyncio
@@ -403,7 +421,6 @@ async def test_postgres_activity_projection_does_not_scan_empty_agent_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db_session, statements = counted_db_session
-    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
     client_id = uuid4()
     window = VirtualWindow(
         id=uuid4(),
@@ -481,6 +498,131 @@ async def test_postgres_activity_projection_repairs_stale_latest_event_without_s
 
 
 @pytest.mark.asyncio
+async def test_postgres_activity_projection_repairs_empty_agent_launch_event_without_scan(
+    counted_db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_session, statements = counted_db_session
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    latest_at = now - timedelta(seconds=10)
+    session_meta = Event(
+        id=uuid4(),
+        client_id=client_id,
+        source_type=EventSourceType.agent_tool_record,
+        source_id="codex-session-1",
+        kind="session_meta",
+        virtual_window_id=None,
+        payload_json={
+            "provider": "codex",
+            "raw_type": "session_meta",
+            "payload": {"id": "codex-session-1"},
+        },
+        fingerprint="codex-empty-launch-projection",
+        created_at=latest_at,
+    )
+    window = VirtualWindow(
+        id=uuid4(),
+        client_id=client_id,
+        title="Terminal",
+        status=WindowStatus.active,
+        agent_activity_latest_at=latest_at,
+        agent_activity_latest_event_id=session_meta.id,
+    )
+    session_meta.virtual_window_id = window.id
+    db_session.add_all([window, session_meta])
+    await db_session.flush()
+    monkeypatch.setattr("app.services.terminal_work_status._dialect_name", lambda _session: "postgresql")
+    statements.clear()
+
+    activity = await terminal_work_status._agent_activity_state_by_window(
+        db_session,
+        client_id,
+        [window.id],
+    )
+
+    assert window.id not in activity.latest_activity
+    assert window.id not in activity.latest_completed_at
+    assert not [
+        statement
+        for statement in statements
+        if "FROM events" in statement and "events.source_type IN" in statement
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_load_work_status_uses_projected_user_input_without_scan(
+    counted_db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_session, statements = counted_db_session
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    window = VirtualWindow(
+        id=uuid4(),
+        client_id=client_id,
+        title="Terminal",
+        status=WindowStatus.active,
+        agent_activity_latest_at=now - timedelta(seconds=10),
+        agent_activity_latest_user_input_at=now - timedelta(seconds=20),
+    )
+    db_session.add(window)
+    await db_session.flush()
+    db_session.add(
+        Event(
+            client_id=client_id,
+            source_type=EventSourceType.terminal,
+            source_id=str(window.id),
+            kind="terminal_input_command",
+            virtual_window_id=window.id,
+            payload_json={"command": "codex", "sequence": 9},
+            fingerprint="postgres-projected-user-input-command",
+            created_at=now - timedelta(seconds=30),
+        )
+    )
+    await db_session.flush()
+
+    async def latest_events_by_window(_session, _client_id, _window_ids, *, kind):
+        if kind != "terminal_input_command":
+            return {}
+        return {
+            window.id: Event(
+                client_id=client_id,
+                source_type=EventSourceType.terminal,
+                source_id=str(window.id),
+                kind="terminal_input_command",
+                virtual_window_id=window.id,
+                payload_json={"command": "codex", "sequence": 9},
+                fingerprint="postgres-projected-user-input-command-projected",
+                created_at=now - timedelta(seconds=30),
+            )
+        }
+
+    async def fail_user_input_scan(*_args, **_kwargs):
+        raise AssertionError("projected Postgres user input should not scan recent agent events")
+
+    monkeypatch.setattr("app.services.terminal_work_status._dialect_name", lambda _session: "postgresql")
+    monkeypatch.setattr(
+        "app.services.terminal_work_status._latest_events_by_window",
+        latest_events_by_window,
+    )
+    monkeypatch.setattr(
+        "app.services.terminal_work_status._latest_agent_user_input_at_by_window",
+        fail_user_input_scan,
+    )
+    statements.clear()
+
+    statuses = await load_work_statuses(db_session, client_id, [window.id], now=now)
+
+    assert statuses[window.id].state == "WORKING"
+    assert not [
+        statement
+        for statement in statements
+        if "FROM events" in statement and "events.source_type IN" in statement
+    ]
+
+
+@pytest.mark.asyncio
 async def test_finished_command_sequence_query_starts_at_latest_agent_command(counted_db_session) -> None:
     db_session, statements = counted_db_session
     now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
@@ -544,28 +686,40 @@ async def test_load_work_status_treats_agent_tool_records_as_working_activity(db
     window = VirtualWindow(id=uuid4(), client_id=client_id, title="Terminal", status=WindowStatus.active)
     db_session.add(window)
     await db_session.flush()
-    db_session.add_all([
-        Event(
-            client_id=client_id,
-            source_type=EventSourceType.terminal,
-            source_id=str(window.id),
-            kind="terminal_input_command",
-            virtual_window_id=window.id,
-            payload_json={"command": "cursor", "sequence": 1},
-            fingerprint="terminal-input-cursor-work-status",
-            created_at=now - timedelta(seconds=25),
-        ),
-        Event(
-            client_id=client_id,
-            source_type=EventSourceType.agent_tool_record,
-            source_id="cursor-session-1",
-            kind="assistant_message",
-            virtual_window_id=window.id,
-            payload_json={"provider": "cursor_cli", "role": "assistant", "content": "working"},
-            fingerprint="cursor-agent-work-status",
-            created_at=now - timedelta(seconds=20),
-        ),
-    ])
+    db_session.add_all(
+        [
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.terminal,
+                source_id=str(window.id),
+                kind="terminal_input_command",
+                virtual_window_id=window.id,
+                payload_json={"command": "cursor", "sequence": 1},
+                fingerprint="terminal-input-cursor-work-status",
+                created_at=now - timedelta(seconds=25),
+            ),
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="cursor-session-1",
+                kind="user_message",
+                virtual_window_id=window.id,
+                payload_json={"provider": "cursor_cli", "role": "user", "content": "fix tests"},
+                fingerprint="cursor-agent-user-input-work-status",
+                created_at=now - timedelta(seconds=22),
+            ),
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="cursor-session-1",
+                kind="assistant_message",
+                virtual_window_id=window.id,
+                payload_json={"provider": "cursor_cli", "role": "assistant", "content": "working"},
+                fingerprint="cursor-agent-work-status",
+                created_at=now - timedelta(seconds=20),
+            ),
+        ]
+    )
     await db_session.flush()
 
     status = await load_work_status(db_session, client_id, window.id, now=now)
@@ -573,6 +727,128 @@ async def test_load_work_status_treats_agent_tool_records_as_working_activity(db
     assert status.state == "WORKING"
     assert status.last_activity_at == now - timedelta(seconds=20)
     assert status.last_working_activity_at == now - timedelta(seconds=20)
+
+
+@pytest.mark.asyncio
+async def test_load_work_status_does_not_treat_empty_agent_launch_output_as_working(db_session) -> None:
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    window = VirtualWindow(id=uuid4(), client_id=client_id, title="Terminal", status=WindowStatus.active)
+    db_session.add(window)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.terminal,
+                source_id=str(window.id),
+                kind="terminal_input_command",
+                virtual_window_id=window.id,
+                payload_json={"command": "codex", "sequence": 7},
+                fingerprint="terminal-input-empty-codex",
+                created_at=now - timedelta(seconds=30),
+            ),
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session-1",
+                kind="session_meta",
+                virtual_window_id=window.id,
+                payload_json={
+                    "provider": "codex",
+                    "raw_type": "session_meta",
+                    "payload": {"id": "codex-session-1"},
+                },
+                fingerprint="codex-empty-launch-session-meta",
+                created_at=now - timedelta(seconds=20),
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    status = await load_work_status(db_session, client_id, window.id, now=now)
+
+    assert status.state == "RECENT_ACTIVE"
+    assert status.last_activity_at == now - timedelta(seconds=30)
+    assert status.last_working_activity_at is None
+
+
+@pytest.mark.asyncio
+async def test_load_work_status_treats_output_after_user_input_as_working(db_session) -> None:
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    window = VirtualWindow(id=uuid4(), client_id=client_id, title="Terminal", status=WindowStatus.active)
+    db_session.add(window)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.terminal,
+                source_id=str(window.id),
+                kind="terminal_input_command",
+                virtual_window_id=window.id,
+                payload_json={"command": "codex", "sequence": 7},
+                fingerprint="terminal-input-codex-user-start",
+                created_at=now - timedelta(seconds=30),
+            ),
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session-1",
+                kind="response_item",
+                virtual_window_id=window.id,
+                payload_json=codex_user_message_payload("fix tests"),
+                fingerprint="codex-user-input-starts-work",
+                created_at=now - timedelta(seconds=20),
+            ),
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session-1",
+                kind="response_item",
+                virtual_window_id=window.id,
+                payload_json=codex_message_payload("working"),
+                fingerprint="codex-output-after-user-input",
+                created_at=now - timedelta(seconds=10),
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    status = await load_work_status(db_session, client_id, window.id, now=now)
+
+    assert status.state == "WORKING"
+    assert status.last_activity_at == now - timedelta(seconds=10)
+    assert status.last_working_activity_at == now - timedelta(seconds=10)
+
+
+@pytest.mark.asyncio
+async def test_load_work_status_ignores_unprompted_agent_output_without_command(db_session) -> None:
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    window = VirtualWindow(id=uuid4(), client_id=client_id, title="Terminal", status=WindowStatus.active)
+    db_session.add(window)
+    await db_session.flush()
+    db_session.add(
+        Event(
+            client_id=client_id,
+            source_type=EventSourceType.agent_tool_record,
+            source_id="codex-session-1",
+            kind="response_item",
+            virtual_window_id=window.id,
+            payload_json=codex_message_payload("initial assistant output"),
+            fingerprint="codex-unprompted-output-without-command",
+            created_at=now - timedelta(seconds=10),
+        )
+    )
+    await db_session.flush()
+
+    status = await load_work_status(db_session, client_id, window.id, now=now)
+
+    assert status.state == "LONG_IDLE"
+    assert status.last_activity_at is None
+    assert status.last_working_activity_at is None
 
 
 @pytest.mark.asyncio
@@ -897,6 +1173,16 @@ async def test_load_work_status_returns_to_working_after_completion_in_same_runn
                 client_id=client_id,
                 source_type=EventSourceType.agent_tool_record,
                 source_id="codex-session-1",
+                kind="response_item",
+                virtual_window_id=window.id,
+                payload_json=codex_user_message_payload("first turn"),
+                fingerprint="codex-agent-first-turn-user-input",
+                created_at=now - timedelta(seconds=50),
+            ),
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="codex-session-1",
                 kind="event_msg",
                 virtual_window_id=window.id,
                 payload_json=codex_completion_payload(),
@@ -1099,7 +1385,7 @@ async def test_claude_local_command_events_do_not_override_turn_completion(db_se
     activity = await load_tree_window_activity(db_session, client_id, [window.id], now=now)
 
     assert activity.work_statuses[window.id].state == "FINISHED"
-    assert activity.work_statuses[window.id].last_working_activity_at == completed_at
+    assert activity.work_statuses[window.id].last_working_activity_at is None
     task_status = activity.last_agent_task_status[window.id]
     assert task_status.state == "FINISHED"
     assert task_status.occurred_at == completed_at

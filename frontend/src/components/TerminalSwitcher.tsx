@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { fetchProjectSummaries, fetchTerminalRecents, summarizeProject } from "../api";
+import { fetchGlobalTerminalRecents, fetchProjectSummaries, fetchTerminalRecents, summarizeProject } from "../api";
 import type { SummaryOutputLanguage } from "../userPreferences";
 import { keyboardShortcutMatches, type KeyboardShortcut } from "../keyboardShortcuts";
 import {
@@ -12,9 +12,10 @@ import {
   type SwitcherNode
 } from "../terminalGrouping";
 import type { TerminalGroupingMode } from "../userPreferences";
-import type { ProjectSummary, TerminalRecent, TreeFolder, TreeWindow } from "../types";
+import type { GlobalTerminalRecent, ProjectSummary, TerminalRecent, TreeFolder, TreeWindow } from "../types";
 import { TerminalUnreadDot } from "./NotificationCenter";
 import { WorkStatusDot } from "./WorkStatusBadge";
+import { useOverlayFocus } from "./useOverlayFocus";
 
 const RECENTS_PAGE_SIZE = 20;
 
@@ -32,6 +33,7 @@ const TERMINAL_GROUPING_DESCRIPTIONS: Record<TerminalGroupingMode, string> = {
 };
 
 export type TerminalSwitcherMode = "recent" | "tree";
+export type TerminalSwitcherRecentScope = "client" | "global";
 
 type TerminalEntry = {
   window: TreeWindow;
@@ -57,12 +59,14 @@ type TerminalSwitcherProps = {
   folders: TreeFolder[] | undefined;
   selectedWindowId: string | null;
   mode: TerminalSwitcherMode;
+  recentScope?: TerminalSwitcherRecentScope;
   terminalGroupingMode: TerminalGroupingMode;
   summaryOutputLanguage: SummaryOutputLanguage;
   isOpen: boolean;
   hasUnreadNotification?: (windowId: string) => boolean;
   onClose: () => void;
-  onSelectWindow: (windowId: string) => void;
+  onSelectWindow: (windowId: string, clientId?: string) => void;
+  onToggleModeShortcut?: () => void;
   onCreateTerminalAtGroup?: (node: SwitcherGroupNode) => void;
   onConfigureTerminalAtGroup?: (node: SwitcherGroupNode) => void;
   creatingTerminal?: boolean;
@@ -73,6 +77,17 @@ type TerminalSwitcherProps = {
 
 function recentItemKey(windowId: string): string {
   return `recent:${windowId}`;
+}
+
+function scopedRecentItemKey(item: TerminalRecent | GlobalTerminalRecent, globalScope: boolean): string {
+  if (globalScope) {
+    return `recent:${(item as GlobalTerminalRecent).client_id}:${item.window_id}`;
+  }
+  return recentItemKey(item.window_id);
+}
+
+function isGlobalTerminalRecent(item: TerminalRecent | GlobalTerminalRecent): item is GlobalTerminalRecent {
+  return "client_id" in item;
 }
 
 function collectGroupKeys(nodes: SwitcherNode[]): string[] {
@@ -376,12 +391,14 @@ export function TerminalSwitcher({
   folders,
   selectedWindowId,
   mode,
+  recentScope = "client",
   terminalGroupingMode,
   summaryOutputLanguage,
   isOpen,
   hasUnreadNotification,
   onClose,
   onSelectWindow,
+  onToggleModeShortcut,
   onCreateTerminalAtGroup,
   onConfigureTerminalAtGroup,
   creatingTerminal,
@@ -395,7 +412,7 @@ export function TerminalSwitcher({
   const [recentPage, setRecentPage] = useState(1);
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(() => new Set());
   const [summarizingProjectPath, setSummarizingProjectPath] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
   const projectSummariesQuery = useQuery({
     queryKey: ["project-summaries", clientId],
     queryFn: () => fetchProjectSummaries(clientId as string),
@@ -426,14 +443,20 @@ export function TerminalSwitcher({
   );
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const isRecentMode = mode === "recent";
+  const isGlobalRecentMode = isRecentMode && recentScope === "global";
   const recentsQuery = useQuery({
     queryKey: [
       "terminal-recents",
-      clientId,
+      isGlobalRecentMode ? "global" : clientId,
       isRecentMode ? { page: recentPage, query: normalizedQuery || null } : null
     ],
-    queryFn: () => fetchTerminalRecents(clientId as string, recentPage, RECENTS_PAGE_SIZE, normalizedQuery),
-    enabled: isOpen && clientId !== null && isRecentMode,
+    queryFn: () => {
+      if (isGlobalRecentMode) {
+        return fetchGlobalTerminalRecents(recentPage, RECENTS_PAGE_SIZE, normalizedQuery);
+      }
+      return fetchTerminalRecents(clientId as string, recentPage, RECENTS_PAGE_SIZE, normalizedQuery);
+    },
+    enabled: isOpen && isRecentMode && (isGlobalRecentMode || clientId !== null),
     staleTime: 0
   });
   const treeNodes = useMemo(() => {
@@ -445,12 +468,12 @@ export function TerminalSwitcher({
   }, [clientId, folders, isRecentMode, projectSummaryLookup, query, terminalGroupingMode]);
   const groupKeys = useMemo(() => collectGroupKeys(treeNodes), [treeNodes]);
   const visibleTreeItems = useMemo(() => flattenVisibleTreeItems(treeNodes, expandedKeys), [expandedKeys, treeNodes]);
-  const recentItems = recentsQuery.data?.items ?? [];
+  const recentItems: Array<TerminalRecent | GlobalTerminalRecent> = recentsQuery.data?.items ?? [];
   const recentTotalPages = recentsQuery.data?.total_pages ?? 0;
   const recentMatchCount = recentsQuery.data?.total ?? 0;
   const recentKeys = useMemo(
-    () => recentItems.map((item) => recentItemKey(item.window_id)),
-    [recentItems]
+    () => recentItems.map((item) => scopedRecentItemKey(item, isGlobalRecentMode)),
+    [isGlobalRecentMode, recentItems]
   );
   const navigableKeys = isRecentMode ? recentKeys : visibleTreeItems.map((item) => item.node.key);
 
@@ -462,8 +485,6 @@ export function TerminalSwitcher({
       setExpandedKeys(new Set());
       return;
     }
-
-    requestAnimationFrame(() => inputRef.current?.focus());
   }, [isOpen]);
 
   useEffect(() => {
@@ -471,10 +492,18 @@ export function TerminalSwitcher({
     setActiveKey(null);
     setRecentPage(1);
     setExpandedKeys(new Set());
-    if (isOpen) {
-      requestAnimationFrame(() => inputRef.current?.focus());
-    }
-  }, [isOpen, mode]);
+  }, [isOpen, mode, recentScope]);
+
+  const handleEscape = useCallback(() => {
+    onClose();
+  }, [onClose]);
+
+  useOverlayFocus({
+    isOpen,
+    ref: panelRef,
+    onEscape: handleEscape,
+    initialFocusSelector: "input"
+  });
 
   useEffect(() => {
     setRecentPage(1);
@@ -499,7 +528,11 @@ export function TerminalSwitcher({
           return currentKey;
         }
 
-        const selectedKey = selectedWindowId === null ? null : recentItemKey(selectedWindowId);
+        const selectedKey = selectedWindowId === null
+          ? null
+          : isGlobalRecentMode && clientId !== null
+            ? `recent:${clientId}:${selectedWindowId}`
+            : recentItemKey(selectedWindowId);
         if (selectedKey !== null && recentKeys.includes(selectedKey)) {
           return selectedKey;
         }
@@ -516,7 +549,7 @@ export function TerminalSwitcher({
       );
       return selectedItem?.node.key ?? null;
     });
-  }, [isOpen, isRecentMode, recentKeys, selectedWindowId, visibleTreeItems]);
+  }, [clientId, isGlobalRecentMode, isOpen, isRecentMode, recentKeys, selectedWindowId, visibleTreeItems]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -525,12 +558,9 @@ export function TerminalSwitcher({
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (keyboardShortcutMatches(event, switchShortcut ?? null)) {
-        return;
-      }
-
-      if (event.key === "Escape") {
         event.preventDefault();
-        onClose();
+        event.stopPropagation();
+        onToggleModeShortcut?.();
         return;
       }
 
@@ -589,8 +619,11 @@ export function TerminalSwitcher({
 
         event.preventDefault();
         if (isRecentMode) {
-          const windowId = activeKey.slice("recent:".length);
-          onSelectWindow(windowId);
+          const item = recentItems.find((candidate) => scopedRecentItemKey(candidate, isGlobalRecentMode) === activeKey);
+          if (item === undefined) {
+            return;
+          }
+          onSelectWindow(item.window_id, isGlobalTerminalRecent(item) ? item.client_id : undefined);
           onClose();
           return;
         }
@@ -625,8 +658,11 @@ export function TerminalSwitcher({
     navigableKeys,
     onClose,
     onSelectWindow,
+    onToggleModeShortcut,
     isRecentMode,
+    isGlobalRecentMode,
     switchShortcut,
+    recentItems,
     visibleTreeItems
   ]);
 
@@ -651,8 +687,8 @@ export function TerminalSwitcher({
       return nextKeys;
     });
   };
-  const selectRecent = (item: TerminalRecent) => {
-    onSelectWindow(item.window_id);
+  const selectRecent = (item: TerminalRecent | GlobalTerminalRecent) => {
+    onSelectWindow(item.window_id, isGlobalTerminalRecent(item) ? item.client_id : undefined);
     onClose();
   };
 
@@ -669,6 +705,7 @@ export function TerminalSwitcher({
         aria-modal="true"
         className="terminal-switcher"
         data-onboarding-id="terminal-switcher"
+        ref={panelRef}
         role="dialog"
       >
         <div className="terminal-switcher-header">
@@ -676,7 +713,7 @@ export function TerminalSwitcher({
             <h2>Switch terminal</h2>
             <p className="muted">
               {isRecentMode
-                ? `最近使用的终端 · ${switchShortcutLabel} 按项目/主题浏览`
+                ? `${isGlobalRecentMode ? "跨 Client 最近使用的终端" : "最近使用的终端"} · ${switchShortcutLabel} 按项目/主题浏览`
                 : `${TERMINAL_GROUPING_DESCRIPTIONS[terminalGroupingMode]} · ${switchShortcutLabel} 查看最近`}
             </p>
           </div>
@@ -686,7 +723,6 @@ export function TerminalSwitcher({
         </div>
 
         <input
-          ref={inputRef}
           aria-label="Search terminals"
           value={query}
           onChange={(event) => {
@@ -699,12 +735,12 @@ export function TerminalSwitcher({
           placeholder={isRecentMode ? "Search recent terminals..." : "Search terminals..."}
         />
 
-        {clientId === null && <p className="terminal-switcher-empty">Select a client first.</p>}
-        {clientId !== null && entries.length === 0 && (
+        {clientId === null && !isGlobalRecentMode && <p className="terminal-switcher-empty">Select a client first.</p>}
+        {clientId !== null && !isGlobalRecentMode && entries.length === 0 && (
           <p className="terminal-switcher-empty">No terminals in this client.</p>
         )}
 
-        {clientId !== null && isRecentMode && (
+        {(clientId !== null || isGlobalRecentMode) && isRecentMode && (
           <>
             {recentsQuery.isLoading && <p className="terminal-switcher-empty">Loading recent terminals...</p>}
             {recentsQuery.isError && (
@@ -718,12 +754,14 @@ export function TerminalSwitcher({
             {!recentsQuery.isLoading && !recentsQuery.isError && recentItems.length > 0 && (
               <ul className="terminal-switcher-results terminal-switcher-recents" role="listbox" aria-label="Recently used terminals">
                 {recentItems.map((item) => {
-                  const key = recentItemKey(item.window_id);
+                  const key = scopedRecentItemKey(item, isGlobalRecentMode);
                   const treeWindow = findWindowInTree(folders ?? [], item.window_id);
                   const isActive = key === activeKey;
-                  const isSelected = item.window_id === selectedWindowId;
+                  const isSelected = item.window_id === selectedWindowId
+                    && (!isGlobalTerminalRecent(item) || item.client_id === clientId);
                   const showUnreadDot = hasUnreadNotification?.(item.window_id) ?? false;
                   const meta = treeWindow ? terminalMeta(treeWindow, projectSummaryLookup) : null;
+                  const clientName = isGlobalTerminalRecent(item) ? item.client_name : null;
 
                   return (
                     <li key={key}>
@@ -738,6 +776,7 @@ export function TerminalSwitcher({
                       >
                         {treeWindow ? <WorkStatusDot status={treeWindow.work_status} /> : <span className="switcher-window-placeholder" aria-hidden="true" />}
                         <span className="switcher-window-title">{item.title}</span>
+                        {clientName !== null && <span className="switcher-client-name">{clientName}</span>}
                         {meta !== null && <TerminalWindowMeta meta={meta} />}
                         <TerminalUnreadDot visible={showUnreadDot} />
                       </button>

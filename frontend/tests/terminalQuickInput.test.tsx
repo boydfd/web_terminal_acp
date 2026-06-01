@@ -182,6 +182,35 @@ describe("TerminalQuickInput", () => {
     expect(onSubmit).toHaveBeenCalledWith("123");
   });
 
+  it("does not submit button clicks while IME composition is active", () => {
+    const onSubmit = vi.fn();
+    const textarea = renderQuickInput({
+      value: "",
+      onValueChange: () => {},
+      onSubmit,
+    });
+    const submitButton = Array.from(container?.querySelectorAll("button") ?? [])
+      .find((button) => button.textContent === "Send");
+    if (!(submitButton instanceof HTMLButtonElement)) {
+      throw new Error("Submit button was not rendered");
+    }
+
+    changeTextareaValue(textarea, "456");
+    compositionStart(textarea);
+    act(() => {
+      submitButton.click();
+    });
+
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    compositionEnd(textarea);
+    act(() => {
+      submitButton.click();
+    });
+
+    expect(onSubmit).toHaveBeenCalledWith("456");
+  });
+
   it("filters and submits custom quick keys", () => {
     const onCustomQuickKeySubmit = vi.fn(() => true);
     renderQuickInput({

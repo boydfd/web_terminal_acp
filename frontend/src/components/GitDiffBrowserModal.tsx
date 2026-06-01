@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { fetchGitRuns } from "../api";
@@ -17,6 +17,7 @@ import {
 } from "../gitDiff";
 import type { GitDiffCommitOption } from "../gitDiff";
 import type { GitDiffFile } from "../types";
+import { useOverlayFocus } from "./useOverlayFocus";
 
 type GitDiffBrowserStep = "commits" | "files" | "diff";
 
@@ -182,6 +183,7 @@ export function GitDiffBrowserModal({
   const [selectedCommitId, setSelectedCommitId] = useState<string | null>(null);
   const [selectedFileKey, setSelectedFileKey] = useState<string | null>(null);
   const [mobileStep, setMobileStep] = useState<GitDiffBrowserStep>("commits");
+  const panelRef = useRef<HTMLElement | null>(null);
   const runsQuery = useQuery({
     queryKey: ["git-runs", clientId, windowId],
     queryFn: () => fetchGitRuns(clientId, windowId),
@@ -223,27 +225,23 @@ export function GitDiffBrowserModal({
     }
   }, [isMobileLayout]);
 
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") {
-        return;
-      }
-      event.preventDefault();
-      event.stopPropagation();
-      if (isMobileLayout && mobileStep === "diff") {
-        setMobileStep("files");
-        return;
-      }
-      if (isMobileLayout && mobileStep === "files") {
-        setMobileStep("commits");
-        return;
-      }
-      onClose();
-    };
-
-    window.addEventListener("keydown", handleKeyDown, { capture: true });
-    return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
+  const handleEscape = useCallback(() => {
+    if (isMobileLayout && mobileStep === "diff") {
+      setMobileStep("files");
+      return;
+    }
+    if (isMobileLayout && mobileStep === "files") {
+      setMobileStep("commits");
+      return;
+    }
+    onClose();
   }, [isMobileLayout, mobileStep, onClose]);
+
+  useOverlayFocus({
+    isOpen: true,
+    ref: panelRef,
+    onEscape: handleEscape
+  });
 
   const handleSelectCommit = (option: GitDiffCommitOption) => {
     setSelectedCommitId(option.id);
@@ -281,7 +279,7 @@ export function GitDiffBrowserModal({
 
   return (
     <div className="git-diff-browser-modal" role="dialog" aria-modal="true" aria-label="Git diff browser">
-      <section className={`git-diff-browser-panel${isMobileLayout ? " mobile" : ""}`}>
+      <section ref={panelRef} className={`git-diff-browser-panel${isMobileLayout ? " mobile" : ""}`}>
         <header className="git-diff-browser-header">
           <div>
             <strong>{title}</strong>

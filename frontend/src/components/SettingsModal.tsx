@@ -17,7 +17,7 @@ import {
 } from "../userPreferences";
 import { ensureDesktopNotificationPermission } from "../desktopNotifications";
 import { readApiBase, readConfiguredApiBase, writeConfiguredApiBase } from "../apiBase";
-import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   createCustomQuickKey,
   quickKeyToken,
@@ -36,6 +36,7 @@ import {
   type KeyboardShortcutId
 } from "../keyboardShortcuts";
 import { THEME_SKINS } from "../themeSkins";
+import { useOverlayFocus } from "./useOverlayFocus";
 
 export type SettingsView = "general" | "theme" | "shortcuts" | "quick-keys";
 type ShortcutBindingTarget =
@@ -179,6 +180,7 @@ export function SettingsModal({
   const [view, setView] = useState<SettingsView>("general");
   const [quickKeyDraft, setQuickKeyDraft] = useState<CustomQuickKey>(() => createCustomQuickKey());
   const [recordingShortcutTarget, setRecordingShortcutTarget] = useState<ShortcutBindingTarget | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
   const quickKeyDraftValid = quickKeyDraft.label.trim().length > 0 && quickKeyDraft.input.length > 0;
   const shortcutRows: Array<{
     target: ShortcutBindingTarget;
@@ -209,29 +211,20 @@ export function SettingsModal({
     }
   }, [initialView, isOpen]);
 
-  useEffect(() => {
-    if (!isOpen) {
+  const handleEscape = useCallback(() => {
+    if (recordingShortcutTarget !== null) {
+      setRecordingShortcutTarget(null);
       return;
     }
 
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented) {
-        return;
-      }
+    onClose();
+  }, [onClose, recordingShortcutTarget]);
 
-      if (recordingShortcutTarget !== null) {
-        event.preventDefault();
-        setRecordingShortcutTarget(null);
-        return;
-      }
-
-      event.preventDefault();
-      onClose();
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isOpen, onClose, recordingShortcutTarget]);
+  useOverlayFocus({
+    isOpen,
+    ref: panelRef,
+    onEscape: handleEscape
+  });
 
   if (!isOpen) {
     return null;
@@ -353,6 +346,7 @@ export function SettingsModal({
       }}
     >
       <div
+        ref={panelRef}
         aria-modal="true"
         className={["settings-modal", view !== "general" ? "settings-modal-wide" : ""].filter(Boolean).join(" ")}
         data-onboarding-id="settings-modal"

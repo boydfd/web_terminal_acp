@@ -3966,6 +3966,95 @@ html.electron-app .terminal-immersive .workspace {
   font-size: 12px;
 }
 
+.client-switcher-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 25;
+  display: grid;
+  align-items: start;
+  justify-items: center;
+  background: rgb(2 6 23 / 72%);
+  padding: 9vh 16px 16px;
+}
+
+.client-switcher {
+  width: min(560px, 100%);
+  max-height: min(70vh, 620px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #0f172a;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 45%);
+  padding: 14px;
+}
+
+.client-switcher-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.client-switcher-header h2 {
+  margin-bottom: 4px;
+  font-size: 18px;
+}
+
+.client-switcher-header p {
+  margin: 0;
+  font-size: 12px;
+}
+
+.client-switcher-empty {
+  margin: 16px 0;
+  color: #94a3b8;
+  text-align: center;
+}
+
+.client-switcher-results {
+  min-height: 0;
+  display: grid;
+  gap: 6px;
+  overflow: auto;
+  padding: 0;
+  list-style: none;
+  margin: 0;
+}
+
+.client-switcher-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #111827;
+  text-align: left;
+}
+
+.client-switcher-row:hover,
+.client-switcher-row.active {
+  border-color: #38bdf8;
+  background: #082f49;
+}
+
+.client-switcher-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #e2e8f0;
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.client-switcher-meta {
+  flex: 0 0 auto;
+  color: #94a3b8;
+  font-size: 12px;
+}
+
 .project-terminal-picker-backdrop {
   position: fixed;
   inset: 0;
@@ -4258,6 +4347,18 @@ html.electron-app .terminal-immersive .workspace {
 
 .switcher-window-title {
   flex: 1 1 auto;
+}
+
+.switcher-client-name {
+  flex: 0 1 auto;
+  max-width: 28%;
+  border: 1px solid #334155;
+  border-radius: 999px;
+  background: #0f172a;
+  color: #cbd5e1;
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 1;
 }
 
 .switcher-window-meta {
@@ -4776,7 +4877,21 @@ html.electron-app .terminal-immersive .workspace {
       max(8px, env(safe-area-inset-left, 0px));
   }
 
+  .client-switcher-backdrop {
+    align-items: end;
+    padding: 10px max(8px, env(safe-area-inset-right, 0px)) max(10px, env(safe-area-inset-bottom, 0px))
+      max(8px, env(safe-area-inset-left, 0px));
+  }
+
   .terminal-switcher {
+    width: min(100%, 420px);
+    max-width: calc(100vw - 16px);
+    max-height: min(82dvh, calc(var(--web-terminal-viewport-height, 100dvh) - 20px));
+    gap: 10px;
+    padding: 10px;
+  }
+
+  .client-switcher {
     width: min(100%, 420px);
     max-width: calc(100vw - 16px);
     max-height: min(82dvh, calc(var(--web-terminal-viewport-height, 100dvh) - 20px));
@@ -4789,11 +4904,27 @@ html.electron-app .terminal-immersive .workspace {
     gap: 8px;
   }
 
+  .client-switcher-header {
+    align-items: center;
+    gap: 8px;
+  }
+
   .terminal-switcher-header h2 {
     font-size: 16px;
   }
 
+  .client-switcher-header h2 {
+    font-size: 16px;
+  }
+
   .terminal-switcher-header p {
+    overflow: hidden;
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .client-switcher-header p {
     overflow: hidden;
     font-size: 11px;
     text-overflow: ellipsis;
@@ -4805,12 +4936,27 @@ html.electron-app .terminal-immersive .workspace {
     padding: 7px 9px;
   }
 
+  .client-switcher-header button {
+    flex: 0 0 auto;
+    padding: 7px 9px;
+  }
+
   .terminal-switcher input {
     width: 100%;
     min-width: 0;
   }
 
+  .client-switcher input {
+    width: 100%;
+    min-width: 0;
+  }
+
   .terminal-switcher-results {
+    gap: 5px;
+    padding-right: 0;
+  }
+
+  .client-switcher-results {
     gap: 5px;
     padding-right: 0;
   }
