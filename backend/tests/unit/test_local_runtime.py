@@ -1,6 +1,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
+import signal
 import threading
 
 import pytest
@@ -19,6 +20,16 @@ class FakeProcess:
 
     async def wait(self) -> int:
         return self.returncode or 0
+
+
+class FakeAttachedProcess:
+    returncode = None
+
+    def __init__(self) -> None:
+        self.signals: list[int] = []
+
+    def send_signal(self, signal_number: int) -> None:
+        self.signals.append(signal_number)
 
 
 @pytest.mark.asyncio
@@ -131,6 +142,7 @@ async def test_attach_recreates_missing_tmux_window_before_shadow_attach(monkeyp
 async def test_resize_ignores_repeated_dimensions(monkeypatch) -> None:
     resizes: list[tuple[int, int, int]] = []
     shadow_resizes: list[tuple[RuntimeWindow, int, int]] = []
+    process = FakeAttachedProcess()
     keepalive = asyncio.create_task(asyncio.sleep(10))
     window = RuntimeWindow(session_id="web-terminal", window_id="@7")
 
@@ -152,7 +164,7 @@ async def test_resize_ignores_repeated_dimensions(monkeypatch) -> None:
     runtime = LocalTerminalRuntime(FakeTmuxManager())
     runtime._sessions[(window.session_id, window.window_id)] = _LocalTerminalSession(
         master_fd=123,
-        process=object(),
+        process=process,
         task=keepalive,
     )
     try:
@@ -165,6 +177,7 @@ async def test_resize_ignores_repeated_dimensions(monkeypatch) -> None:
             await keepalive
 
     assert resizes == [(123, 80, 24), (123, 81, 24)]
+    assert process.signals == [signal.SIGWINCH, signal.SIGWINCH]
     assert shadow_resizes == [(window, 80, 24), (window, 81, 24)]
 
 
@@ -320,7 +333,7 @@ async def test_resize_returns_before_shadow_tmux_resize_completes(monkeypatch) -
     runtime = LocalTerminalRuntime(FakeTmuxManager())
     runtime._sessions[(window.session_id, window.window_id)] = _LocalTerminalSession(
         master_fd=123,
-        process=object(),
+        process=FakeAttachedProcess(),
         task=keepalive,
     )
     try:

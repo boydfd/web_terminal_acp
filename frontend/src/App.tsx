@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  auxTerminalWebSocketUrl,
   bootstrapClient,
   createClientRegistrationKey,
   createWindow,
@@ -9,10 +10,13 @@ import {
   deleteClient,
   deleteWindow,
   dismissTerminalNotification,
+  ensureAuxTerminal,
   fetchAuthStatus,
+  fetchAgentClients,
   fetchClients,
   fetchCustomQuickKeys,
   fetchProjectSummaries,
+  fetchTerminalProjects,
   fetchTerminalNotifications,
   fetchTree,
   fetchWindow,
@@ -54,7 +58,10 @@ import { WindowDetail } from "./components/WindowDetail";
 import {
   type SummaryOutputLanguage,
   type TerminalGroupingMode,
-  type ThemeSkinId
+  type TerminalTimeRange,
+  type ThemeSkinId,
+  readTerminalTimeRange,
+  writeTerminalTimeRange
 } from "./userPreferences";
 import {
   effectiveKeyboardShortcut,
@@ -69,6 +76,7 @@ import { terminalThemeForSkin, themeSkinClassName } from "./themeSkins";
 import { clearAuthToken, readAuthToken, writeAuthToken } from "./auth";
 import { isOnboardingEnabled } from "./onboarding";
 import {
+  agentDirectSubmitInput,
   clearLegacyCustomQuickKeys,
   decodeQuickKeyInput,
   normalizeCustomQuickKeys,
@@ -76,22 +84,27 @@ import {
   type CustomQuickKey
 } from "./terminalQuickKeys";
 import { ensureDesktopNotificationPermission, showAgentTaskDesktopNotification } from "./desktopNotifications";
+import { DEFAULT_AGENT_CLIENTS } from "./agentLaunch";
 import {
   findNewUnreadNotifications,
   normalizeTerminalNotifications,
   type TerminalNotification
 } from "./terminalNotifications";
 import {
-  collectCreatableProjectPaths,
   createWindowInputForGroupNode,
+  isCreatableProjectPath,
   type SwitcherGroupNode
 } from "./terminalGrouping";
 import {
   activityHasWorkingTerminal,
+  firstProjectPath,
   mergeTreeWithActivity,
+  projectListContains,
+  projectPathForWindow,
   windowActivityMap
 } from "./terminalTree";
 import { terminalRuntimeReadiness, waitForTerminalRuntime } from "./terminalCreateReadiness";
+import { TERMINAL_TIME_RANGE_OPTIONS, isTerminalTimeRange } from "./terminalTimeRange";
 import {
   applyUiInvalidation,
   isActivityOnlyWindowInvalidation,
@@ -116,7 +129,6 @@ type AddClientMode = "bootstrap" | "registration";
 const TERMINAL_VIEWPORT_STORAGE_KEY = "web-terminal-acp:terminal-viewport-mode";
 const CLIENT_WINDOW_SELECTION_STORAGE_KEY = "web-terminal-acp:client-window-selections";
 const CLIENT_RECENCY_STORAGE_KEY = "web-terminal-acp:client-recency";
-const TERMINAL_ENTER_INPUT = "\r";
 const MOBILE_SHORTCUT_DIRECTION_INPUT: Record<MobileShortcutDirection, string> = {
   up: "\x1b[A",
   down: "\x1b[B",
@@ -698,6 +710,7 @@ function AuthenticatedApp({
 
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
   const [selectedWindowId, setSelectedWindowId] = useState<string | null>(null);
+  const [selectedProjectPath, setSelectedProjectPath] = useState<string | null>(null);
   const [routeSelectionRequest, setRouteSelectionRequest] = useState<TerminalRouteSelection | null>(
     readTerminalRouteSelection
   );
@@ -727,6 +740,9 @@ function AuthenticatedApp({
   const [terminalGroupingMode, setTerminalGroupingMode] = useState<TerminalGroupingMode>(
     () => readInitialSettings().terminalGroupingMode
   );
+  const [terminalTimeRange, setTerminalTimeRange] = useState<TerminalTimeRange>(
+    () => readTerminalTimeRange()
+  );
   const [themeSkin, setThemeSkin] = useState<ThemeSkinId>(
     () => readInitialSettings().themeSkin
   );
@@ -745,6 +761,8 @@ function AuthenticatedApp({
   const [terminalQuickInputDraft, setTerminalQuickInputDraft] = useState("");
   const [terminalConnectionStatus, setTerminalConnectionStatus] = useState<TerminalConnectionStatus>("connecting");
   const [terminalImmersive, setTerminalImmersive] = useState(false);
+  const [auxTerminalOpen, setAuxTerminalOpen] = useState(false);
+  const [auxTerminalMounted, setAuxTerminalMounted] = useState(false);
   const [notificationCenterOpen, setNotificationCenterOpen] = useState(false);
   const [gitDiffBrowserOpen, setGitDiffBrowserOpen] = useState(false);
   const [agentRecordModalOpen, setAgentRecordModalOpen] = useState(false);
@@ -757,11 +775,25 @@ function AuthenticatedApp({
   const virtualKeysPreferenceTouchedRef = useRef(false);
   const terminalControlsRef = useRef<HTMLDivElement | null>(null);
   const terminalPaneRef = useRef<TerminalPaneHandle | null>(null);
+  const auxTerminalPaneRef = useRef<TerminalPaneHandle | null>(null);
+  const auxTerminalSelectionRef = useRef<{ clientId: string | null; windowId: string | null }>({
+    clientId: null,
+    windowId: null
+  });
   const terminalCreateWaitRef = useRef(0);
   const queryClient = useQueryClient();
 
   const registrationKeyMutation = useMutation({
     mutationFn: (label?: string | null) => createClientRegistrationKey(label),
+  });
+
+  const {
+    mutate: ensureAuxTerminalReady,
+    isPending: auxTerminalStarting,
+    isError: auxTerminalUnavailable
+  } = useMutation({
+    mutationFn: ({ clientId, windowId }: { clientId: string; windowId: string }) =>
+      ensureAuxTerminal(clientId, windowId),
   });
 
   const agentRecordModal = useAgentRecordData({
@@ -822,7 +854,7 @@ function AuthenticatedApp({
       if (!reserveWindowActivityRefresh(event, lastActivityRefetchAt)) {
         return;
       }
-      void queryClient.invalidateQueries({ queryKey: ["window-activity", event.client_id] });
+      void queryClient.invalidateQueries({ queryKey: ["window-activity", event.client_id], exact: false });
       trackDelayedRefresh(event.client_id, scheduleWindowActivityRefresh(queryClient, event, (timer) => {
         if (event.client_id !== null && delayedRefreshTimers.get(event.client_id) === timer) {
           delayedRefreshTimers.delete(event.client_id);
@@ -925,14 +957,6 @@ function AuthenticatedApp({
     });
   }, []);
 
-  const submitAgentPreviewQuickInput = useCallback((draft: string) => {
-    if (draft.length === 0) {
-      return false;
-    }
-
-    return terminalPaneRef.current?.submitQuickInput(`${draft}${TERMINAL_ENTER_INPUT}`) ?? false;
-  }, []);
-
   const customQuickKeysQuery = useQuery({
     queryKey: ["custom-quick-keys"],
     queryFn: fetchCustomQuickKeys
@@ -1022,17 +1046,58 @@ function AuthenticatedApp({
   }, []);
 
   const clientsQuery = useQuery({ queryKey: ["clients"], queryFn: fetchClients, refetchInterval: 10000 });
-  const treeQuery = useQuery({
-    queryKey: ["tree", selectedClientId],
-    queryFn: () => fetchTree(selectedClientId as string),
+  const agentClientsQuery = useQuery({
+    queryKey: ["agent-clients", selectedClientId],
+    queryFn: () => fetchAgentClients(selectedClientId as string),
+    enabled: selectedClientId !== null,
+    staleTime: 60000
+  });
+  const agentClients = agentClientsQuery.data?.agent_clients ?? DEFAULT_AGENT_CLIENTS;
+  const terminalProjectsQuery = useQuery({
+    queryKey: ["terminal-projects", selectedClientId, terminalTimeRange],
+    queryFn: () => fetchTerminalProjects(selectedClientId as string, terminalTimeRange),
     enabled: selectedClientId !== null,
     refetchInterval: 10000
   });
+  const treeQuery = useQuery({
+    queryKey: ["tree", selectedClientId, terminalTimeRange, selectedProjectPath],
+    queryFn: () => fetchTree(selectedClientId as string, terminalTimeRange, selectedProjectPath),
+    enabled: selectedClientId !== null && selectedProjectPath !== null,
+    refetchInterval: 10000
+  });
   const windowActivityQuery = useQuery({
-    queryKey: ["window-activity", selectedClientId],
-    queryFn: () => fetchWindowActivity(selectedClientId as string, { includeRuntimeTags: true }),
-    enabled: selectedClientId !== null && treeQuery.isSuccess,
+    queryKey: ["window-activity", selectedClientId, terminalTimeRange, selectedProjectPath],
+    queryFn: () => fetchWindowActivity(selectedClientId as string, {
+      includeRuntimeTags: true,
+      range: terminalTimeRange,
+      projectPath: selectedProjectPath
+    }),
+    enabled: selectedClientId !== null && selectedProjectPath !== null && treeQuery.isSuccess,
     refetchInterval: (query) => (activityHasWorkingTerminal(query.state.data) ? 3000 : 10000)
+  });
+  const terminalSwitcherTreeQuery = useQuery({
+    queryKey: ["tree", selectedClientId, terminalTimeRange, null],
+    queryFn: () => fetchTree(selectedClientId as string, terminalTimeRange, null),
+    enabled: selectedClientId !== null && terminalSwitcherOpen,
+    refetchInterval: 10000
+  });
+  const terminalSwitcherActivityQuery = useQuery({
+    queryKey: ["window-activity", selectedClientId, terminalTimeRange, null],
+    queryFn: () => fetchWindowActivity(selectedClientId as string, {
+      includeRuntimeTags: true,
+      range: terminalTimeRange,
+      projectPath: null
+    }),
+    enabled: selectedClientId !== null
+      && terminalSwitcherOpen
+      && terminalSwitcherTreeQuery.isSuccess,
+    refetchInterval: (query) => (activityHasWorkingTerminal(query.state.data) ? 3000 : 10000)
+  });
+  const selectedWindowQuery = useQuery({
+    queryKey: ["window", selectedClientId, selectedWindowId],
+    queryFn: () => fetchWindow(selectedClientId as string, selectedWindowId as string),
+    enabled: selectedClientId !== null && selectedWindowId !== null,
+    staleTime: 5000
   });
   const lastNotificationActivitySignature = useMemo(() => {
     if (!windowActivityQuery.data) {
@@ -1058,11 +1123,25 @@ function AuthenticatedApp({
     () => mergeTreeWithActivity(treeQuery.data, windowActivityMap(windowActivityQuery.data)),
     [treeQuery.data, windowActivityQuery.data]
   );
+  const terminalSwitcherFolders = useMemo(
+    () => mergeTreeWithActivity(
+      terminalSwitcherTreeQuery.data,
+      windowActivityMap(terminalSwitcherActivityQuery.data)
+    ) ?? treeFolders,
+    [
+      terminalSwitcherActivityQuery.data,
+      terminalSwitcherTreeQuery.data,
+      treeFolders
+    ]
+  );
   const selectedClient = clientsQuery.data?.find((client) => client.id === selectedClientId) ?? null;
   const selectedClientOffline = isRemoteClientOffline(selectedClient);
+  const terminalProjects = Array.isArray(terminalProjectsQuery.data) ? terminalProjectsQuery.data : [];
   const projectPaths = useMemo(
-    () => collectCreatableProjectPaths(treeFolders ?? []),
-    [treeFolders]
+    () => terminalProjects
+      .map((project) => project.project_path)
+      .filter(isCreatableProjectPath),
+    [terminalProjects]
   );
   const terminalTheme = useMemo(() => terminalThemeForSkin(themeSkin), [themeSkin]);
   const projectSummariesQuery = useQuery({
@@ -1071,10 +1150,21 @@ function AuthenticatedApp({
     enabled: selectedClientId !== null && projectTerminalPickerOpen
   });
   const selectedTreeWindow = findTreeWindow(treeFolders, selectedWindowId);
-  const selectedWindowTitle = selectedTreeWindow?.title ?? null;
+  const selectedWindow = selectedTreeWindow ?? selectedWindowQuery.data ?? null;
+  const selectedWindowTitle = selectedWindow?.title ?? null;
+  const submitAgentPreviewQuickInput = useCallback((draft: string) => {
+    if (draft.length === 0) {
+      return false;
+    }
+
+    return terminalPaneRef.current?.submitQuickInput(
+      `${draft}${agentDirectSubmitInput(selectedWindow?.runtime_tags)}`
+    ) ?? false;
+  }, [selectedWindow?.runtime_tags]);
   const selectCreatedTerminal = useCallback((window: VirtualWindow, mode: "push" | "replace" = "push") => {
     setSelectedClientId(window.client_id);
     setSelectedWindowId(window.id);
+    setSelectedProjectPath(projectPathForWindow(window));
     rememberClientUse(window.client_id);
     rememberClientWindowSelection(window.client_id, window.id);
     setRouteSelectionRequest(null);
@@ -1095,8 +1185,9 @@ function AuthenticatedApp({
     onSuccess: async (window, variables) => {
       const waitId = terminalCreateWaitRef.current + 1;
       terminalCreateWaitRef.current = waitId;
-      queryClient.invalidateQueries({ queryKey: ["tree", window.client_id] });
-      queryClient.invalidateQueries({ queryKey: ["window-activity", window.client_id] });
+      queryClient.invalidateQueries({ queryKey: ["terminal-projects", window.client_id], exact: false });
+      queryClient.invalidateQueries({ queryKey: ["tree", window.client_id], exact: false });
+      queryClient.invalidateQueries({ queryKey: ["window-activity", window.client_id], exact: false });
       queryClient.setQueryData(["window", window.client_id, window.id], window);
 
       let createSurfacesClosed = false;
@@ -1129,8 +1220,9 @@ function AuthenticatedApp({
         }
 
         queryClient.setQueryData(["window", readyWindow.client_id, readyWindow.id], readyWindow);
-        queryClient.invalidateQueries({ queryKey: ["tree", readyWindow.client_id] });
-        queryClient.invalidateQueries({ queryKey: ["window-activity", readyWindow.client_id] });
+        queryClient.invalidateQueries({ queryKey: ["terminal-projects", readyWindow.client_id], exact: false });
+        queryClient.invalidateQueries({ queryKey: ["tree", readyWindow.client_id], exact: false });
+        queryClient.invalidateQueries({ queryKey: ["window-activity", readyWindow.client_id], exact: false });
         selectCreatedTerminal(readyWindow);
         closeCreateSurfaces();
       } catch {
@@ -1153,8 +1245,9 @@ function AuthenticatedApp({
   const deleteMutation = useMutation({
     mutationFn: ({ clientId, windowId }: DeleteWindowVariables) => deleteWindow(clientId, windowId),
     onSuccess: (_result, { clientId, windowId, nextWindowId }) => {
-      queryClient.invalidateQueries({ queryKey: ["tree", clientId] });
-      queryClient.invalidateQueries({ queryKey: ["window-activity", clientId] });
+      queryClient.invalidateQueries({ queryKey: ["tree", clientId], exact: false });
+      queryClient.invalidateQueries({ queryKey: ["terminal-projects", clientId], exact: false });
+      queryClient.invalidateQueries({ queryKey: ["window-activity", clientId], exact: false });
       queryClient.invalidateQueries({ queryKey: ["terminal-recents", "global"] });
       setTerminalNotifications((current) => current.filter((notification) => notification.windowId !== windowId));
       setSelectedWindowId((currentWindowId) => {
@@ -1179,8 +1272,9 @@ function AuthenticatedApp({
   const deleteClientMutation = useMutation({
     mutationFn: ({ clientId }: DeleteClientVariables) => deleteClient(clientId),
     onSuccess: (_result, { clientId }) => {
-      queryClient.removeQueries({ queryKey: ["tree", clientId] });
-      queryClient.removeQueries({ queryKey: ["window-activity", clientId] });
+      queryClient.removeQueries({ queryKey: ["tree", clientId], exact: false });
+      queryClient.removeQueries({ queryKey: ["terminal-projects", clientId], exact: false });
+      queryClient.removeQueries({ queryKey: ["window-activity", clientId], exact: false });
       queryClient.removeQueries({ queryKey: ["terminal-notifications", clientId] });
       queryClient.removeQueries({ queryKey: ["terminal-recents", clientId] });
       queryClient.invalidateQueries({ queryKey: ["terminal-recents", "global"] });
@@ -1209,6 +1303,7 @@ function AuthenticatedApp({
       setDeferredTreeSelection(null);
       setSelectedClientId(null);
       setSelectedWindowId(null);
+      setSelectedProjectPath(null);
       setMobileTerminalActive(false);
       setDetailPanelOpen(false);
       setTerminalImmersive(false);
@@ -1266,6 +1361,7 @@ function AuthenticatedApp({
       if (selectedClientId !== null) {
         setSelectedClientId(null);
         setSelectedWindowId(null);
+        setSelectedProjectPath(null);
         setDeferredTreeSelection(null);
         setAgentRecordModalOpen(false);
         writeTerminalRoute(null, null, "replace");
@@ -1287,6 +1383,7 @@ function AuthenticatedApp({
         ? routeSelectionRequest.windowId
         : clientWindowSelections[nextClient.id]?.windowId ?? null;
       setSelectedWindowId(nextWindowId);
+      setSelectedProjectPath(null);
       setDeferredTreeSelection(null);
       setAgentRecordModalOpen(false);
       if (requestedClient === null && routeSelectionRequest.clientId !== null) {
@@ -1304,6 +1401,7 @@ function AuthenticatedApp({
     setSelectedClientId(preferredClient.id);
     rememberClientUse(preferredClient.id);
     setSelectedWindowId(clientWindowSelections[preferredClient.id]?.windowId ?? null);
+    setSelectedProjectPath(null);
     setDeferredTreeSelection(null);
     setAgentRecordModalOpen(false);
   }, [clientWindowSelections, clientsQuery.data, rememberClientUse, routeSelectionRequest, selectedClientId]);
@@ -1385,6 +1483,12 @@ function AuthenticatedApp({
       afterCreate: () => setProjectTerminalPickerOpen(false)
     });
   }, [clientsQuery.data, createMutation, selectedClientId, terminalCreateBusy]);
+
+  const handleSelectProject = useCallback((projectPath: string) => {
+    setRouteSelectionRequest(null);
+    setDeferredTreeSelection(null);
+    setSelectedProjectPath(projectPath);
+  }, []);
 
   const handleConfigureTerminalAtProjectPath = useCallback((projectPath: string, agent: AgentLaunchKind) => {
     if (selectedClientId === null || terminalCreateBusy) {
@@ -1472,6 +1576,7 @@ function AuthenticatedApp({
     setTerminalControlsOpen(false);
     setTerminalSwitcherOpen(false);
     setNotificationCenterOpen(false);
+    agentRecordModal.setJumpRequest(null);
     agentRecordModal.setExpanded(true);
     setAgentRecordModalOpen(true);
   }, [agentRecordModal, selectedClientId, selectedWindowId]);
@@ -1481,11 +1586,15 @@ function AuthenticatedApp({
       return;
     }
 
+    const selectedWindowProjectPath = projectPathForWindow(selectedWindow);
+    if (selectedWindowProjectPath !== null) {
+      setSelectedProjectPath(selectedWindowProjectPath);
+    }
     setMobileTerminalActive(false);
     setTerminalImmersive(false);
     setTerminalControlsOpen(false);
     setTerminalListLocateSignal((signal) => signal + 1);
-  }, [selectedClientId, selectedWindowId]);
+  }, [selectedClientId, selectedWindow, selectedWindowId]);
 
   const triggerGitDiffBrowser = useCallback(() => {
     if (selectedClientId === null || selectedWindowId === null) {
@@ -1518,6 +1627,44 @@ function AuthenticatedApp({
     setSettingsOpen((open) => !open);
   }, []);
 
+  const focusAuxTerminal = useCallback(() => {
+    requestAnimationFrame(() => {
+      auxTerminalPaneRef.current?.refit();
+      auxTerminalPaneRef.current?.focus();
+    });
+  }, []);
+
+  const toggleAuxTerminal = useCallback(() => {
+    if (selectedClientId === null || selectedWindowId === null) {
+      return;
+    }
+
+    setTerminalControlsOpen(false);
+    setTerminalSwitcherOpen(false);
+    setClientSwitcherOpen(false);
+    setProjectTerminalPickerOpen(false);
+    setNotificationCenterOpen(false);
+    setSettingsOpen(false);
+    setAgentRecordModalOpen(false);
+    setGitDiffBrowserOpen(false);
+    const nextOpen = !auxTerminalOpen;
+    if (nextOpen) {
+      setAuxTerminalMounted(true);
+      ensureAuxTerminalReady({ clientId: selectedClientId, windowId: selectedWindowId });
+      focusAuxTerminal();
+    } else {
+      focusSelectedTerminal();
+    }
+    setAuxTerminalOpen(nextOpen);
+  }, [
+    auxTerminalOpen,
+    ensureAuxTerminalReady,
+    focusAuxTerminal,
+    focusSelectedTerminal,
+    selectedClientId,
+    selectedWindowId
+  ]);
+
   const toggleNotificationCenter = useCallback(() => {
     setNotificationCenterOpen((open) => !open);
   }, []);
@@ -1542,6 +1689,9 @@ function AuthenticatedApp({
         return true;
       case "new-terminal-project":
         triggerNewTerminalByProjectShortcut();
+        return true;
+      case "toggle-aux-terminal":
+        toggleAuxTerminal();
         return true;
       case "quick-input":
         triggerQuickInput();
@@ -1570,6 +1720,7 @@ function AuthenticatedApp({
     triggerNewTerminalByProjectShortcut,
     triggerNewTerminalShortcut,
     triggerQuickInput,
+    toggleAuxTerminal,
   ]);
 
   useEffect(() => {
@@ -1588,6 +1739,7 @@ function AuthenticatedApp({
         "switch-client",
         "switch-terminal",
         "new-terminal",
+        "toggle-aux-terminal",
         "quick-input",
         "expand-record",
         "locate-terminal",
@@ -1648,6 +1800,7 @@ function AuthenticatedApp({
         || terminalControlsOpen
         || gitDiffBrowserOpen
         || agentRecordModalOpen
+        || auxTerminalOpen
       ) {
         return;
       }
@@ -1682,6 +1835,7 @@ function AuthenticatedApp({
     settingsOpen,
     addClientModalOpen,
     agentRecordModalOpen,
+    auxTerminalOpen,
     terminalCreateContext,
     terminalControlsOpen,
     terminalSwitcherOpen
@@ -1696,8 +1850,63 @@ function AuthenticatedApp({
     setNotificationCenterOpen(false);
     setGitDiffBrowserOpen(false);
     setAgentRecordModalOpen(false);
+    setAuxTerminalOpen(false);
+    setAuxTerminalMounted(false);
     setTerminalCreateContext(null);
   }, [selectedClientId]);
+
+  useEffect(() => {
+    if (selectedClientId === null) {
+      setSelectedProjectPath(null);
+    }
+  }, [selectedClientId]);
+
+  useEffect(() => {
+    if (!terminalProjectsQuery.isSuccess) {
+      return;
+    }
+
+    const projects = terminalProjects;
+    setSelectedProjectPath((currentProjectPath) => {
+      if (projectListContains(projects, currentProjectPath)) {
+        return currentProjectPath;
+      }
+
+      const selectedWindowProjectPath = projectPathForWindow(selectedWindow);
+      if (projectListContains(projects, selectedWindowProjectPath)) {
+        return selectedWindowProjectPath;
+      }
+
+      if (selectedWindowId !== null && selectedWindow === null) {
+        return currentProjectPath;
+      }
+
+      return firstProjectPath(projects);
+    });
+  }, [
+    selectedClientId,
+    selectedWindow,
+    selectedWindowId,
+    terminalProjects,
+    terminalProjectsQuery.isSuccess
+  ]);
+
+  useEffect(() => {
+    const previousSelection = auxTerminalSelectionRef.current;
+    const selectionChanged = (
+      previousSelection.clientId !== selectedClientId
+      || previousSelection.windowId !== selectedWindowId
+    );
+    auxTerminalSelectionRef.current = { clientId: selectedClientId, windowId: selectedWindowId };
+    if (selectedClientId === null || selectedWindowId === null) {
+      setAuxTerminalOpen(false);
+      setAuxTerminalMounted(false);
+      return;
+    }
+    if (selectionChanged && !auxTerminalOpen) {
+      setAuxTerminalMounted(false);
+    }
+  }, [auxTerminalOpen, selectedClientId, selectedWindowId]);
 
   useEffect(() => {
     if (selectedClientId === null) {
@@ -1789,10 +1998,22 @@ function AuthenticatedApp({
       routeSelectionRequest !== null ||
       selectedClientId === null ||
       selectedWindowId === null ||
+      selectedProjectPath === null ||
       treeFolders === undefined ||
       treeQuery.isFetching ||
+      !projectListContains(terminalProjects, selectedProjectPath)
+    ) {
+      return;
+    }
+
+    if (
       treeContainsWindow(treeFolders, selectedWindowId)
     ) {
+      return;
+    }
+
+    const selectedWindowProjectPath = projectPathForWindow(selectedWindow);
+    if (selectedWindowProjectPath !== null && selectedWindowProjectPath !== selectedProjectPath) {
       return;
     }
 
@@ -1807,6 +2028,9 @@ function AuthenticatedApp({
     routeSelectionRequest,
     selectedClientId,
     selectedWindowId,
+    selectedProjectPath,
+    selectedWindow,
+    terminalProjects,
     treeFolders,
     treeQuery.isFetching
   ]);
@@ -1814,6 +2038,10 @@ function AuthenticatedApp({
   useEffect(() => {
     window.localStorage.setItem(TERMINAL_VIEWPORT_STORAGE_KEY, terminalViewportMode);
   }, [terminalViewportMode]);
+
+  useEffect(() => {
+    writeTerminalTimeRange(terminalTimeRange);
+  }, [terminalTimeRange]);
 
   useEffect(() => {
     if (!isMobileLayout || selectedClientId === null || selectedWindowId === null) {
@@ -1869,6 +2097,7 @@ function AuthenticatedApp({
     setDeferredTreeSelection(null);
     setSelectedClientId(clientId);
     setSelectedWindowId(rememberedWindowId);
+    setSelectedProjectPath(null);
     rememberClientUse(clientId);
     setMobileTerminalActive(false);
     setDetailPanelOpen(false);
@@ -1885,6 +2114,12 @@ function AuthenticatedApp({
     const selectedTitle = selectingCurrentClient && windowId === selectedWindowId
       ? findWindowTitle(treeFolders, windowId)
       : null;
+    const nextWindowProjectPath = selectingCurrentClient
+      ? projectPathForWindow(
+          findTreeWindow(treeFolders, windowId)
+          ?? findTreeWindow(terminalSwitcherFolders, windowId)
+        )
+      : null;
     if (selectedTitle !== null && selectingCurrentClient) {
       persistTerminalRecent(clientId, windowId, selectedTitle);
     }
@@ -1893,6 +2128,7 @@ function AuthenticatedApp({
     setDeferredTreeSelection(null);
     setSelectedClientId(clientId);
     setSelectedWindowId(windowId);
+    setSelectedProjectPath(selectingCurrentClient ? nextWindowProjectPath : null);
     rememberClientUse(clientId);
     rememberClientWindowSelection(clientId, windowId);
     setDetailPanelOpen(false);
@@ -1909,11 +2145,23 @@ function AuthenticatedApp({
     setRouteSelectionRequest(null);
     setDeferredTreeSelection(null);
     setSelectedWindowId(windowId);
+    setSelectedProjectPath(
+      projectPathForWindow(
+        findTreeWindow(treeFolders, windowId)
+        ?? findTreeWindow(terminalSwitcherFolders, windowId)
+      )
+    );
     rememberClientUse(selectedClientId);
     rememberClientWindowSelection(selectedClientId, windowId);
     setAgentRecordModalOpen(false);
     writeTerminalRoute(selectedClientId, windowId, "replace");
-  }, [rememberClientUse, rememberClientWindowSelection, selectedClientId]);
+  }, [
+    rememberClientUse,
+    rememberClientWindowSelection,
+    selectedClientId,
+    terminalSwitcherFolders,
+    treeFolders
+  ]);
 
   useEffect(() => {
     if (selectedClientId === null || selectedWindowId === null || selectedWindowTitle === null) {
@@ -1968,6 +2216,7 @@ function AuthenticatedApp({
     : switchTerminalShortcut;
   const newTerminalShortcutLabel = keyboardShortcutLabel(effectiveKeyboardShortcut("new-terminal", keyboardShortcutBindings));
   const quickInputShortcutLabel = keyboardShortcutLabel(effectiveKeyboardShortcut("quick-input", keyboardShortcutBindings));
+  const auxTerminalShortcutLabel = keyboardShortcutLabel(effectiveKeyboardShortcut("toggle-aux-terminal", keyboardShortcutBindings));
   const gitDiffShortcutLabel = keyboardShortcutLabel(effectiveKeyboardShortcut("git-diff", keyboardShortcutBindings));
   const settingsShortcutLabel = keyboardShortcutLabel(effectiveKeyboardShortcut("settings", keyboardShortcutBindings));
   const onboardingSteps = useMemo(
@@ -2045,6 +2294,7 @@ function AuthenticatedApp({
       setDeferredTreeSelection(null);
       setSelectedClientId(notification.clientId);
     }
+    setSelectedProjectPath(null);
     setDeferredTreeSelection(null);
     setSelectedWindowId(notification.windowId);
     rememberClientUse(notification.clientId);
@@ -2244,6 +2494,13 @@ function AuthenticatedApp({
         onPress: triggerQuickInput
       },
       {
+        id: "toggle-aux-terminal",
+        label: "Aux terminal",
+        hint: auxTerminalShortcutLabel,
+        disabled: selectedClientId === null || selectedWindowId === null,
+        onPress: toggleAuxTerminal
+      },
+      {
         id: "expand-record",
         label: "展开 Agent 记录",
         hint: keyboardShortcutLabel(effectiveKeyboardShortcut("expand-record", keyboardShortcutBindings)),
@@ -2292,6 +2549,7 @@ function AuthenticatedApp({
       selectedClientOffline,
       selectedWindowId,
       customQuickKeys,
+      auxTerminalShortcutLabel,
       submitCustomQuickKey,
       terminalCreateBusy,
       terminalConnectionStatus,
@@ -2302,6 +2560,7 @@ function AuthenticatedApp({
       triggerNewTerminalByProjectShortcut,
       triggerNewTerminalShortcut,
       triggerQuickInput,
+      toggleAuxTerminal,
       toggleNotificationCenter,
       toggleSettings,
       unreadNotificationCount
@@ -2365,20 +2624,34 @@ function AuthenticatedApp({
         {selectedClientOffline && <p className="muted">Client agent offline, waiting for reconnect.</p>}
         {createMutation.isError && <p className="error" role="alert">{createErrorMessage}</p>}
         {deleteMutation.isError && <p className="error" role="alert">{deleteErrorMessage}</p>}
-        {selectedClientId !== null && treeQuery.isLoading && <p className="muted">Loading tree...</p>}
+        {selectedClientId !== null && terminalProjectsQuery.isError && (
+          <p className="error" role="alert">Failed to load terminal projects.</p>
+        )}
         {selectedClientId !== null && treeQuery.isError && <p className="error" role="alert">Failed to load tree.</p>}
-        {selectedClientId !== null && treeFolders && (
+        {selectedClientId !== null && (
           <FolderTree
             clientId={selectedClientId}
-            folders={treeFolders}
+            folders={treeFolders ?? []}
+            projects={terminalProjects}
+            selectedProjectPath={selectedProjectPath}
+            loadingProjects={terminalProjectsQuery.isFetching}
+            loadingSelectedProject={selectedProjectPath !== null && (treeQuery.isLoading || windowActivityQuery.isLoading)}
             groupingMode={terminalGroupingMode}
+            timeRange={terminalTimeRange}
+            timeRangeOptions={TERMINAL_TIME_RANGE_OPTIONS}
             summaryOutputLanguage={summaryOutputLanguage}
             selectedWindowId={selectedWindowId}
             locateSelectedWindowSignal={terminalListLocateSignal}
             deletingWindowId={deletingWindowId}
             hasUnreadNotification={hasUnreadNotification}
+            onSelectProject={handleSelectProject}
             onSelectWindow={(window) => selectWindow(window.id)}
             onDeleteWindow={(window) => requestDeleteWindow(window.id, window.title)}
+            onTimeRangeChange={(range) => {
+              if (isTerminalTimeRange(range)) {
+                setTerminalTimeRange(range);
+              }
+            }}
             onCreateTerminalAtGroup={handleCreateTerminalAtGroup}
             onConfigureTerminalAtGroup={handleConfigureTerminalAtGroup}
             renderHeaderAction={() => (
@@ -2480,6 +2753,16 @@ function AuthenticatedApp({
                   role="menuitem"
                   className="terminal-controls-row"
                   disabled={selectedClientId === null || selectedWindowId === null}
+                  onClick={toggleAuxTerminal}
+                >
+                  <span>Aux terminal</span>
+                  <strong>{auxTerminalOpen ? "Open" : auxTerminalShortcutLabel}</strong>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="terminal-controls-row"
+                  disabled={selectedClientId === null || selectedWindowId === null}
                   onClick={() => {
                     setTerminalImmersive(true);
                     setDetailPanelOpen(false);
@@ -2563,6 +2846,50 @@ function AuthenticatedApp({
             <span>Creating {pendingTerminalCreate.title}...</span>
           </div>
         )}
+        {auxTerminalMounted && selectedClientId !== null && selectedWindowId !== null && (
+          <section
+            className="aux-terminal-drawer"
+            role="dialog"
+            aria-label="Aux terminal"
+            aria-hidden={!auxTerminalOpen}
+            data-open={auxTerminalOpen ? "true" : "false"}
+          >
+            <div className="aux-terminal-header">
+              <div className="aux-terminal-title">
+                <strong>Aux terminal</strong>
+                <span>{selectedWindowTitle ?? selectedWindowId}</span>
+              </div>
+              <div className="aux-terminal-header-actions">
+                {auxTerminalStarting && <span role="status">Starting...</span>}
+                {auxTerminalUnavailable && <span role="alert">Unavailable</span>}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuxTerminalOpen(false);
+                    focusSelectedTerminal();
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="aux-terminal-body">
+              <TerminalPane
+                key={`aux-terminal-${selectedClientId}-${selectedWindowId}`}
+                ref={auxTerminalPaneRef}
+                clientId={selectedClientId}
+                windowId={selectedWindowId}
+                webSocketUrl={auxTerminalWebSocketUrl}
+                selectionEnabled={false}
+                priorityEnabled={false}
+                autoFocus={auxTerminalOpen}
+                viewportMode="desktop"
+                theme={terminalTheme}
+                layoutVersion={auxTerminalOpen ? 1 : 0}
+              />
+            </div>
+          </section>
+        )}
       </section>
       <aside className="detail-panel" data-onboarding-id="detail-panel">
         <div className="detail-panel-mobile-header">
@@ -2603,11 +2930,14 @@ function AuthenticatedApp({
         onQuickInputSubmit={submitAgentPreviewQuickInput}
         onModeChange={agentRecordModal.setMode}
         onChatRoleFilterChange={agentRecordModal.setChatRoleFilter}
+        jumpRequest={agentRecordModal.jumpRequest}
         onClose={() => {
           agentRecordModal.setExpanded(false);
+          agentRecordModal.setJumpRequest(null);
+          agentRecordModal.setSelectedSessionId(null);
           setAgentRecordModalOpen(false);
         }}
-        onSessionChange={agentRecordModal.resetPages}
+        onSessionChange={agentRecordModal.setSelectedSessionId}
         onPreviousPage={agentRecordModal.previousPage}
         onNextPage={agentRecordModal.nextPage}
       />
@@ -2623,7 +2953,7 @@ function AuthenticatedApp({
       )}
       <TerminalSwitcher
         clientId={selectedClientId}
-        folders={treeFolders}
+        folders={terminalSwitcherFolders}
         mode={terminalSwitcherMode}
         recentScope={terminalSwitcherRecentScope}
         terminalGroupingMode={terminalGroupingMode}
@@ -2653,7 +2983,8 @@ function AuthenticatedApp({
         isOpen={projectTerminalPickerOpen}
         projectPaths={projectPaths}
         projectSummaries={projectSummariesQuery.data ?? []}
-        loadingProjects={treeQuery.isFetching || windowActivityQuery.isFetching}
+        agentClients={agentClients}
+        loadingProjects={terminalProjectsQuery.isFetching}
         creatingTerminal={terminalCreateBusy}
         createTerminalDisabled={selectedClientOffline}
         onClose={() => {
@@ -2688,6 +3019,7 @@ function AuthenticatedApp({
         desktopNotificationsEnabled={desktopNotificationsEnabled}
         keyboardShortcutBindings={keyboardShortcutBindings}
         customQuickKeys={customQuickKeys}
+        selectedClientId={selectedClientId}
         onSummaryOutputLanguageChange={setSummaryOutputLanguage}
         onTerminalGroupingModeChange={setTerminalGroupingMode}
         onThemeSkinChange={setThemeSkin}
@@ -2742,6 +3074,7 @@ function AuthenticatedApp({
           && !addClientModalOpen
           && !terminalQuickInputOpen
           && !gitDiffBrowserOpen
+          && !auxTerminalOpen
         }
         actions={mobileShortcutActions}
         onDirectionInput={submitMobileShortcutDirection}

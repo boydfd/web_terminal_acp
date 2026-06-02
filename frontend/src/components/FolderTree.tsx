@@ -12,7 +12,8 @@ import {
   type TerminalGroupingMode
 } from "../terminalGrouping";
 import type { SummaryOutputLanguage } from "../userPreferences";
-import type { ProjectSummary, TreeFolder, TreeWindow } from "../types";
+import type { TerminalTimeRange } from "../terminalTimeRange";
+import type { ProjectSummary, TerminalProject, TreeFolder, TreeWindow } from "../types";
 import { GitPendingBadge } from "./GitPendingBadge";
 import { TerminalUnreadDot } from "./NotificationCenter";
 import { WorkStatusDot } from "./WorkStatusBadge";
@@ -20,14 +21,22 @@ import { WorkStatusDot } from "./WorkStatusBadge";
 type FolderTreeProps = {
   clientId: string | null;
   folders: TreeFolder[];
+  projects?: TerminalProject[];
+  selectedProjectPath?: string | null;
+  loadingProjects?: boolean;
+  loadingSelectedProject?: boolean;
   groupingMode: TerminalGroupingMode;
+  timeRange: TerminalTimeRange;
+  timeRangeOptions: Array<{ value: TerminalTimeRange; label: string }>;
   summaryOutputLanguage: SummaryOutputLanguage;
   selectedWindowId: string | null;
   locateSelectedWindowSignal?: number;
   deletingWindowId?: string | null;
   hasUnreadNotification?: (windowId: string) => boolean;
+  onSelectProject?: (projectPath: string) => void;
   onSelectWindow: (window: TreeWindow) => void;
   onDeleteWindow: (window: TreeWindow) => void;
+  onTimeRangeChange: (range: TerminalTimeRange) => void;
   onCreateTerminalAtGroup?: (node: SwitcherGroupNode) => void;
   onConfigureTerminalAtGroup?: (node: SwitcherGroupNode) => void;
   renderHeaderAction?: () => ReactNode;
@@ -40,7 +49,7 @@ type CollapsedState = {
   keys: Set<string>;
 };
 
-function collapsedStorageKey(clientId: string | null, groupingMode: TerminalGroupingMode): string {
+function collapsedStorageKey(clientId: string | null, groupingMode: string): string {
   return `web-terminal-acp:terminals-tree:collapsed:${clientId ?? "no-client"}:${groupingMode}`;
 }
 
@@ -104,6 +113,67 @@ function writeCollapsedKeys(storageKey: string, keys: Set<string>) {
   } catch {
     return;
   }
+}
+
+function projectFallbackLabel(projectPath: string): string {
+  const segments = projectPath.split("/").filter(Boolean);
+  return segments[segments.length - 1] ?? projectPath;
+}
+
+function ProjectCardList({
+  projects,
+  selectedProjectPath,
+  projectSummaryLookup,
+  loadingProjects,
+  onSelectProject
+}: {
+  projects: TerminalProject[];
+  selectedProjectPath: string | null;
+  projectSummaryLookup: Map<string, ProjectSummary>;
+  loadingProjects?: boolean;
+  onSelectProject: (projectPath: string) => void;
+}) {
+  if (loadingProjects && projects.length === 0) {
+    return (
+      <div className="terminal-project-loading" role="status" aria-live="polite">
+        <span className="terminal-project-spinner" aria-hidden="true" />
+        <span>Loading projects...</span>
+      </div>
+    );
+  }
+
+  if (projects.length === 0) {
+    return <p className="muted terminal-project-empty">No terminal projects in this range.</p>;
+  }
+
+  return (
+    <div className="terminal-project-cards" aria-label="Terminal projects">
+      {projects.map((project) => {
+        const isSelected = project.project_path === selectedProjectPath;
+        const summary = projectSummaryLookup.get(project.project_path);
+        const label = summary?.display_name?.trim() || projectFallbackLabel(project.project_path);
+
+        return (
+          <button
+            key={project.project_path}
+            type="button"
+            aria-current={isSelected ? "true" : undefined}
+            className={isSelected ? "terminal-project-card selected" : "terminal-project-card"}
+            onClick={() => onSelectProject(project.project_path)}
+            title={project.project_path}
+          >
+            <span className="terminal-project-card-main">
+              <strong>{label}</strong>
+              {label !== project.project_path && (
+                <span>{project.project_path}</span>
+              )}
+            </span>
+            <span className="terminal-project-card-count">{project.window_count}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 function WindowNode({
@@ -320,14 +390,22 @@ function DisplayTreeNode({
 export function FolderTree({
   clientId,
   folders,
+  projects = [],
+  selectedProjectPath = null,
+  loadingProjects,
+  loadingSelectedProject,
   groupingMode,
+  timeRange,
+  timeRangeOptions,
   summaryOutputLanguage,
   selectedWindowId,
   locateSelectedWindowSignal = 0,
   deletingWindowId,
   hasUnreadNotification,
+  onSelectProject = () => {},
   onSelectWindow,
   onDeleteWindow,
+  onTimeRangeChange,
   onCreateTerminalAtGroup,
   onConfigureTerminalAtGroup,
   renderHeaderAction,
@@ -368,7 +446,7 @@ export function FolderTree({
     () => buildTerminalSwitcherTree(folders, groupingMode, projectSummaryLookup, ""),
     [folders, groupingMode, projectSummaryLookup]
   );
-  const storageKey = collapsedStorageKey(clientId, groupingMode);
+  const storageKey = collapsedStorageKey(clientId, `${groupingMode}:${selectedProjectPath ?? "no-project"}`);
   const [collapsedState, setCollapsedState] = useState<CollapsedState>(() => ({
     storageKey,
     keys: loadCollapsedKeys(storageKey, displayTree)
@@ -458,8 +536,40 @@ export function FolderTree({
     <div data-onboarding-id="terminal-tree">
       <div className="tree-header">
         <h2>Terminals</h2>
-        {renderHeaderAction?.()}
+        <div className="tree-header-actions">
+          <label className="terminal-range-control">
+            <span>Range</span>
+            <select
+              value={timeRange}
+              aria-label="Terminal time range"
+              onChange={(event) => onTimeRangeChange(event.target.value as TerminalTimeRange)}
+            >
+              {timeRangeOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          {renderHeaderAction?.()}
+        </div>
       </div>
+      <ProjectCardList
+        projects={projects}
+        selectedProjectPath={selectedProjectPath}
+        projectSummaryLookup={projectSummaryLookup}
+        loadingProjects={loadingProjects}
+        onSelectProject={onSelectProject}
+      />
+      {selectedProjectPath !== null && loadingSelectedProject && (
+        <div className="terminal-tree-loading" role="status" aria-live="polite">
+          <span className="terminal-project-spinner" aria-hidden="true" />
+          <span>Loading project tree...</span>
+        </div>
+      )}
+      {selectedProjectPath !== null && !loadingSelectedProject && displayTree.length === 0 && (
+        <p className="muted terminal-project-empty">No terminals in this project.</p>
+      )}
       <ul className="tree-root">
         {displayTree.map((node) => (
           <DisplayTreeNode

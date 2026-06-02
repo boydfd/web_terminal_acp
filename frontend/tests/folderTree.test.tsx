@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FolderTree } from "../src/components/FolderTree";
+import { TERMINAL_TIME_RANGE_OPTIONS } from "../src/terminalTimeRange";
 import type { TreeFolder } from "../src/types";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -52,6 +53,7 @@ function renderFolderTree(props: {
   folders: TreeFolder[];
   selectedWindowId?: string | null;
   locateSelectedWindowSignal?: number;
+  onTimeRangeChange?: (range: string) => void;
 }): HTMLButtonElement {
   if (container === null || root === null || queryClient === null) {
     container = document.createElement("div");
@@ -74,11 +76,14 @@ function renderFolderTree(props: {
           clientId="client-1"
           folders={props.folders}
           groupingMode="topic"
+          timeRange="7d"
+          timeRangeOptions={TERMINAL_TIME_RANGE_OPTIONS}
           summaryOutputLanguage="中文"
           selectedWindowId={props.selectedWindowId ?? "window-1"}
           locateSelectedWindowSignal={props.locateSelectedWindowSignal}
           onSelectWindow={() => {}}
           onDeleteWindow={() => {}}
+          onTimeRangeChange={props.onTimeRangeChange ?? (() => {})}
         />
       </QueryClientProvider>
     );
@@ -158,5 +163,24 @@ describe("FolderTree", () => {
     });
 
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the terminal time range selector with 7 days selected", () => {
+    renderFolderTree({
+      folders: treeWithTitle("Selected Terminal")
+    });
+
+    const select = container?.querySelector("select[aria-label='Terminal time range']");
+    expect(select).toBeInstanceOf(HTMLSelectElement);
+    expect((select as HTMLSelectElement).value).toBe("7d");
+    expect(Array.from((select as HTMLSelectElement).options).map((option) => option.value)).toEqual([
+      "1d",
+      "3d",
+      "5d",
+      "7d",
+      "14d",
+      "30d",
+      "all"
+    ]);
   });
 });

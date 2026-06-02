@@ -787,6 +787,26 @@ async def _handle_terminal_output_message(
     )
 
 
+async def _handle_aux_terminal_output_message(
+    websocket: WebSocket,
+    client_id: UUID,
+    message: AgentMessage,
+) -> None:
+    if message.window_id is None:
+        return
+    if not await _window_belongs_to_client(client_id, message.window_id):
+        return
+    payload = TerminalPayload.model_validate(message.payload)
+    view_id = _message_view_id(message)
+    if view_id is None:
+        return
+    await _terminal_broker(websocket).publish_output(
+        client_id,
+        view_id,
+        payload.to_bytes(),
+    )
+
+
 async def _handle_terminal_selection_message(
     websocket: WebSocket,
     client_id: UUID,
@@ -1281,6 +1301,10 @@ async def client_agent_bulk_websocket(websocket: WebSocket) -> None:
                 )
                 continue
 
+            if message.type == "aux_terminal_output":
+                await _handle_aux_terminal_output_message(websocket, client_id, message)
+                continue
+
             logger.warning(
                 "client-agent bulk websocket received unsupported message",
                 extra={
@@ -1443,7 +1467,7 @@ async def client_agent_websocket(websocket: WebSocket) -> None:
                 connection.mark_seen()
                 continue
 
-            if message.type in {"ai_event", "terminal_output"}:
+            if message.type in {"ai_event", "terminal_output", "aux_terminal_output"}:
                 logger.warning(
                     "client-agent bulk message received on control websocket",
                     extra={

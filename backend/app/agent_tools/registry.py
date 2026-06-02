@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import importlib
 import re
 from collections.abc import Iterable
 
 from app.models import EventSourceType
 
-from .adapters.claude_code import ClaudeCodeAdapter
-from .adapters.codex import CodexAdapter
-from .adapters.cursor_cli import CursorCliAdapter
+from app.agent_plugins import get_agent_plugin_registry
+from app.agent_plugins.types import AgentPlugin
 from .types import AgentToolAdapter
 
 
@@ -20,6 +20,7 @@ class AgentToolRegistry:
         return self._adapters
 
     def by_provider(self, provider: str) -> AgentToolAdapter:
+        provider = get_agent_plugin_registry().canonical_provider(provider)
         try:
             return self._by_provider[provider]
         except KeyError as exc:
@@ -60,13 +61,32 @@ class AgentToolRegistry:
         return source_types
 
     def command_pattern(self) -> re.Pattern[str]:
-        names = sorted(
-            {name for adapter in self._adapters for name in adapter.command_names},
-            key=len,
-            reverse=True,
-        )
+        names = get_agent_plugin_registry().command_names()
         return re.compile(r"(?:^|\b)(" + "|".join(re.escape(name) for name in names) + r")(?:\b|$)")
 
 
 def get_agent_tool_registry() -> AgentToolRegistry:
-    return AgentToolRegistry((CodexAdapter(), ClaudeCodeAdapter(), CursorCliAdapter()))
+    return AgentToolRegistry(
+        adapter
+        for plugin in get_agent_plugin_registry().all()
+        if (adapter := _adapter_from_plugin(plugin)) is not None
+    )
+
+
+def _adapter_from_plugin(plugin: AgentPlugin) -> AgentToolAdapter | None:
+    module_name = plugin.tool_adapter_module
+    class_name = plugin.tool_adapter_class
+    if module_name is None and class_name is None:
+        return None
+    if not module_name or not class_name:
+        raise ValueError(f"agent plugin {plugin.agent_client_id!r} has incomplete tool adapter metadata")
+    if not module_name.isidentifier() or not class_name.isidentifier():
+        raise ValueError(f"agent plugin {plugin.agent_client_id!r} has invalid tool adapter metadata")
+    module = importlib.import_module(f"app.agent_tools.adapters.{module_name}")
+    adapter = getattr(module, class_name)()
+    if adapter.provider_id != plugin.provider_id:
+        raise ValueError(
+            f"agent plugin {plugin.agent_client_id!r} adapter provider "
+            f"{adapter.provider_id!r} does not match {plugin.provider_id!r}"
+        )
+    return adapter

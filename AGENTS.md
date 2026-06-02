@@ -9,6 +9,13 @@
 - Increment `PATCH` for backward-compatible bug fixes, small UI adjustments, refactors, or internal-only client changes.
 - Keep all project version sources that represent the client in sync, such as `backend/app/version.py` and `frontend/package.json` when applicable.
 
+## Agent / Agent-Client Terminology
+
+- Use **agent-client** as the generic term for executable tools such as Claude Code, Codex, and Cursor CLI.
+- A Web Terminal ACP **agent** is a reusable profile stored under `~/.web-terminal-acp/agents/<profile-id>`.
+- Agent profiles own common `skills/`, `skills.disabled/`, and `AGENT.md`; Web Terminal materializes those into each agent-client's expected config names, such as Claude Code `CLAUDE.md` and Codex `AGENTS.md`.
+- Plugins and hooks are not treated as common agent content. They are selected per agent-client from that machine's global agent-client configuration.
+
 ## Web Terminal Agent 开发
 
 在 Web Terminal 管理 shell（已设置 `WEB_TERMINAL_WINDOW_ID`）中跑 agent 时，**必须先读取并严格遵循**项目 skill：
@@ -22,6 +29,7 @@
 - 项目级 skill 必须同时维护 Codex、Claude Code、Cursor 三份：`.codex/skills/<name>`、`.claude/skills/<name>`、`.cursor/skills/<name>`。
 - 新增或修改项目 skill 时，三份 `SKILL.md`、脚本和必要 metadata 必须保持行为一致；不要只更新其中一个 agent 的版本。
 - Android app 打包使用 `android-app-release` skill；常用入口是 `make android-release`、`make android-local-release`、`make android-debug`。
+- 慢 SQL / Postgres 性能排查必须使用 `slow-sql-analysis` skill；每次排查结论和处理方式必须记录到 `docs/performance-tuning/slow-sqls/`。
 
 ## Remote Client Bundle
 

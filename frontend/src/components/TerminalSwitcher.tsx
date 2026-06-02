@@ -736,7 +736,7 @@ export function TerminalSwitcher({
         />
 
         {clientId === null && !isGlobalRecentMode && <p className="terminal-switcher-empty">Select a client first.</p>}
-        {clientId !== null && !isGlobalRecentMode && entries.length === 0 && (
+        {clientId !== null && !isGlobalRecentMode && !isRecentMode && entries.length === 0 && (
           <p className="terminal-switcher-empty">No terminals in this client.</p>
         )}
 

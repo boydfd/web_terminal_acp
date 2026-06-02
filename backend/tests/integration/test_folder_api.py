@@ -1,4 +1,6 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -6,9 +8,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import get_session
 from app.main import app
-from app.models import ClientRuntime
+from app.models import ClientRuntime, VirtualWindow, WindowStatus
 from app.routers import folders as folders_router
 from app.repositories.clients import create_client, ensure_local_client
+from app.repositories.folders import get_or_create_folder_by_path
 from app.services import polling_response_cache
 from app.services.polling_response_cache import clear_polling_response_cache
 
@@ -125,7 +128,7 @@ async def test_tree_hot_cache_skips_client_and_tree_queries(sqlite_client, monke
     async def fail_require_client(_session, _client_id):
         raise AssertionError("hot tree cache should avoid client lookup")
 
-    async def fail_build_tree(_session, _client_id):
+    async def fail_build_tree(_session, _client_id, **_kwargs):
         raise AssertionError("hot tree cache should avoid tree query")
 
     monkeypatch.setattr(folders_router, "_require_client", fail_require_client)
@@ -148,12 +151,16 @@ async def test_tree_expired_cache_serves_stale_response(sqlite_client, monkeypat
     assert first_tree.status_code == 200
     refreshes = []
 
-    async def fail_build_tree(_session, _client_id):
+    async def fail_build_tree(_session, _client_id, **_kwargs):
         raise AssertionError("expired tree cache should return stale before refresh")
 
     monkeypatch.setattr(polling_response_cache, "_CACHE_TTL_SECONDS", -1.0)
     monkeypatch.setattr(folders_router, "build_tree", fail_build_tree)
-    monkeypatch.setattr(folders_router, "_refresh_response_cache", lambda cache_key, refresh: refreshes.append(cache_key))
+    monkeypatch.setattr(
+        folders_router,
+        "_refresh_response_cache",
+        lambda cache_key, refresh: refreshes.append(cache_key),
+    )
 
     second_tree = await sqlite_client.get(f"/api/clients/{client_id}/tree")
 
@@ -255,6 +262,60 @@ async def test_folder_api_allows_same_path_under_different_clients(sqlite_client
     assert remote_tree_response.status_code == 200
     assert local_tree_response.json()[0]["folders"][0]["id"] == local_response.json()["id"]
     assert remote_tree_response.json()[0]["folders"][0]["id"] == remote_response.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_tree_range_filters_windows_by_recent_activity(sqlite_client):
+    client_id = await get_local_client_id(sqlite_client)
+    client_uuid = UUID(client_id)
+    current = datetime.now(UTC)
+    async with sqlite_client.session_factory() as session:
+        folder = await get_or_create_folder_by_path(session, client_uuid, "/range")
+        old_window = VirtualWindow(
+            client_id=client_uuid,
+            folder_id=folder.id,
+            title="old terminal",
+            status=WindowStatus.active,
+            created_at=current - timedelta(days=20),
+            updated_at=current,
+        )
+        recent_output_window = VirtualWindow(
+            client_id=client_uuid,
+            folder_id=folder.id,
+            title="recent output",
+            status=WindowStatus.active,
+            created_at=current - timedelta(days=20),
+            updated_at=current - timedelta(days=20),
+            terminal_last_output_at=current - timedelta(days=2),
+        )
+        recent_created_window = VirtualWindow(
+            client_id=client_uuid,
+            folder_id=folder.id,
+            title="recent created",
+            status=WindowStatus.active,
+            created_at=current - timedelta(days=2),
+            updated_at=current - timedelta(days=2),
+        )
+        session.add_all([old_window, recent_output_window, recent_created_window])
+        await session.commit()
+
+    week_response = await sqlite_client.get(f"/api/clients/{client_id}/tree?range=7d")
+    all_response = await sqlite_client.get(f"/api/clients/{client_id}/tree?range=all")
+
+    assert week_response.status_code == 200
+    assert all_response.status_code == 200
+    week_titles = [
+        window["title"]
+        for root in week_response.json()
+        for window in root["windows"]
+    ]
+    all_titles = [
+        window["title"]
+        for root in all_response.json()
+        for window in root["windows"]
+    ]
+    assert week_titles == ["recent output", "recent created"]
+    assert all_titles == ["old terminal", "recent output", "recent created"]
 
 
 @pytest.mark.asyncio

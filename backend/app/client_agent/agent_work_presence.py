@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+from app.agent_plugins import get_agent_plugin_registry
 from app.client_agent.terminal import ClientTerminalMultiplexer
 from app.client_agent.tmux_runtime import ClientTmuxRuntime
 
@@ -16,12 +17,6 @@ logger = logging.getLogger(__name__)
 PRESENCE_SEND_INTERVAL_SECONDS = 30.0
 AGENT_WORK_PRESENCE_KIND = "agent_work_presence"
 PARENT_MAP_CACHE_TTL_SECONDS = 5.0
-
-_PROVIDER_COMMAND_NAMES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("claude_code", ("claude",)),
-    ("codex", ("codex",)),
-    ("cursor_cli", ("agent", "cursor", "cursor-agent")),
-)
 
 
 @dataclass(frozen=True)
@@ -49,7 +44,7 @@ _parent_map_cache = ParentMapCache()
 
 
 def agent_command_tokens() -> frozenset[str]:
-    names = {name for _, command_names in _PROVIDER_COMMAND_NAMES for name in command_names}
+    names = set(get_agent_plugin_registry().command_names())
     names.add("acpx")
     return frozenset(names)
 
@@ -207,18 +202,16 @@ def _provider_from_cmdline(cmdline: str, command_tokens: frozenset[str]) -> str 
     if not cmdline:
         return None
     basename = _command_name_from_cmdline(cmdline)
-    for provider_id, command_names in _PROVIDER_COMMAND_NAMES:
-        if basename in command_names:
-            return provider_id
-        if any(re.search(rf"(?:^|\s){re.escape(name)}(?:\s|$)", cmdline) for name in command_names):
-            return provider_id
+    for plugin in get_agent_plugin_registry().all():
+        if basename in plugin.command.command_names:
+            return plugin.provider_id
+        if any(re.search(rf"(?:^|\s){re.escape(name)}(?:\s|$)", cmdline) for name in plugin.command.command_names):
+            return plugin.provider_id
     if basename == "acpx" or re.search(r"(?:^|\s)acpx(?:\s|$)", cmdline):
-        for provider_id, command_names in _PROVIDER_COMMAND_NAMES:
-            for name in command_names:
+        for plugin in get_agent_plugin_registry().all():
+            for name in plugin.command.command_names:
                 if re.search(rf"(?:^|\s){re.escape(name)}(?:\s|$)", cmdline):
-                    return provider_id
+                    return plugin.provider_id
     if basename in command_tokens:
-        for provider_id, command_names in _PROVIDER_COMMAND_NAMES:
-            if basename in command_names:
-                return provider_id
+        return get_agent_plugin_registry().provider_for_command_name(basename)
     return None

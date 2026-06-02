@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shlex
 
+from app.agent_plugins import get_agent_plugin_registry
 from app.agent_tools import get_agent_tool_registry
 from app.models import AiSession, VirtualWindow
 
@@ -21,27 +22,15 @@ _FLAGS_WITH_VALUE = {
     "--prompt",
     "--message",
 }
-_CODEX_NON_TASK_SUBCOMMANDS = {
-    "auth",
-    "completion",
-    "debug",
-    "help",
-    "login",
-    "logout",
-    "mcp",
-    "resume",
-    "sandbox",
-}
-
 
 def agent_from_command(command: str | None) -> str | None:
     if not command:
         return None
 
     command_providers = {
-        name: adapter.provider_id
-        for adapter in get_agent_tool_registry().all()
-        for name in adapter.command_names
+        name: plugin.provider_id
+        for plugin in get_agent_plugin_registry().all()
+        for name in plugin.command.command_names
     }
     for segment in _COMMAND_SEGMENT_PATTERN.split(command):
         provider = _agent_from_command_segment(segment, command_providers)
@@ -55,9 +44,9 @@ def agent_command_has_inline_task(command: str | None) -> bool:
         return False
 
     command_providers = {
-        name: adapter.provider_id
-        for adapter in get_agent_tool_registry().all()
-        for name in adapter.command_names
+        name: plugin.provider_id
+        for plugin in get_agent_plugin_registry().all()
+        for name in plugin.command.command_names
     }
     for segment in _COMMAND_SEGMENT_PATTERN.split(command):
         parts = _agent_command_segment_parts(segment, command_providers)
@@ -107,11 +96,12 @@ def _agent_args_have_inline_task(provider: str, args: list[str]) -> bool:
         return True
     if not positionals:
         return False
-    if provider == "codex":
+    plugin = get_agent_plugin_registry().by_provider(provider)
+    if plugin.command.non_task_subcommands:
         first = positionals[0]
         if first == "exec":
             return len(positionals) > 1
-        return first not in _CODEX_NON_TASK_SUBCOMMANDS
+        return first not in set(plugin.command.non_task_subcommands)
     return True
 
 

@@ -1,5 +1,7 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -11,6 +13,8 @@ from app.services.agent_config import (
     list_agent_config,
     set_agent_config_item_enabled,
 )
+from app.services import agent_config as agent_config_service
+from app.services import agent_profiles as agent_profile_service
 
 
 def section_items(config, section: str):
@@ -78,6 +82,50 @@ def test_codex_config_lists_user_skills_plugins_and_updates_enablement(tmp_path:
     assert 'enabled = true' in (codex_home / "config.toml").read_text(encoding="utf-8")
 
 
+def test_codex_plugin_config_does_not_read_or_rewrite_other_toml_sections(tmp_path: Path) -> None:
+    codex_home = tmp_path / ".codex"
+    plugin_manifest = (
+        codex_home
+        / "plugins"
+        / "cache"
+        / "openai-curated"
+        / "superpowers"
+        / "acdd3141"
+        / ".codex-plugin"
+        / "plugin.json"
+    )
+    plugin_manifest.parent.mkdir(parents=True)
+    plugin_manifest.write_text(json.dumps({"name": "superpowers"}), encoding="utf-8")
+    (codex_home / "config.toml").write_text(
+        "\n".join(
+            [
+                '[plugins."superpowers@openai-curated"]',
+                "enabled = true",
+                "",
+                "[profiles.default]",
+                "enabled = false",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = list_agent_config("codex", home=tmp_path)
+
+    assert section_items(config, "plugins")["superpowers@openai-curated"].enabled is True
+
+    set_agent_config_item_enabled(
+        "codex",
+        "plugins",
+        "superpowers@openai-curated",
+        False,
+        home=tmp_path,
+    )
+    updated = (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert '[plugins."superpowers@openai-curated"]\nenabled = false' in updated
+    assert "[profiles.default]\nenabled = false" in updated
+
+
 def test_apply_agent_config_selection_materializes_per_window_home(tmp_path: Path) -> None:
     codex_home = tmp_path / ".codex"
     write_skill(codex_home / "skills", "docker")
@@ -119,6 +167,87 @@ def test_apply_agent_config_selection_materializes_per_window_home(tmp_path: Pat
     assert (managed / "history.jsonl").resolve() == codex_home / "history.jsonl"
     assert (codex_home / "skills" / "docker" / "SKILL.md").is_file()
     assert (codex_home / "skills.disabled" / "sleepy" / "SKILL.md").is_file()
+
+
+def test_list_window_agent_config_reads_existing_managed_home(tmp_path: Path) -> None:
+    codex_home = tmp_path / ".codex"
+    write_skill(codex_home / "skills", "docker")
+    write_skill(codex_home / "skills", "review")
+    managed = tmp_path / ".web-terminal-acp" / "codex-homes" / "window-1"
+    write_skill(managed / "skills.disabled", "docker")
+
+    config = agent_config_service.list_window_agent_config(
+        "codex",
+        window_id="window-1",
+        home=tmp_path,
+    )
+
+    assert section_items(config, "skills")["docker"].enabled is False
+    assert section_items(config, "skills")["review"].enabled is True
+
+
+def test_set_window_agent_config_detaches_shell_symlinked_skill_config(tmp_path: Path) -> None:
+    codex_home = tmp_path / ".codex"
+    write_skill(codex_home / "skills", "docker")
+    (codex_home / "skills.disabled").mkdir(parents=True)
+    managed = tmp_path / ".web-terminal-acp" / "codex-homes" / "window-1"
+    managed.mkdir(parents=True)
+    (managed / "skills").symlink_to(codex_home / "skills")
+    (managed / "skills.disabled").symlink_to(codex_home / "skills.disabled")
+
+    config = agent_config_service.set_window_agent_config_item_enabled(
+        "codex",
+        "skills",
+        "docker",
+        False,
+        window_id="window-1",
+        home=tmp_path,
+    )
+
+    assert section_items(config, "skills")["docker"].enabled is False
+    assert not (managed / "skills").is_symlink()
+    assert not (managed / "skills.disabled").is_symlink()
+    assert (managed / "skills.disabled" / "docker" / "SKILL.md").is_file()
+    assert (codex_home / "skills" / "docker" / "SKILL.md").is_file()
+    assert not (codex_home / "skills.disabled" / "docker").exists()
+
+
+def test_set_window_agent_config_detaches_shell_symlinked_codex_plugin_config(tmp_path: Path) -> None:
+    codex_home = tmp_path / ".codex"
+    plugin_manifest = (
+        codex_home
+        / "plugins"
+        / "cache"
+        / "openai-curated"
+        / "superpowers"
+        / "acdd3141"
+        / ".codex-plugin"
+        / "plugin.json"
+    )
+    plugin_manifest.parent.mkdir(parents=True)
+    plugin_manifest.write_text(json.dumps({"name": "superpowers"}), encoding="utf-8")
+    (codex_home / "config.toml").write_text(
+        '[plugins."superpowers@openai-curated"]\nenabled = true\n',
+        encoding="utf-8",
+    )
+    managed = tmp_path / ".web-terminal-acp" / "codex-homes" / "window-1"
+    managed.mkdir(parents=True)
+    (managed / "plugins").symlink_to(codex_home / "plugins")
+    (managed / "config.toml").symlink_to(codex_home / "config.toml")
+
+    config = agent_config_service.set_window_agent_config_item_enabled(
+        "codex",
+        "plugins",
+        "superpowers@openai-curated",
+        False,
+        window_id="window-1",
+        home=tmp_path,
+    )
+
+    assert section_items(config, "plugins")["superpowers@openai-curated"].enabled is False
+    assert not (managed / "config.toml").is_symlink()
+    assert 'enabled = false' in (managed / "config.toml").read_text(encoding="utf-8")
+    assert 'enabled = true' in (codex_home / "config.toml").read_text(encoding="utf-8")
 
 
 def test_apply_agent_config_selection_links_history_for_claude_and_cursor(tmp_path: Path) -> None:
@@ -195,6 +324,133 @@ def test_claude_plugin_config_rejects_control_character_item_id(tmp_path: Path) 
         )
 
     assert not (claude_home / "settings.json").exists()
+
+
+def test_claude_plugin_config_concurrent_updates_preserve_distinct_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_home = tmp_path / ".claude"
+    claude_home.mkdir()
+    (claude_home / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"one": True, "two": True}}),
+        encoding="utf-8",
+    )
+    first_write_started = Event()
+    release_first_write = Event()
+    second_write_started = Event()
+    original_write = agent_config_service._write_text_file_atomic
+    delayed = False
+
+    def slow_first_write(path: Path, content: str) -> None:
+        nonlocal delayed
+        if path == claude_home / "settings.json":
+            if not delayed:
+                delayed = True
+                first_write_started.set()
+                assert release_first_write.wait(timeout=5)
+            else:
+                second_write_started.set()
+        original_write(path, content)
+
+    monkeypatch.setattr(agent_config_service, "_write_text_file_atomic", slow_first_write)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_one = executor.submit(
+            set_agent_config_item_enabled,
+            "claude",
+            "plugins",
+            "one",
+            False,
+            home=tmp_path,
+        )
+        assert first_write_started.wait(timeout=5)
+        future_two = executor.submit(
+            set_agent_config_item_enabled,
+            "claude",
+            "plugins",
+            "two",
+            False,
+            home=tmp_path,
+        )
+        assert not second_write_started.wait(timeout=0.2)
+        release_first_write.set()
+        future_one.result()
+        future_two.result()
+
+    settings = json.loads((claude_home / "settings.json").read_text(encoding="utf-8"))
+    assert settings["enabledPlugins"] == {"one": False, "two": False}
+
+
+def test_agent_profile_config_concurrent_updates_preserve_distinct_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_home = tmp_path / ".claude"
+    (claude_home / "settings.json").parent.mkdir(parents=True)
+    (claude_home / "plugins").mkdir(parents=True)
+    (claude_home / "plugins" / "installed_plugins.json").write_text(
+        json.dumps({"plugins": {"one": [], "two": []}}),
+        encoding="utf-8",
+    )
+    (claude_home / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"one": True, "two": True}}),
+        encoding="utf-8",
+    )
+    profile = agent_profile_service.create_agent_profile(
+        name="Builder",
+        default_agent_client="claude",
+        home=tmp_path,
+    )
+    profile_manifest = tmp_path / ".web-terminal-acp" / "agents" / profile.id / "profile.json"
+    first_write_started = Event()
+    release_first_write = Event()
+    second_write_started = Event()
+    original_write = agent_config_service._write_text_file_atomic
+    delayed = False
+
+    def slow_first_write(path: Path, content: str) -> None:
+        nonlocal delayed
+        if path == profile_manifest:
+            if not delayed:
+                delayed = True
+                first_write_started.set()
+                assert release_first_write.wait(timeout=5)
+            else:
+                second_write_started.set()
+        original_write(path, content)
+
+    monkeypatch.setattr(agent_config_service, "_write_text_file_atomic", slow_first_write)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_one = executor.submit(
+            agent_profile_service.set_agent_profile_config_item_enabled,
+            profile.id,
+            "claude",
+            "plugins",
+            "one",
+            False,
+            home=tmp_path,
+        )
+        assert first_write_started.wait(timeout=5)
+        future_two = executor.submit(
+            agent_profile_service.set_agent_profile_config_item_enabled,
+            profile.id,
+            "claude",
+            "plugins",
+            "two",
+            False,
+            home=tmp_path,
+        )
+        assert not second_write_started.wait(timeout=0.2)
+        release_first_write.set()
+        future_one.result()
+        future_two.result()
+
+    config = agent_profile_service.list_agent_profile_config(profile.id, "claude", home=tmp_path)
+    plugins = section_items(config, "plugins")
+    assert plugins["one"].enabled is False
+    assert plugins["two"].enabled is False
 
 
 def test_claude_config_lists_plugins_hooks_and_updates_settings_json(tmp_path: Path) -> None:
@@ -353,3 +609,140 @@ def test_cursor_config_lists_user_skills_and_hooks_json(tmp_path: Path) -> None:
     hooks = json.loads((cursor_home / "hooks.json").read_text(encoding="utf-8"))
     assert hooks["hooks"]["afterFileEdit"][0]["command"] == "hooks/format.sh"
     assert "enabled" not in hooks["hooks"]["afterFileEdit"][0]
+
+
+def test_cursor_plugin_config_uses_directory_id_when_manifest_name_differs(tmp_path: Path) -> None:
+    cursor_home = tmp_path / ".cursor"
+    plugin_manifest = cursor_home / "plugins.disabled" / "superpowers-dir" / ".cursor-plugin" / "plugin.json"
+    plugin_manifest.parent.mkdir(parents=True)
+    plugin_manifest.write_text(
+        json.dumps({"name": "superpowers", "displayName": "Superpowers"}),
+        encoding="utf-8",
+    )
+
+    config = list_agent_config("cursor_cli", home=tmp_path)
+
+    plugin = section_items(config, "plugins")["superpowers-dir"]
+    assert plugin.name == "Superpowers"
+    assert plugin.enabled is False
+
+    set_agent_config_item_enabled("cursor_cli", "plugins", "superpowers-dir", True, home=tmp_path)
+
+    assert (cursor_home / "plugins" / "superpowers-dir" / ".cursor-plugin" / "plugin.json").is_file()
+    assert not (cursor_home / "plugins.disabled" / "superpowers-dir").exists()
+
+
+def test_antigravity_config_uses_gemini_antigravity_cli_root(tmp_path: Path) -> None:
+    agy_home = tmp_path / ".gemini" / "antigravity-cli"
+    write_skill(agy_home / "skills", "browser")
+    plugin_manifest = agy_home / "plugins.disabled" / "review" / ".antigravity-plugin" / "plugin.json"
+    plugin_manifest.parent.mkdir(parents=True)
+    plugin_manifest.write_text(
+        json.dumps({"name": "review", "displayName": "Review Tools"}),
+        encoding="utf-8",
+    )
+    (agy_home / "hooks.json").write_text(
+        json.dumps({"hooks": {"UserPromptSubmit": [{"command": "hooks/audit.sh"}]}}),
+        encoding="utf-8",
+    )
+
+    config = list_agent_config("agy", home=tmp_path)
+
+    assert config.agent == "antigravity"
+    assert section_items(config, "skills")["browser"].enabled is True
+    assert section_items(config, "plugins")["review"].name == "Review Tools"
+    assert section_items(config, "plugins")["review"].enabled is False
+    assert section_items(config, "hooks")["UserPromptSubmit:hooks/audit.sh"].enabled is True
+
+    set_agent_config_item_enabled("antigravity-cli", "plugins", "review", True, home=tmp_path)
+    assert (agy_home / "plugins" / "review" / ".antigravity-plugin" / "plugin.json").is_file()
+    assert not (agy_home / "plugins.disabled" / "review").exists()
+
+
+def test_antigravity_window_config_materializes_nested_managed_home_alias(tmp_path: Path) -> None:
+    agy_home = tmp_path / ".gemini" / "antigravity-cli"
+    write_skill(agy_home / "skills", "browser")
+    (agy_home / "settings.json").write_text("{}", encoding="utf-8")
+    (agy_home / "antigravity-oauth-token").write_text("token", encoding="utf-8")
+
+    config = agent_config_service.list_window_agent_config(
+        "antigravity",
+        window_id="window-1",
+        home=tmp_path,
+    )
+
+    managed = tmp_path / ".web-terminal-acp" / "antigravity-cli-homes" / "window-1"
+    command_home = tmp_path / ".web-terminal-acp" / "antigravity-cli-homes" / ".managed-home" / "window-1"
+    assert config.agent == "antigravity"
+    assert (managed / "settings.json").is_file()
+    assert (managed / "skills" / "browser" / "SKILL.md").is_file()
+    assert (managed / "antigravity-oauth-token").resolve() == agy_home / "antigravity-oauth-token"
+    assert (command_home / ".gemini" / "antigravity-cli").resolve() == managed
+
+
+def test_agent_profile_initializes_common_skills_and_agent_md_from_global_home(tmp_path: Path) -> None:
+    codex_home = tmp_path / ".codex"
+    write_skill(codex_home / "skills", "docker")
+    write_skill(codex_home / "skills.disabled", "sleepy")
+    (codex_home / "AGENTS.md").write_text("Use project rules.\n", encoding="utf-8")
+
+    profile = agent_profile_service.create_agent_profile(
+        name="Builder",
+        default_agent_client="codex",
+        home=tmp_path,
+    )
+
+    profile_root = tmp_path / ".web-terminal-acp" / "agents" / profile.id
+    assert profile.name == "Builder"
+    assert (profile_root / "skills" / "docker" / "SKILL.md").is_file()
+    assert (profile_root / "skills.disabled" / "sleepy" / "SKILL.md").is_file()
+    assert (profile_root / "AGENT.md").read_text(encoding="utf-8") == "Use project rules.\n"
+
+
+def test_agent_profile_materializes_common_config_to_agent_client_home(tmp_path: Path) -> None:
+    codex_home = tmp_path / ".codex"
+    write_skill(codex_home / "skills", "docker")
+    write_skill(codex_home / "skills.disabled", "sleepy")
+    (codex_home / "config.toml").write_text(
+        '[plugins."superpowers@openai-curated"]\nenabled = true\n',
+        encoding="utf-8",
+    )
+    profile = agent_profile_service.create_agent_profile(
+        name="Builder",
+        default_agent_client="codex",
+        home=tmp_path,
+    )
+    agent_profile_service.set_agent_profile_config_item_enabled(
+        profile.id,
+        "codex",
+        "skills",
+        "docker",
+        False,
+        home=tmp_path,
+    )
+    agent_profile_service.set_agent_profile_config_item_enabled(
+        profile.id,
+        "codex",
+        "skills",
+        "sleepy",
+        True,
+        home=tmp_path,
+    )
+    agent_profile_service.update_agent_profile(
+        profile.id,
+        agent_md="Common rules\n",
+        home=tmp_path,
+    )
+
+    agent_profile_service.materialize_agent_profile_for_window(
+        profile.id,
+        "codex",
+        window_id="window-1",
+        home=tmp_path,
+    )
+
+    managed = tmp_path / ".web-terminal-acp" / "codex-homes" / "window-1"
+    assert (managed / "skills.disabled" / "docker" / "SKILL.md").is_file()
+    assert (managed / "skills" / "sleepy" / "SKILL.md").is_file()
+    assert (managed / "AGENTS.md").read_text(encoding="utf-8") == "Common rules\n"
+    assert (managed / "AGENT.md").read_text(encoding="utf-8") == "Common rules\n"

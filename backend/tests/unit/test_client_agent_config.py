@@ -72,6 +72,23 @@ class _NoopAgentToolWatcher:
         return None
 
 
+class _NoopAuxTerminal:
+    async def ensure_terminal(self, *args, **kwargs):
+        return None
+
+    async def attach(self, *args, **kwargs) -> None:
+        return None
+
+    async def detach(self, *args, **kwargs) -> None:
+        return None
+
+    async def send_input(self, *args, **kwargs) -> None:
+        return None
+
+    async def resize(self, *args, **kwargs) -> None:
+        return None
+
+
 class _ExistingRuntime:
     async def has_window(
         self,
@@ -654,6 +671,7 @@ async def test_terminal_attach_marks_initial_pty_output_as_snapshot() -> None:
         FakeTerminalMultiplexer(),
         _NoopIdleSupervisor(),
         _NoopAgentToolWatcher(),
+        _NoopAuxTerminal(),
         {},
         set(),
         asyncio.Semaphore(1),
@@ -707,6 +725,7 @@ async def test_terminal_attach_keeps_later_pty_output_recordable() -> None:
         FakeTerminalMultiplexer(),
         _NoopIdleSupervisor(),
         _NoopAgentToolWatcher(),
+        _NoopAuxTerminal(),
         {},
         set(),
         asyncio.Semaphore(1),
@@ -766,6 +785,7 @@ async def test_silent_attach_snapshot_does_not_mark_later_pty_output_as_snapshot
         FakeTerminalMultiplexer(),
         _NoopIdleSupervisor(),
         _NoopAgentToolWatcher(),
+        _NoopAuxTerminal(),
         attach_snapshot_tasks,
         set(),
         asyncio.Semaphore(1),
@@ -831,6 +851,7 @@ async def test_terminal_detach_cancels_pending_attach_snapshot() -> None:
         terminal,
         _NoopIdleSupervisor(),
         _NoopAgentToolWatcher(),
+        _NoopAuxTerminal(),
         attach_snapshot_tasks,
         set(),
         asyncio.Semaphore(1),
@@ -851,6 +872,7 @@ async def test_terminal_detach_cancels_pending_attach_snapshot() -> None:
         terminal,
         _NoopIdleSupervisor(),
         _NoopAgentToolWatcher(),
+        _NoopAuxTerminal(),
         attach_snapshot_tasks,
         set(),
         asyncio.Semaphore(1),

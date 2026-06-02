@@ -4,13 +4,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID
 
+from sqlalchemy import case, desc
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, load_only
 
-from app.models import Folder, FolderSplitJob, VirtualWindow
+from app.models import AiSession, Folder, FolderSplitJob, VirtualWindow
 
 
 @dataclass
@@ -29,6 +30,12 @@ class TreeFolder:
     path: str
     folders: list[TreeFolder] = field(default_factory=list)
     windows: list[TreeWindow] = field(default_factory=list)
+
+
+@dataclass
+class TerminalProject:
+    project_path: str
+    window_count: int
 
 
 @dataclass
@@ -52,6 +59,7 @@ class TopicTreeNode:
 MAX_FOLDER_SEGMENT_LENGTH = 255
 MAX_FOLDER_PATH_LENGTH = 1024
 GET_OR_CREATE_RETRIES = 3
+UNASSIGNED_PROJECT_PATH = "/未指定"
 
 
 def canonicalize_folder_path(path: str) -> str:
@@ -309,7 +317,76 @@ async def _direct_window_counts_by_folder(session: AsyncSession, client_id: UUID
     return {folder_id: count for folder_id, count in rows if folder_id is not None}
 
 
-async def build_tree(session: AsyncSession, client_id: UUID) -> list[TreeFolder]:
+def window_visible_at_expression():
+    candidates = [
+        func.coalesce(VirtualWindow.terminal_last_output_at, VirtualWindow.created_at),
+        func.coalesce(VirtualWindow.agent_activity_latest_at, VirtualWindow.created_at),
+        func.coalesce(VirtualWindow.agent_activity_latest_completed_at, VirtualWindow.created_at),
+        func.coalesce(VirtualWindow.agent_activity_latest_user_input_at, VirtualWindow.created_at),
+        VirtualWindow.created_at,
+    ]
+    expression = candidates[0]
+    for candidate in candidates[1:]:
+        expression = case((candidate > expression, candidate), else_=expression)
+    return expression
+
+
+def window_project_path_expression():
+    latest_project_path = (
+        select(AiSession.project_path)
+        .where(
+            AiSession.client_id == VirtualWindow.client_id,
+            AiSession.virtual_window_id == VirtualWindow.id,
+        )
+        .order_by(desc(AiSession.updated_at), desc(AiSession.created_at), desc(AiSession.id))
+        .limit(1)
+        .correlate(VirtualWindow)
+        .scalar_subquery()
+    )
+    return func.coalesce(
+        func.nullif(latest_project_path, ""),
+        func.nullif(VirtualWindow.cwd, ""),
+        UNASSIGNED_PROJECT_PATH,
+    )
+
+
+async def list_terminal_projects(
+    session: AsyncSession,
+    client_id: UUID,
+    *,
+    visible_since: datetime | None = None,
+) -> list[TerminalProject]:
+    window_visible_at = window_visible_at_expression()
+    project_path = window_project_path_expression()
+    window_filters = [
+        VirtualWindow.client_id == client_id,
+        VirtualWindow.folder_id.is_not(None),
+    ]
+    if visible_since is not None:
+        window_filters.append(window_visible_at >= visible_since)
+
+    rows = await session.execute(
+        select(
+            project_path.label("project_path"),
+            func.count(VirtualWindow.id).label("window_count"),
+        )
+        .where(*window_filters)
+        .group_by(project_path)
+        .order_by(project_path)
+    )
+    return [
+        TerminalProject(project_path=project_path, window_count=int(window_count))
+        for project_path, window_count in rows
+    ]
+
+
+async def build_tree(
+    session: AsyncSession,
+    client_id: UUID,
+    *,
+    visible_since: datetime | None = None,
+    project_path: str | None = None,
+) -> list[TreeFolder]:
     folder_rows = list(
         await session.execute(
             select(Folder.id, Folder.parent_id, Folder.name, Folder.path)
@@ -334,6 +411,16 @@ async def build_tree(session: AsyncSession, client_id: UUID) -> list[TreeFolder]
         else:
             roots.append(node)
 
+    window_visible_at = window_visible_at_expression()
+    window_filters = [
+        VirtualWindow.client_id == client_id,
+        VirtualWindow.folder_id.is_not(None),
+    ]
+    if visible_since is not None:
+        window_filters.append(window_visible_at >= visible_since)
+    if project_path is not None:
+        window_filters.append(window_project_path_expression() == project_path)
+
     window_rows = await session.execute(
         select(
             VirtualWindow.id,
@@ -343,11 +430,13 @@ async def build_tree(session: AsyncSession, client_id: UUID) -> list[TreeFolder]
             VirtualWindow.created_at,
             VirtualWindow.title_tags,
         )
-        .where(
-            VirtualWindow.client_id == client_id,
-            VirtualWindow.folder_id.is_not(None),
+        .where(*window_filters)
+        .order_by(
+            window_visible_at,
+            VirtualWindow.created_at,
+            VirtualWindow.title,
+            VirtualWindow.id,
         )
-        .order_by(VirtualWindow.created_at, VirtualWindow.title, VirtualWindow.id)
     )
     for window_id, folder_id, title, status, created_at, title_tags in window_rows:
         if folder_id not in nodes:

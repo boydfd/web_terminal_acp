@@ -330,6 +330,15 @@ class CodexAdapter:
 
         return None
 
+    def is_completion(self, event: Event) -> bool:
+        raw_type = _raw_type(event.payload_json)
+        item_type = string_value(_item(event.payload_json).get("type"))
+        return raw_type == "event_msg" and item_type in {
+            "task_complete",
+            "task_completed",
+            "turn_completed",
+        }
+
     def summary_text(self, event: Event) -> str:
         chat = self.project_chat(event)
         if chat is not None:

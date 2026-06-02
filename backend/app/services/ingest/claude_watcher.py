@@ -15,6 +15,7 @@ from elasticsearch import AsyncElasticsearch
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db import prefer_deferred_commit
 from app.models import Event, EventSourceType, VirtualWindow
 from app.repositories.ai_sessions import get_or_create_ai_session
 from app.repositories.clients import ensure_local_client
@@ -341,6 +342,7 @@ async def poll_claude_jsonl_directory_once(
         try:
             async with session_factory() as session:
                 local_client = await ensure_local_client(session)
+                await prefer_deferred_commit(session)
                 offsets[path] = await ingest_claude_jsonl_file(
                     session,
                     path,

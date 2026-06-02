@@ -97,6 +97,32 @@ def claude_local_command_payload(text: str = "<bash-stdout>done</bash-stdout>") 
     }
 
 
+def claude_metadata_payload(payload_type: str) -> dict:
+    return {
+        "provider": "claude_code",
+        "type": payload_type,
+        "content": "metadata",
+    }
+
+
+def cursor_completion_payload(text: str = "done") -> dict:
+    return {
+        "provider": "cursor_cli",
+        "role": "assistant",
+        "text": text,
+    }
+
+
+def antigravity_completion_payload(text: str = "done") -> dict:
+    return {
+        "provider": "antigravity_cli",
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "content": text,
+    }
+
+
 @pytest.fixture
 async def db_session():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -680,7 +706,7 @@ async def test_finished_command_sequence_query_starts_at_latest_agent_command(co
 
 
 @pytest.mark.asyncio
-async def test_load_work_status_treats_agent_tool_records_as_working_activity(db_session) -> None:
+async def test_load_work_status_treats_agent_tool_record_output_as_working_activity(db_session) -> None:
     now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
     client_id = uuid4()
     window = VirtualWindow(id=uuid4(), client_id=client_id, title="Terminal", status=WindowStatus.active)
@@ -694,28 +720,28 @@ async def test_load_work_status_treats_agent_tool_records_as_working_activity(db
                 source_id=str(window.id),
                 kind="terminal_input_command",
                 virtual_window_id=window.id,
-                payload_json={"command": "cursor", "sequence": 1},
-                fingerprint="terminal-input-cursor-work-status",
+                payload_json={"command": "codex", "sequence": 1},
+                fingerprint="terminal-input-agent-record-work-status",
                 created_at=now - timedelta(seconds=25),
             ),
             Event(
                 client_id=client_id,
                 source_type=EventSourceType.agent_tool_record,
-                source_id="cursor-session-1",
+                source_id="codex-session-1",
                 kind="user_message",
                 virtual_window_id=window.id,
-                payload_json={"provider": "cursor_cli", "role": "user", "content": "fix tests"},
-                fingerprint="cursor-agent-user-input-work-status",
+                payload_json={"provider": "codex", "raw_type": "event_msg", "payload": {"type": "user_message", "message": "fix tests"}},
+                fingerprint="agent-record-user-input-work-status",
                 created_at=now - timedelta(seconds=22),
             ),
             Event(
                 client_id=client_id,
                 source_type=EventSourceType.agent_tool_record,
-                source_id="cursor-session-1",
+                source_id="codex-session-1",
                 kind="assistant_message",
                 virtual_window_id=window.id,
-                payload_json={"provider": "cursor_cli", "role": "assistant", "content": "working"},
-                fingerprint="cursor-agent-work-status",
+                payload_json={"provider": "codex", "raw_type": "event_msg", "payload": {"type": "agent_message", "message": "working"}},
+                fingerprint="agent-record-output-work-status",
                 created_at=now - timedelta(seconds=20),
             ),
         ]
@@ -1893,6 +1919,120 @@ async def test_load_tree_window_activity_reports_finished_notification_status(db
     activity = await load_tree_window_activity(db_session, client_id, [window.id], now=now)
 
     assert activity.work_statuses[window.id].state == "FINISHED"
+    task_status = activity.last_agent_task_status[window.id]
+    assert task_status.state == "FINISHED"
+    assert task_status.occurred_at == completed_at
+
+
+@pytest.mark.asyncio
+async def test_load_work_status_keeps_claude_finished_after_metadata_events(db_session) -> None:
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    window = VirtualWindow(id=uuid4(), client_id=client_id, title="Claude", status=WindowStatus.active)
+    db_session.add(window)
+    await db_session.flush()
+    completed_at = now - timedelta(seconds=30)
+    metadata_at = now - timedelta(seconds=10)
+    window.agent_activity_latest_at = metadata_at
+    window.agent_activity_latest_event_id = uuid4()
+    window.agent_activity_latest_completed_at = completed_at
+    db_session.add_all(
+        [
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="claude-session-1",
+                kind="system_message",
+                virtual_window_id=window.id,
+                payload_json=claude_turn_duration_payload(timestamp=completed_at),
+                fingerprint="claude-completed-before-metadata",
+                created_at=completed_at,
+            ),
+            Event(
+                client_id=client_id,
+                source_type=EventSourceType.agent_tool_record,
+                source_id="claude-session-1",
+                kind="last-prompt",
+                virtual_window_id=window.id,
+                payload_json=claude_metadata_payload("last-prompt"),
+                fingerprint="claude-last-prompt-after-completion",
+                created_at=metadata_at,
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    status = await load_work_status(db_session, client_id, window.id, now=now)
+    activity = await load_tree_window_activity(db_session, client_id, [window.id], now=now)
+
+    assert status.state == "FINISHED"
+    assert status.last_activity_at == completed_at
+    task_status = activity.last_agent_task_status[window.id]
+    assert task_status.state == "FINISHED"
+    assert task_status.occurred_at == completed_at
+
+
+@pytest.mark.asyncio
+async def test_load_work_status_uses_cursor_assistant_message_as_completion(db_session) -> None:
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    window = VirtualWindow(id=uuid4(), client_id=client_id, title="Cursor", status=WindowStatus.active)
+    db_session.add(window)
+    await db_session.flush()
+    completed_at = now - timedelta(seconds=20)
+    window.agent_activity_latest_at = completed_at
+    window.agent_activity_latest_event_id = uuid4()
+    db_session.add(
+        Event(
+            client_id=client_id,
+            source_type=EventSourceType.agent_tool_record,
+            source_id="cursor-session-1",
+            kind="assistant_message",
+            virtual_window_id=window.id,
+            payload_json=cursor_completion_payload(),
+            fingerprint="cursor-assistant-completed",
+            created_at=completed_at,
+        )
+    )
+    await db_session.flush()
+
+    status = await load_work_status(db_session, client_id, window.id, now=now)
+    activity = await load_tree_window_activity(db_session, client_id, [window.id], now=now)
+
+    assert status.state == "FINISHED"
+    task_status = activity.last_agent_task_status[window.id]
+    assert task_status.state == "FINISHED"
+    assert task_status.occurred_at == completed_at
+
+
+@pytest.mark.asyncio
+async def test_load_work_status_uses_antigravity_final_model_response_as_completion(db_session) -> None:
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+    client_id = uuid4()
+    window = VirtualWindow(id=uuid4(), client_id=client_id, title="Antigravity", status=WindowStatus.active)
+    db_session.add(window)
+    await db_session.flush()
+    completed_at = now - timedelta(seconds=20)
+    window.agent_activity_latest_at = completed_at
+    window.agent_activity_latest_event_id = uuid4()
+    db_session.add(
+        Event(
+            client_id=client_id,
+            source_type=EventSourceType.agent_tool_record,
+            source_id="antigravity-session-1",
+            kind="assistant_message",
+            virtual_window_id=window.id,
+            payload_json=antigravity_completion_payload(),
+            fingerprint="antigravity-model-completed",
+            created_at=completed_at,
+        )
+    )
+    await db_session.flush()
+
+    status = await load_work_status(db_session, client_id, window.id, now=now)
+    activity = await load_tree_window_activity(db_session, client_id, [window.id], now=now)
+
+    assert status.state == "FINISHED"
     task_status = activity.last_agent_task_status[window.id]
     assert task_status.state == "FINISHED"
     assert task_status.occurred_at == completed_at

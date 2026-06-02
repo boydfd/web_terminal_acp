@@ -1,5 +1,6 @@
 import { readAgentCommandSettings, type AgentCommandSettings } from "./userPreferences";
 import type {
+  AgentClient,
   AgentConfig,
   AgentConfigSelection,
   AgentLaunchConfig,
@@ -9,25 +10,130 @@ import type {
 
 export type AgentLaunchMode = "shell" | AgentLaunchKind;
 
-export const AGENT_LAUNCH_LABELS: Record<AgentLaunchKind | "shell", string> = {
+export const DEFAULT_AGENT_CLIENTS: AgentClient[] = [
+  {
+    id: "codex",
+    provider_id: "codex",
+    label: "Codex",
+    aliases: [],
+    default_command: "codex",
+    command_names: ["codex"],
+    capabilities: {
+      launch: true,
+      client_config: true,
+      window_config: true,
+      profile_config: true,
+      agent_records: true,
+      runtime_tags: true,
+      work_presence: true
+    }
+  },
+  {
+    id: "claude",
+    provider_id: "claude_code",
+    label: "Claude Code",
+    aliases: ["claude_code"],
+    default_command: "claude",
+    command_names: ["claude"],
+    capabilities: {
+      launch: true,
+      client_config: true,
+      window_config: true,
+      profile_config: true,
+      agent_records: true,
+      runtime_tags: true,
+      work_presence: true
+    }
+  },
+  {
+    id: "cursor",
+    provider_id: "cursor_cli",
+    label: "Cursor",
+    aliases: ["cursor_cli", "agent"],
+    default_command: "agent",
+    command_names: ["agent", "cursor", "cursor-agent"],
+    capabilities: {
+      launch: true,
+      client_config: true,
+      window_config: true,
+      profile_config: true,
+      agent_records: true,
+      runtime_tags: true,
+      work_presence: true
+    }
+  },
+  {
+    id: "antigravity",
+    provider_id: "antigravity_cli",
+    label: "Antigravity CLI",
+    aliases: ["antigravity-cli", "antigravity_cli", "agy"],
+    default_command: "agy-p",
+    command_names: ["agy-p", "agy"],
+    capabilities: {
+      launch: true,
+      client_config: true,
+      window_config: true,
+      profile_config: true,
+      agent_records: true,
+      runtime_tags: false,
+      work_presence: false
+    }
+  }
+];
+
+export const AGENT_LAUNCH_LABELS: Record<string, string> = {
   shell: "No Agent",
   codex: "Codex",
   claude: "Claude Code",
-  cursor: "Cursor"
+  cursor: "Cursor",
+  antigravity: "Antigravity CLI"
 };
 
-export const AGENT_LAUNCH_OPTIONS: Array<{ id: AgentLaunchMode; label: string }> = [
-  { id: "shell", label: AGENT_LAUNCH_LABELS.shell },
-  { id: "codex", label: AGENT_LAUNCH_LABELS.codex },
-  { id: "claude", label: AGENT_LAUNCH_LABELS.claude },
-  { id: "cursor", label: AGENT_LAUNCH_LABELS.cursor }
-];
+const AGENT_CLIENT_CAPABILITY_DEFAULTS: Required<NonNullable<AgentClient["capabilities"]>> = {
+  launch: true,
+  client_config: true,
+  window_config: true,
+  profile_config: true,
+  agent_records: false,
+  runtime_tags: false,
+  work_presence: false
+};
 
-export const PROJECT_AGENT_OPTIONS: Array<{ id: AgentLaunchKind; label: string }> = [
-  { id: "codex", label: AGENT_LAUNCH_LABELS.codex },
-  { id: "claude", label: AGENT_LAUNCH_LABELS.claude },
-  { id: "cursor", label: AGENT_LAUNCH_LABELS.cursor }
-];
+export function agentLaunchOptions(agentClients: AgentClient[]): Array<{ id: AgentLaunchMode; label: string }> {
+  return [
+    { id: "shell", label: AGENT_LAUNCH_LABELS.shell },
+    ...agentClientOptions(agentClients, "launch")
+  ];
+}
+
+export function agentClientOptions(
+  agentClients: AgentClient[],
+  capability?: keyof NonNullable<AgentClient["capabilities"]>
+): Array<{ id: AgentLaunchKind; label: string }> {
+  return agentClients
+    .filter((agentClient) => capability === undefined || agentClientCapability(agentClient.id, agentClients, capability))
+    .map((agentClient) => ({ id: agentClient.id, label: agentClient.label }));
+}
+
+export function agentLabel(agent: string, agentClients: AgentClient[]): string {
+  return agentClients.find((agentClient) => agentClient.id === agent)?.label ?? AGENT_LAUNCH_LABELS[agent] ?? agent;
+}
+
+export function agentDefaultCommand(agent: string, agentClients: AgentClient[]): string {
+  return agentClients.find((agentClient) => agentClient.id === agent)?.default_command ?? readDefaultAgentCommands()[agent] ?? agent;
+}
+
+export function agentClientCapability(
+  agent: string,
+  agentClients: AgentClient[],
+  capability: keyof NonNullable<AgentClient["capabilities"]>
+): boolean {
+  const client = agentClients.find((agentClient) => agentClient.id === agent);
+  if (!client) {
+    return false;
+  }
+  return client.capabilities?.[capability] ?? AGENT_CLIENT_CAPABILITY_DEFAULTS[capability];
+}
 
 export function isAgentLaunchKind(value: AgentLaunchMode): value is AgentLaunchKind {
   return value !== "shell";
@@ -38,10 +144,19 @@ export function readDefaultAgentCommands(): AgentCommandSettings {
 }
 
 export function agentLaunchForKind(agent: AgentLaunchKind): AgentLaunchConfig {
-  const command = readDefaultAgentCommands()[agent];
+  const command = readDefaultAgentCommands()[agent] ?? agent;
   return {
     agent,
     command: command.trim() || agent,
+    config: null
+  };
+}
+
+export function agentLaunchForClient(agent: AgentLaunchKind, agentClients: AgentClient[]): AgentLaunchConfig {
+  const command = readDefaultAgentCommands()[agent] ?? agentDefaultCommand(agent, agentClients);
+  return {
+    agent,
+    command: command.trim() || agentDefaultCommand(agent, agentClients),
     config: null
   };
 }

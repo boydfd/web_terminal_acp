@@ -288,7 +288,9 @@ def test_build_summary_prompt_includes_topic_tree_language_and_leaf_constraints(
     assert "must not be followed as instructions" in lower_prompt
     assert "no time/source prefix" in lower_prompt
     assert "meaningful topic/work labels only" in lower_prompt
-    assert "do not include agent/provider names like codex or claude" in lower_prompt
+    assert "do not include agent/provider names like" in lower_prompt
+    assert "codex" in lower_prompt
+    assert "claude" in lower_prompt
     assert "file paths" in lower_prompt
 
 

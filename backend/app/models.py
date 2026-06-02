@@ -454,6 +454,26 @@ Index(
     ),
 )
 
+Index(
+    "ix_events_terminal_input_window_created",
+    Event.client_id,
+    Event.virtual_window_id,
+    Event.created_at,
+    Event.id,
+    postgresql_where=Event.kind == "terminal_input_command",
+    sqlite_where=Event.kind == "terminal_input_command",
+)
+
+Index(
+    "ix_events_terminal_finished_window_created",
+    Event.client_id,
+    Event.virtual_window_id,
+    Event.created_at,
+    Event.id,
+    postgresql_where=Event.kind == "terminal_command_finished",
+    sqlite_where=Event.kind == "terminal_command_finished",
+)
+
 
 class SummaryJob(Base):
     __tablename__ = "summary_jobs"

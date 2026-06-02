@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import shutil
+import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-AgentKind = Literal["codex", "claude", "cursor"]
+from app.agent_plugins import get_agent_plugin_registry
+from app.agent_plugins.types import AgentPlugin
+
+AgentKind = str
 SectionKind = Literal["skills", "plugins", "hooks"]
 DISABLED_HOOKS_FILE = "hooks.disabled.json"
+_CONFIG_WRITE_LOCKS: dict[str, threading.RLock] = {}
+_CONFIG_WRITE_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,40 @@ def set_agent_config_item_enabled(
     return list_agent_config(agent_kind, home=home)
 
 
+def list_window_agent_config(
+    agent: str,
+    *,
+    window_id: str,
+    home: Path | None = None,
+) -> AgentConfig:
+    agent_kind = _agent_kind(agent)
+    user_home = home or Path.home()
+    managed_root = _ensure_window_agent_config_root(agent_kind, window_id, user_home)
+    return list_agent_config(agent_kind, home=_managed_home_root(managed_root))
+
+
+def set_window_agent_config_item_enabled(
+    agent: str,
+    section_id: str,
+    item_id: str,
+    enabled: bool,
+    *,
+    window_id: str,
+    home: Path | None = None,
+) -> AgentConfig:
+    agent_kind = _agent_kind(agent)
+    user_home = home or Path.home()
+    managed_root = _ensure_window_agent_config_root(agent_kind, window_id, user_home)
+    _detach_window_config_section(agent_kind, managed_root, section_id)
+    return set_agent_config_item_enabled(
+        agent_kind,
+        section_id,
+        item_id,
+        enabled,
+        home=_managed_home_root(managed_root),
+    )
+
+
 def normalize_agent_kind(agent: str) -> AgentKind:
     return _agent_kind(agent)
 
@@ -120,36 +162,63 @@ def apply_agent_config_selection(
 
 
 def _agent_kind(agent: str) -> AgentKind:
-    normalized = agent.strip().lower()
-    if normalized == "codex":
-        return "codex"
-    if normalized in {"claude", "claude_code"}:
-        return "claude"
-    if normalized in {"cursor", "cursor_cli", "agent"}:
-        return "cursor"
-    raise ValueError(f"unsupported agent: {agent}")
+    return get_agent_plugin_registry().normalize_agent_id(agent)
+
+
+def _agent_plugin(agent: AgentKind) -> AgentPlugin:
+    return get_agent_plugin_registry().by_agent_id(agent)
+
+
+def _lock_key(path: Path) -> str:
+    return str(path.expanduser().resolve(strict=False))
+
+
+def _config_write_lock(path: Path) -> threading.RLock:
+    key = _lock_key(path)
+    with _CONFIG_WRITE_LOCKS_GUARD:
+        lock = _CONFIG_WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _CONFIG_WRITE_LOCKS[key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def _locked_config_writes(*paths: Path):
+    locks: list[threading.RLock] = []
+    seen: set[str] = set()
+    for path in sorted(paths, key=_lock_key):
+        key = _lock_key(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        locks.append(_config_write_lock(path))
+    for lock in locks:
+        lock.acquire()
+    try:
+        yield
+    finally:
+        for lock in reversed(locks):
+            lock.release()
 
 
 def _agent_root(agent: AgentKind, home: Path) -> Path:
-    roots: dict[AgentKind, str] = {
-        "codex": ".codex",
-        "claude": ".claude",
-        "cursor": ".cursor",
-    }
-    return home / roots[agent]
+    return home / _agent_plugin(agent).storage.user_root
 
 
 def _managed_agent_root(agent: AgentKind, window_id: str, home: Path) -> Path:
-    roots: dict[AgentKind, str] = {
-        "codex": ".web-terminal-acp/codex-homes",
-        "claude": ".web-terminal-acp/claude-code-homes",
-        "cursor": ".web-terminal-acp/cursor-homes",
-    }
-    return home / roots[agent] / window_id
+    return home / _agent_plugin(agent).storage.managed_root / window_id
 
 
 def _managed_home_root(managed_root: Path) -> Path:
     return managed_root.parent / ".managed-home" / managed_root.name
+
+
+def _ensure_window_agent_config_root(agent: AgentKind, window_id: str, home: Path) -> Path:
+    managed_root = _managed_agent_root(agent, window_id, home)
+    source_root = _agent_root(agent, home)
+    _materialize_agent_config_root(agent, source_root, managed_root)
+    return managed_root
 
 
 def _materialize_agent_config_root(agent: AgentKind, source_root: Path, managed_root: Path) -> None:
@@ -158,17 +227,18 @@ def _materialize_agent_config_root(agent: AgentKind, source_root: Path, managed_
     for item_name in item_names:
         source = source_root / item_name
         target = managed_root / item_name
-        if not source.exists() or target.exists():
+        if not source.exists():
             continue
         if source.is_dir():
-            _copy_config_directory(source, target)
-        else:
+            _copy_config_item_directory(agent, managed_root, item_name, source, target)
+        elif not target.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target, follow_symlinks=True)
+
     _link_agent_history_items(agent, source_root, managed_root)
 
     home_root = _managed_home_root(managed_root)
-    alias = home_root / _agent_root(agent, Path()).name
+    alias = _managed_home_alias_path(agent, home_root)
     alias.parent.mkdir(parents=True, exist_ok=True)
     if not alias.exists() and not alias.is_symlink():
         with contextlib.suppress(OSError):
@@ -177,8 +247,102 @@ def _materialize_agent_config_root(agent: AgentKind, source_root: Path, managed_
         _copy_config_directory(managed_root, alias)
 
 
+def _copy_config_item_directory(
+    agent: AgentKind,
+    managed_root: Path,
+    item_name: str,
+    source: Path,
+    target: Path,
+) -> None:
+    if target.is_symlink():
+        return
+    if target.exists() and not target.is_dir():
+        return
+    counterpart = _managed_config_directory_counterpart(agent, item_name)
+    if counterpart is None:
+        _copy_config_directory(source, target)
+        return
+
+    target.mkdir(parents=True, exist_ok=True)
+    counterpart_root = managed_root / counterpart
+    for child in sorted(source.iterdir(), key=lambda candidate: candidate.name):
+        child_target = target / child.name
+        if child_target.exists() or (counterpart_root / child.name).exists():
+            continue
+        if child.is_dir():
+            _copy_config_directory(child, child_target)
+        else:
+            shutil.copy2(child, child_target, follow_symlinks=True)
+
+
 def _copy_config_directory(source: Path, target: Path) -> None:
     shutil.copytree(source, target, symlinks=True, dirs_exist_ok=True)
+
+
+def _managed_home_alias_path(agent: AgentKind, home_root: Path) -> Path:
+    plugin_alias = _agent_plugin(agent).storage.managed_home_alias
+    if not plugin_alias:
+        return home_root / _agent_root(agent, Path()).name
+    alias_path = Path(plugin_alias)
+    if alias_path.is_absolute() or ".." in alias_path.parts:
+        raise ValueError(f"invalid managed home alias: {plugin_alias}")
+    return home_root / alias_path
+
+
+def _managed_config_directory_counterpart(agent: AgentKind, item_name: str) -> str | None:
+    skills = _skills_directory(agent)
+    counterparts = {
+        skills: f"{skills}.disabled",
+        f"{skills}.disabled": skills,
+        "plugins": "plugins.disabled",
+        "plugins.disabled": "plugins",
+    }
+    return counterparts.get(item_name)
+
+
+def _detach_window_config_section(agent: AgentKind, managed_root: Path, section_id: str) -> None:
+    if section_id == "skills":
+        _detach_window_config_items(
+            managed_root,
+            (_skills_directory(agent), f"{_skills_directory(agent)}.disabled"),
+        )
+        return
+    if section_id == "plugins":
+        plugin = _agent_plugin(agent)
+        if plugin.native_config.plugin_strategy == "codex_toml":
+            _detach_window_config_items(managed_root, ("config.toml",))
+        elif plugin.native_config.plugin_strategy == "claude_settings":
+            _detach_window_config_items(managed_root, ("settings.json",))
+        else:
+            _detach_window_config_items(managed_root, ("plugins", "plugins.disabled"))
+        return
+    if section_id == "hooks":
+        _detach_window_config_items(managed_root, (_hooks_config_name(agent), DISABLED_HOOKS_FILE))
+
+
+def _hooks_config_name(agent: AgentKind) -> str:
+    return _agent_plugin(agent).native_config.hooks_config_name
+
+
+def _detach_window_config_items(managed_root: Path, item_names: tuple[str, ...]) -> None:
+    for item_name in item_names:
+        path = managed_root / item_name
+        if path.is_symlink():
+            _replace_symlink_with_copy(path)
+
+
+def _replace_symlink_with_copy(path: Path) -> None:
+    try:
+        source = path.resolve(strict=True)
+    except FileNotFoundError:
+        path.unlink(missing_ok=True)
+        return
+    path.unlink()
+    if source.is_dir():
+        _copy_config_directory(source, path)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, path, follow_symlinks=True)
 
 
 def _link_agent_history_items(agent: AgentKind, source_root: Path, managed_root: Path) -> None:
@@ -195,45 +359,15 @@ def _link_existing_item(source: Path, target: Path) -> None:
 
 
 def _agent_config_item_names(agent: AgentKind) -> tuple[str, ...]:
-    common = ("hooks", "hooks.json", DISABLED_HOOKS_FILE, "plugins", "plugins.disabled")
-    if agent == "codex":
-        return (
-            "config.toml",
-            "AGENTS.md",
-            "skills",
-            "skills.disabled",
-            "plugin_marketplaces.json",
-            *common,
-        )
-    if agent == "claude":
-        return (
-            "settings.json",
-            "settings.local.json",
-            "commands",
-            "skills",
-            "skills.disabled",
-            "api-key-helper.sh",
-            *common,
-        )
-    return (
-        "agent-cli-state.json",
-        "cli-config.json",
-        "skills-cursor",
-        "skills-cursor.disabled",
-        *common,
-    )
+    return _agent_plugin(agent).storage.config_item_names
 
 
 def _agent_history_item_names(agent: AgentKind) -> tuple[str, ...]:
-    if agent == "codex":
-        return ("history.json", "history.jsonl")
-    if agent == "claude":
-        return ("history.json", "history.jsonl", "file-history")
-    return ("history.json", "history.jsonl", "chats")
+    return _agent_plugin(agent).storage.history_item_names
 
 
 def _skills_directory(agent: AgentKind) -> str:
-    return "skills-cursor" if agent == "cursor" else "skills"
+    return _agent_plugin(agent).storage.skills_directory
 
 
 def _list_directory_items(root: Path, section: str) -> list[AgentConfigItem]:
@@ -260,14 +394,15 @@ def _set_directory_item_enabled(root: Path, section: str, item_id: str, enabled:
     disabled = root / f"{section}.disabled" / item_id
     source = disabled if enabled else active
     target = active if enabled else disabled
-    if not source.exists():
+    with _locked_config_writes(active.parent, disabled.parent, active, disabled):
+        if not source.exists():
+            if target.exists():
+                return
+            raise ValueError(f"config item not found: {item_id}")
+        target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
-            return
-        raise ValueError(f"config item not found: {item_id}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        raise ValueError(f"config item already exists at target: {item_id}")
-    shutil.move(str(source), str(target))
+            raise ValueError(f"config item already exists at target: {item_id}")
+        shutil.move(str(source), str(target))
 
 
 def _name_from_skill(path: Path) -> str | None:
@@ -284,11 +419,12 @@ def _name_from_skill(path: Path) -> str | None:
 
 
 def _list_plugins(agent: AgentKind, root: Path) -> list[AgentConfigItem]:
-    if agent == "codex":
+    strategy = _agent_plugin(agent).native_config.plugin_strategy
+    if strategy == "codex_toml":
         return _list_codex_plugins(root)
-    if agent == "claude":
+    if strategy == "claude_settings":
         return _list_claude_plugins(root)
-    return _list_cursor_plugins(root)
+    return _list_directory_plugins(root)
 
 
 def _list_codex_plugins(root: Path) -> list[AgentConfigItem]:
@@ -315,38 +451,93 @@ def _list_claude_plugins(root: Path) -> list[AgentConfigItem]:
     return items
 
 
-def _list_cursor_plugins(root: Path) -> list[AgentConfigItem]:
+def _list_directory_plugins(root: Path) -> list[AgentConfigItem]:
     items: dict[str, AgentConfigItem] = {}
     for enabled, base in ((False, root / "plugins.disabled"), (True, root / "plugins")):
         if not base.exists():
             continue
         for path in sorted(child for child in base.iterdir() if child.is_dir()):
-            manifest = path / ".cursor-plugin" / "plugin.json"
+            manifest = _directory_plugin_manifest(path)
             if not manifest.is_file():
                 continue
             data = _read_json_file(manifest)
-            plugin_id = _string(data.get("name")) or path.name
-            label = _string(data.get("displayName")) or _string(data.get("name")) or path.name
+            plugin_id = path.name
+            label = (
+                _string(data.get("displayName"))
+                or _deep_string(data, "interface", "displayName")
+                or _string(data.get("title"))
+                or _string(data.get("name"))
+                or path.name
+            )
             items[plugin_id] = AgentConfigItem(plugin_id, label, enabled, str(path))
     return sorted(items.values(), key=lambda item: item.name.lower())
 
 
+def _directory_plugin_manifest(path: Path) -> Path:
+    for relative in (
+        ".cursor-plugin/plugin.json",
+        ".antigravity-plugin/plugin.json",
+        ".gemini-plugin/plugin.json",
+        ".claude-plugin/plugin.json",
+        ".codex-plugin/plugin.json",
+        "plugin.json",
+    ):
+        manifest = path / relative
+        if manifest.is_file():
+            return manifest
+    return path / ".cursor-plugin" / "plugin.json"
+
+
 def _set_plugin_enabled(agent: AgentKind, root: Path, item_id: str, enabled: bool) -> None:
-    if agent == "codex":
+    strategy = _agent_plugin(agent).native_config.plugin_strategy
+    if strategy == "codex_toml":
         _write_codex_plugin_enabled(root / "config.toml", item_id, enabled)
         return
-    if agent == "claude":
+    if strategy == "claude_settings":
         _validate_json_key_item_id(item_id)
         settings_path = root / "settings.json"
-        settings = _read_json_file(settings_path)
-        enabled_plugins = settings.setdefault("enabledPlugins", {})
-        if not isinstance(enabled_plugins, dict):
-            enabled_plugins = {}
-            settings["enabledPlugins"] = enabled_plugins
-        enabled_plugins[item_id] = enabled
-        _write_json_file(settings_path, settings)
+        with _locked_config_writes(settings_path):
+            settings = _read_json_file(settings_path)
+            enabled_plugins = settings.setdefault("enabledPlugins", {})
+            if not isinstance(enabled_plugins, dict):
+                enabled_plugins = {}
+                settings["enabledPlugins"] = enabled_plugins
+            enabled_plugins[item_id] = enabled
+            _write_json_file(settings_path, settings)
         return
-    _set_directory_item_enabled(root, "plugins", item_id, enabled)
+    _set_cursor_plugin_enabled(root, item_id, enabled)
+
+
+def _set_cursor_plugin_enabled(root: Path, item_id: str, enabled: bool) -> None:
+    with _locked_config_writes(root / "plugins", root / "plugins.disabled"):
+        try:
+            _set_directory_item_enabled(root, "plugins", item_id, enabled)
+            return
+        except ValueError as exc:
+            if not str(exc).startswith("config item not found:"):
+                raise
+
+        _validate_json_key_item_id(item_id)
+        directory_name = _cursor_plugin_directory_for_manifest_name(root, item_id, enabled=enabled)
+        if directory_name is None:
+            raise ValueError(f"config item not found: {item_id}")
+        _set_directory_item_enabled(root, "plugins", directory_name, enabled)
+
+
+def _cursor_plugin_directory_for_manifest_name(
+    root: Path,
+    item_id: str,
+    *,
+    enabled: bool,
+) -> str | None:
+    source = root / ("plugins.disabled" if enabled else "plugins")
+    if not source.exists():
+        return None
+    for path in sorted(child for child in source.iterdir() if child.is_dir()):
+        data = _read_json_file(_directory_plugin_manifest(path))
+        if _string(data.get("name")) == item_id:
+            return path.name
+    return None
 
 
 def _list_hooks(agent: AgentKind, root: Path) -> list[AgentConfigItem]:
@@ -387,44 +578,44 @@ def _hook_items(hooks: dict[str, Any], *, enabled: bool) -> list[AgentConfigItem
 def _set_hook_enabled(agent: AgentKind, root: Path, item_id: str, enabled: bool) -> None:
     settings_path = _hooks_config_path(agent, root)
     disabled_path = root / DISABLED_HOOKS_FILE
-    settings = _read_json_file(settings_path)
-    hooks = _ensure_hooks_root(settings)
-    disabled_hooks = _read_json_file(disabled_path)
     event_name, separator, command = item_id.partition(":")
     if not separator:
         raise ValueError(f"invalid hook id: {item_id}")
 
-    if enabled:
-        removed = _remove_hook_entry(disabled_hooks, event_name, command)
+    with _locked_config_writes(settings_path, disabled_path):
+        settings = _read_json_file(settings_path)
+        hooks = _ensure_hooks_root(settings)
+        disabled_hooks = _read_json_file(disabled_path)
+
+        if enabled:
+            removed = _remove_hook_entry(disabled_hooks, event_name, command)
+            if removed is not None:
+                _set_hook_entry_enabled(removed, True)
+                _append_hook_entry(hooks, event_name, removed)
+                _write_json_file(settings_path, settings)
+                _write_json_file(disabled_path, disabled_hooks)
+                return
+            active = _find_hook_entry(hooks, event_name, command)
+            if active is not None:
+                _set_hook_entry_enabled(active, True)
+                _write_json_file(settings_path, settings)
+                return
+            raise ValueError(f"hook not found: {item_id}")
+
+        removed = _remove_hook_entry(hooks, event_name, command)
         if removed is not None:
-            _set_hook_entry_enabled(removed, True)
-            _append_hook_entry(hooks, event_name, removed)
+            _set_hook_entry_enabled(removed, False)
+            _append_hook_entry(disabled_hooks, event_name, removed)
             _write_json_file(settings_path, settings)
             _write_json_file(disabled_path, disabled_hooks)
             return
-        active = _find_hook_entry(hooks, event_name, command)
-        if active is not None:
-            _set_hook_entry_enabled(active, True)
-            _write_json_file(settings_path, settings)
+        if _find_hook_entry(disabled_hooks, event_name, command) is not None:
             return
         raise ValueError(f"hook not found: {item_id}")
 
-    removed = _remove_hook_entry(hooks, event_name, command)
-    if removed is not None:
-        _set_hook_entry_enabled(removed, False)
-        _append_hook_entry(disabled_hooks, event_name, removed)
-        _write_json_file(settings_path, settings)
-        _write_json_file(disabled_path, disabled_hooks)
-        return
-    if _find_hook_entry(disabled_hooks, event_name, command) is not None:
-        return
-    raise ValueError(f"hook not found: {item_id}")
-
 
 def _hooks_config_path(agent: AgentKind, root: Path) -> Path:
-    if agent == "claude":
-        return root / "settings.json"
-    return root / "hooks.json"
+    return root / _hooks_config_name(agent)
 
 
 def _hooks_root(settings: dict[str, Any]) -> dict[str, Any]:
@@ -533,8 +724,38 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 
 
 def _write_json_file(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    with _locked_config_writes(path):
+        _write_text_file_atomic(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def _write_text_file_atomic(path: Path, content: str) -> None:
+    write_path = path
+    if path.is_symlink():
+        with contextlib.suppress(OSError):
+            write_path = path.resolve(strict=True)
+    write_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_mode: int | None = None
+    with contextlib.suppress(OSError):
+        existing_mode = write_path.stat().st_mode & 0o777
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{write_path.name}.",
+        suffix=".tmp",
+        dir=write_path.parent,
+        text=True,
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if existing_mode is not None:
+                os.fchmod(handle.fileno(), existing_mode)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, write_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temp_path.unlink()
+        raise
 
 
 def _string(value: object) -> str | None:
@@ -550,6 +771,15 @@ def _deep_string(data: object, *keys: str) -> str | None:
     return _string(value)
 
 
+def _codex_plugin_header(line: str) -> str | None:
+    header = re.match(r'\s*\[plugins\."([^"]+)"\]\s*(?:#.*)?$', line)
+    return header.group(1) if header else None
+
+
+def _is_toml_table_header(line: str) -> bool:
+    return re.match(r"\s*\[\[?[^\[\]]+\]?\]\s*(?:#.*)?$", line) is not None
+
+
 def _read_codex_plugin_enabled(path: Path) -> dict[str, bool]:
     if not path.is_file():
         return {}
@@ -560,10 +790,12 @@ def _read_codex_plugin_enabled(path: Path) -> dict[str, bool]:
     except OSError:
         return {}
     for line in lines:
-        header = re.match(r'\s*\[plugins\."([^"]+)"\]\s*$', line)
-        if header:
-            current_plugin = header.group(1)
+        plugin_id = _codex_plugin_header(line)
+        if plugin_id is not None:
+            current_plugin = plugin_id
             continue
+        if _is_toml_table_header(line):
+            current_plugin = None
         if current_plugin is None:
             continue
         enabled = re.match(r"\s*enabled\s*=\s*(true|false)\s*(?:#.*)?$", line, re.IGNORECASE)
@@ -575,38 +807,39 @@ def _read_codex_plugin_enabled(path: Path) -> dict[str, bool]:
 def _write_codex_plugin_enabled(path: Path, item_id: str, enabled: bool) -> None:
     _validate_codex_plugin_id(item_id)
     value = "true" if enabled else "false"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        path.write_text(f'[plugins."{item_id}"]\nenabled = {value}\n', encoding="utf-8")
-        return
+    with _locked_config_writes(path):
+        if not path.exists():
+            _write_text_file_atomic(path, f'[plugins."{item_id}"]\nenabled = {value}\n')
+            return
 
-    lines = path.read_text(encoding="utf-8").splitlines()
-    output: list[str] = []
-    in_target = False
-    target_seen = False
-    enabled_written = False
-    for line in lines:
-        header = re.match(r'\s*\[plugins\."([^"]+)"\]\s*$', line)
-        if header:
-            if in_target and not enabled_written:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        output: list[str] = []
+        in_target = False
+        target_seen = False
+        enabled_written = False
+        for line in lines:
+            plugin_id = _codex_plugin_header(line)
+            if plugin_id is not None or _is_toml_table_header(line):
+                if in_target and not enabled_written:
+                    output.append(f"enabled = {value}")
+                    enabled_written = True
+                in_target = plugin_id == item_id
+                if in_target:
+                    target_seen = True
+                output.append(line)
+                continue
+            if in_target and re.match(r"\s*enabled\s*=", line):
                 output.append(f"enabled = {value}")
                 enabled_written = True
-            in_target = header.group(1) == item_id
-            target_seen = target_seen or in_target
+                continue
             output.append(line)
-            continue
-        if in_target and re.match(r"\s*enabled\s*=", line):
+        if in_target and not enabled_written:
             output.append(f"enabled = {value}")
-            enabled_written = True
-            continue
-        output.append(line)
-    if in_target and not enabled_written:
-        output.append(f"enabled = {value}")
-    if not target_seen:
-        if output and output[-1].strip():
-            output.append("")
-        output.extend([f'[plugins."{item_id}"]', f"enabled = {value}"])
-    path.write_text("\n".join(output) + "\n", encoding="utf-8")
+        if not target_seen:
+            if output and output[-1].strip():
+                output.append("")
+            output.extend([f'[plugins."{item_id}"]', f"enabled = {value}"])
+        _write_text_file_atomic(path, "\n".join(output) + "\n")
 
 
 def _validate_path_item_id(item_id: str) -> None:

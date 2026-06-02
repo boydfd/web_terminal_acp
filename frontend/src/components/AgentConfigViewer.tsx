@@ -1,4 +1,5 @@
 import type { AgentConfig, AgentConfigItem, AgentConfigSection } from "../types";
+import { agentLabel, DEFAULT_AGENT_CLIENTS } from "../agentLaunch";
 
 type AgentConfigViewerProps = {
   config: AgentConfig | null;
@@ -11,24 +12,21 @@ type AgentConfigViewerProps = {
   title?: string;
   metaPrefix?: string;
   emptyMessage?: string;
+  readOnly?: boolean;
   onToggleItem: (sectionId: string, itemId: string, nextEnabled: boolean) => void;
-};
-
-const AGENT_LABELS: Record<AgentConfig["agent"], string> = {
-  codex: "Codex",
-  claude: "Claude",
-  cursor: "Cursor"
 };
 
 function AgentConfigItemRow({
   section,
   item,
   disabled,
+  readOnly,
   onToggleItem
 }: {
   section: AgentConfigSection;
   item: AgentConfigItem;
   disabled: boolean;
+  readOnly: boolean;
   onToggleItem: (sectionId: string, itemId: string, nextEnabled: boolean) => void;
 }) {
   const action = item.enabled ? "Disable" : "Enable";
@@ -42,7 +40,7 @@ function AgentConfigItemRow({
         <input
           type="checkbox"
           checked={item.enabled}
-          disabled={disabled}
+          disabled={readOnly || disabled}
           aria-label={`${action} ${item.name}`}
           onChange={(event) => onToggleItem(section.id, item.id, event.target.checked)}
         />
@@ -56,11 +54,13 @@ function AgentConfigSectionView({
   section,
   pendingItemId,
   isToggling,
+  readOnly,
   onToggleItem
 }: {
   section: AgentConfigSection;
   pendingItemId: string | null;
   isToggling: boolean;
+  readOnly: boolean;
   onToggleItem: (sectionId: string, itemId: string, nextEnabled: boolean) => void;
 }) {
   return (
@@ -79,6 +79,7 @@ function AgentConfigSectionView({
               section={section}
               item={item}
               disabled={isToggling && pendingItemId === item.id}
+              readOnly={readOnly}
               onToggleItem={onToggleItem}
             />
           ))}
@@ -99,10 +100,11 @@ export function AgentConfigViewer({
   title = "Agent Config",
   metaPrefix = "user config",
   emptyMessage,
+  readOnly = false,
   onToggleItem
 }: AgentConfigViewerProps) {
   const meta = config
-    ? `${AGENT_LABELS[config.agent]} ${metaPrefix}${isFetching && !isLoading ? " · refreshing" : ""}`
+    ? `${agentLabel(config.agent, DEFAULT_AGENT_CLIENTS)} ${metaPrefix}${isFetching && !isLoading ? " · refreshing" : ""}`
     : isLoading
       ? "Loading"
       : "Unavailable";
@@ -127,6 +129,7 @@ export function AgentConfigViewer({
               section={section}
               pendingItemId={pendingItemId}
               isToggling={isToggling}
+              readOnly={readOnly}
               onToggleItem={onToggleItem}
             />
           ))}

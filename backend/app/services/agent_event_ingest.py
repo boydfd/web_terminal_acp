@@ -7,8 +7,10 @@ from elasticsearch import ApiError, AsyncElasticsearch
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_plugins import get_agent_plugin_registry
 from app.agent_tools import get_agent_tool_registry
 from app.client_agent.ai_events import ManagedAiEvent, managed_event_from_payload
+from app.db import prefer_deferred_commit
 from app.models import AiSession, Event
 from app.repositories.ai_sessions import get_or_create_ai_session
 from app.repositories.events import insert_normalized_event
@@ -16,11 +18,9 @@ from app.services.summary_scheduler import schedule_summary_after_agent_activity
 from app.repositories.windows import get_window_for_client
 from app.services.search_index import index_ai_event
 
-_PROVIDER_ALIASES = {"claude": "claude_code"}
-
 
 def canonical_provider(provider: str) -> str:
-    return _PROVIDER_ALIASES.get(provider, provider)
+    return get_agent_plugin_registry().canonical_provider(provider)
 
 
 async def persist_managed_agent_event(
@@ -42,6 +42,8 @@ async def persist_managed_agent_event(
     )
     if validated_event is None:
         raise ValueError("event attribution does not match client/window")
+
+    await prefer_deferred_commit(session)
 
     window = await get_window_for_client(session, event.client_id, event.window_id)
     if window is None:

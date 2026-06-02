@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+from .types import (
+    AgentClientCapabilities,
+    AgentCommandSpec,
+    AgentManagedStorageSpec,
+    AgentNativeConfigSpec,
+    AgentPlugin,
+)
+
+COMMON_CONFIG_ITEMS = ("hooks", "hooks.json", "hooks.disabled.json", "plugins", "plugins.disabled")
+
+
+def builtin_agent_plugins() -> tuple[AgentPlugin, ...]:
+    return (
+        AgentPlugin(
+            agent_client_id="codex",
+            provider_id="codex",
+            label="Codex",
+            aliases=(),
+            command=AgentCommandSpec(
+                default_command="codex",
+                command_names=("codex",),
+                permission_flag="--dangerously-bypass-approvals-and-sandbox",
+                non_task_subcommands=(
+                    "auth",
+                    "completion",
+                    "debug",
+                    "help",
+                    "login",
+                    "logout",
+                    "mcp",
+                    "resume",
+                    "sandbox",
+                ),
+            ),
+            storage=AgentManagedStorageSpec(
+                user_root=".codex",
+                managed_root=".web-terminal-acp/codex-homes",
+                managed_home_alias=".codex",
+                skills_directory="skills",
+                config_item_names=(
+                    "config.toml",
+                    "AGENTS.md",
+                    "skills",
+                    "skills.disabled",
+                    "plugin_marketplaces.json",
+                    *COMMON_CONFIG_ITEMS,
+                ),
+                history_item_names=("history.json", "history.jsonl"),
+                env={"CODEX_HOME": "~/.web-terminal-acp/codex-homes/{window_id}"},
+                shell_env_aliases={
+                    "WEB_TERMINAL_CODEX_HOME": "~/.web-terminal-acp/codex-homes/{window_id}",
+                    "WEB_TERMINAL_ORIGINAL_CODEX_HOME": "~/.codex",
+                },
+                shell_prepare_function="__web_terminal_prepare_codex_home",
+            ),
+            native_config=AgentNativeConfigSpec(
+                hooks_config_name="hooks.json",
+                profile_agent_md_targets=("AGENTS.md", "AGENT.md"),
+                initial_agent_md_candidates=("AGENTS.md", "AGENT.md"),
+                plugin_strategy="codex_toml",
+            ),
+            capabilities=AgentClientCapabilities(
+                agent_records=True,
+                runtime_tags=True,
+                work_presence=True,
+            ),
+            watch_collector_name="collect_codex_watch_events",
+            tool_adapter_module="codex",
+            tool_adapter_class="CodexAdapter",
+        ),
+        AgentPlugin(
+            agent_client_id="claude",
+            provider_id="claude_code",
+            label="Claude Code",
+            aliases=("claude_code",),
+            command=AgentCommandSpec(
+                default_command="claude",
+                command_names=("claude",),
+                permission_flag="--dangerously-skip-permissions",
+            ),
+            storage=AgentManagedStorageSpec(
+                user_root=".claude",
+                managed_root=".web-terminal-acp/claude-code-homes",
+                managed_home_alias=".claude",
+                skills_directory="skills",
+                config_item_names=(
+                    "settings.json",
+                    "settings.local.json",
+                    "commands",
+                    "skills",
+                    "skills.disabled",
+                    "api-key-helper.sh",
+                    *COMMON_CONFIG_ITEMS,
+                ),
+                history_item_names=("history.json", "history.jsonl", "file-history"),
+                env={"CLAUDE_CONFIG_DIR": "~/.web-terminal-acp/claude-code-homes/{window_id}"},
+                shell_env_aliases={
+                    "WEB_TERMINAL_CLAUDE_CODE_HOME": "~/.web-terminal-acp/claude-code-homes/{window_id}",
+                    "WEB_TERMINAL_ORIGINAL_CLAUDE_CODE_HOME": "~/.claude",
+                    "WEB_TERMINAL_ORIGINAL_CLAUDE_JSON": "~/.claude.json",
+                },
+                shell_prepare_function="__web_terminal_prepare_claude_code_home",
+            ),
+            native_config=AgentNativeConfigSpec(
+                hooks_config_name="settings.json",
+                profile_agent_md_targets=("CLAUDE.md", "AGENT.md"),
+                initial_agent_md_candidates=("CLAUDE.md", "AGENT.md"),
+                plugin_strategy="claude_settings",
+                hook_strategy="claude_settings",
+            ),
+            capabilities=AgentClientCapabilities(
+                agent_records=True,
+                runtime_tags=True,
+                work_presence=True,
+            ),
+            watch_collector_name="collect_claude_code_watch_events",
+            tool_adapter_module="claude_code",
+            tool_adapter_class="ClaudeCodeAdapter",
+        ),
+        AgentPlugin(
+            agent_client_id="cursor",
+            provider_id="cursor_cli",
+            label="Cursor",
+            aliases=("cursor_cli", "agent"),
+            command=AgentCommandSpec(
+                default_command="agent",
+                command_names=("agent", "cursor", "cursor-agent"),
+            ),
+            storage=AgentManagedStorageSpec(
+                user_root=".cursor",
+                managed_root=".web-terminal-acp/cursor-homes",
+                managed_home_alias=".cursor",
+                skills_directory="skills-cursor",
+                config_item_names=(
+                    "agent-cli-state.json",
+                    "cli-config.json",
+                    "skills-cursor",
+                    "skills-cursor.disabled",
+                    *COMMON_CONFIG_ITEMS,
+                ),
+                history_item_names=("history.json", "history.jsonl", "chats"),
+                env={
+                    "CURSOR_AGENT_HOME": "~/.web-terminal-acp/cursor-homes/{window_id}",
+                    "CURSOR_CONFIG_DIR": "~/.web-terminal-acp/cursor-homes/{window_id}",
+                    "CURSOR_DATA_DIR": "~/.web-terminal-acp/cursor-homes/{window_id}",
+                },
+                shell_env_aliases={
+                    "WEB_TERMINAL_CURSOR_HOME": "~/.web-terminal-acp/cursor-homes/{window_id}",
+                    "WEB_TERMINAL_ORIGINAL_CURSOR_DIR": "~/.cursor",
+                },
+                shell_prepare_function="__web_terminal_prepare_cursor_home",
+            ),
+            native_config=AgentNativeConfigSpec(
+                hooks_config_name="hooks.json",
+                profile_agent_md_targets=("AGENT.md", "AGENTS.md"),
+                initial_agent_md_candidates=("AGENT.md", "AGENTS.md"),
+                plugin_strategy="directory",
+            ),
+            capabilities=AgentClientCapabilities(
+                agent_records=True,
+                runtime_tags=True,
+                work_presence=True,
+            ),
+            watch_collector_name="collect_cursor_watch_events",
+            tool_adapter_module="cursor_cli",
+            tool_adapter_class="CursorCliAdapter",
+        ),
+        AgentPlugin(
+            agent_client_id="antigravity",
+            provider_id="antigravity_cli",
+            label="Antigravity CLI",
+            aliases=("antigravity-cli", "antigravity_cli", "agy"),
+            command=AgentCommandSpec(
+                default_command="agy-p",
+                command_names=("agy-p", "agy"),
+                permission_flag="--dangerously-skip-permissions",
+                non_task_subcommands=(
+                    "changelog",
+                    "help",
+                    "install",
+                    "plugin",
+                    "plugins",
+                    "update",
+                ),
+            ),
+            storage=AgentManagedStorageSpec(
+                user_root=".gemini/antigravity-cli",
+                managed_root=".web-terminal-acp/antigravity-cli-homes",
+                managed_home_alias=".gemini/antigravity-cli",
+                skills_directory="skills",
+                config_item_names=(
+                    "settings.json",
+                    "keybindings.json",
+                    "skills",
+                    "skills.disabled",
+                    *COMMON_CONFIG_ITEMS,
+                ),
+                history_item_names=(
+                    "antigravity-oauth-token",
+                    "history.jsonl",
+                    "installation_id",
+                    "conversations",
+                    "implicit",
+                ),
+                env={
+                    "WEB_TERMINAL_ANTIGRAVITY_COMMAND_HOME": "~/.web-terminal-acp/antigravity-cli-homes/.managed-home/{window_id}"
+                },
+                shell_env_aliases={
+                    "WEB_TERMINAL_ANTIGRAVITY_HOME": "~/.web-terminal-acp/antigravity-cli-homes/{window_id}",
+                    "WEB_TERMINAL_ORIGINAL_ANTIGRAVITY_CLI_HOME": "~/.gemini/antigravity-cli",
+                    "WEB_TERMINAL_ORIGINAL_HOME": "~",
+                },
+                shell_prepare_function="__web_terminal_prepare_antigravity_home",
+            ),
+            native_config=AgentNativeConfigSpec(
+                hooks_config_name="hooks.json",
+                profile_agent_md_targets=("AGENT.md", "AGENTS.md"),
+                initial_agent_md_candidates=("AGENT.md", "AGENTS.md"),
+                plugin_strategy="directory",
+            ),
+            capabilities=AgentClientCapabilities(
+                agent_records=True,
+            ),
+            watch_collector_name="collect_antigravity_watch_events",
+            tool_adapter_module="antigravity_cli",
+            tool_adapter_class="AntigravityCliAdapter",
+        ),
+    )

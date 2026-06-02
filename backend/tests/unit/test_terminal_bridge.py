@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import os
 import fcntl
+import signal
 import struct
 import termios
 from uuid import UUID
@@ -111,6 +112,10 @@ class FakeProcess:
         self.terminated = 0
         self.killed = 0
         self.waited = 0
+        self.signals: list[int] = []
+
+    def send_signal(self, signal_number: int) -> None:
+        self.signals.append(signal_number)
 
     def terminate(self) -> None:
         self.terminated += 1
@@ -141,6 +146,7 @@ async def test_local_terminal_runtime_resize_updates_pty_and_shadow_tmux_window(
     tmux_manager = FakeTmuxManager()
     runtime = LocalTerminalRuntime(tmux_manager)
     window = RuntimeWindow(session_id="web-terminal", window_id="@9")
+    process = FakeProcess()
     keepalive = asyncio.create_task(asyncio.sleep(10))
 
     async def fake_to_thread(func, *args):
@@ -153,7 +159,7 @@ async def test_local_terminal_runtime_resize_updates_pty_and_shadow_tmux_window(
     monkeypatch.setattr("app.services.runtime.local.apply_pty_resize", fake_resize)
     runtime._sessions[(window.session_id, window.window_id)] = _LocalTerminalSession(
         master_fd=123,
-        process=object(),
+        process=process,
         task=keepalive,
     )
     try:
@@ -164,6 +170,7 @@ async def test_local_terminal_runtime_resize_updates_pty_and_shadow_tmux_window(
             await keepalive
 
     assert resizes == [(123, ResizeControl(cols=41, rows=44))]
+    assert process.signals == [signal.SIGWINCH]
     assert tmux_manager.resizes == [(window, 41, 44)]
 
 

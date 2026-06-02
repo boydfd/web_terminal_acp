@@ -1,8 +1,9 @@
+name: ${COMPOSE_PROJECT_NAME:-web_terminal_acp}
+
 services:
   postgres:
     image: postgres:16.3-alpine
     restart: unless-stopped
-    network_mode: bridge
     command:
       - postgres
       - -c
@@ -13,6 +14,10 @@ services:
       - track_io_timing=on
       - -c
       - log_min_duration_statement=${POSTGRES_LOG_MIN_DURATION_STATEMENT_MS:-500}
+      - -c
+      - checkpoint_timeout=${POSTGRES_CHECKPOINT_TIMEOUT:-15min}
+      - -c
+      - max_wal_size=${POSTGRES_MAX_WAL_SIZE:-2GB}
       - -c
       - "log_line_prefix=%m [%p] user=%u,db=%d,app=%a,client=%h "
       - -c
@@ -45,7 +50,7 @@ services:
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
     restart: unless-stopped
-    network_mode: bridge
+    hostname: elasticsearch
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
@@ -72,7 +77,6 @@ services:
   redis:
     image: redis:7.2-alpine
     restart: unless-stopped
-    network_mode: bridge
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
     ports:
       - "${REDIS_PUBLISHED_PORT:-16379}:6379"
@@ -119,7 +123,6 @@ services:
       args:
         BACKEND_BASE_IMAGE: backend-base
     restart: unless-stopped
-    network_mode: bridge
     environment:
       APP_HOST: 0.0.0.0
       APP_PORT: 8000
@@ -149,10 +152,6 @@ services:
       - ${AGENTS_CONFIG_DIR:-~/.agents}:/home/appuser/.agents
       - ${ACPX_CONFIG_DIR:-~/.acpx}:/home/appuser/.acpx
       - ${WORKSPACE_DIR:-~/workspace}:/workspace
-    links:
-      - postgres
-      - elasticsearch
-      - redis
     depends_on:
       postgres:
         condition: service_healthy
@@ -185,11 +184,8 @@ services:
         VITE_CLIENT_AGENT_SERVER_URL: ${VITE_CLIENT_AGENT_SERVER_URL:-}
         NPM_REGISTRY: ${NPM_REGISTRY:-}
     restart: unless-stopped
-    network_mode: bridge
     ports:
       - "5173:80"
-    links:
-      - backend
     depends_on:
       backend:
         condition: service_healthy
@@ -207,6 +203,12 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${COMPOSE_NETWORK_SUBNET:-10.201.0.0/24}
 
 volumes:
   postgres_data:

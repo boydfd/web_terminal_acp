@@ -81,4 +81,32 @@ describe("ProjectTerminalPicker", () => {
       expect.objectContaining({ agent: "codex", command: "codex" })
     );
   });
+
+  it("hides agent clients that do not support launch", () => {
+    renderPicker({
+      agentClients: [
+        {
+          id: "launchable",
+          provider_id: "launchable_provider",
+          label: "Launchable",
+          aliases: [],
+          default_command: "launchable",
+          command_names: ["launchable"],
+          capabilities: { launch: true }
+        },
+        {
+          id: "config_only",
+          provider_id: "config_provider",
+          label: "Config Only",
+          aliases: [],
+          default_command: "config-only",
+          command_names: ["config-only"],
+          capabilities: { launch: false, profile_config: true }
+        }
+      ]
+    });
+
+    expect(container?.textContent).toContain("Launchable");
+    expect(container?.textContent).not.toContain("Config Only");
+  });
 });

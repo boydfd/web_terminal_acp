@@ -4,17 +4,20 @@ import asyncio
 import contextlib
 import logging
 import posixpath
+import re
+import shlex
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from sqlalchemy import case, desc, func, or_, select
+from sqlalchemy import Text, and_, case, cast, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
+from app.agent_plugins import get_agent_plugin_registry, list_agent_client_descriptors
 from app.agent_tools import agent_activity_source_types, get_agent_tool_registry
 from app.agent_tools.common import fallback_projection
 from app.agent_tools.types import AgentChatProjection, AgentEventProjection, AgentToolAdapter
@@ -48,10 +51,13 @@ from app.repositories.windows import (
 )
 from app.routers.ui_events import ui_event_hub_from_state
 from app.services import agent_config as agent_config_service
+from app.services import agent_profiles as agent_profile_service
+from app.services.aux_terminal import aux_terminal_registry_from_state, kill_remote_aux_terminal
 from app.schemas import (
     AgentConfigOut,
     AgentConfigSelectionIn,
     AgentConfigToggleIn,
+    AgentClientListOut,
     AgentChatMessageOut,
     AgentChatRecordOut,
     AgentEventOut,
@@ -99,17 +105,24 @@ REMOTE_CREATE_WINDOW_TIMEOUT_SECONDS = 60.0
 
 AgentRecordLimit = Annotated[int, Query(ge=1, le=200)]
 AgentRecordOffset = Annotated[int, Query(ge=0)]
-AgentChatRole = Literal["all", "user", "agent"]
+AgentChatRole = Literal["all", "user", "agent", "subagent_call", "subagent_result"]
+AgentClientCapability = Literal["launch", "client_config", "window_config", "profile_config"]
 CommandHistoryLimit = Annotated[int, Query(ge=1, le=200)]
 CommandHistoryOffset = Annotated[int, Query(ge=0)]
 TitleHistoryLimit = Annotated[int, Query(ge=1, le=200)]
 TitleHistoryOffset = Annotated[int, Query(ge=0)]
 _PROVIDER_ALIASES = {"claude": "claude_code", "cursor": "cursor_cli", "agent": "cursor_cli"}
-_AGENT_PROVIDER_BY_KIND = {
-    "codex": "codex",
-    "claude": "claude_code",
-    "cursor": "cursor_cli",
+_COMMAND_SEGMENT_PATTERN = re.compile(r"&&|\|\||[;|]")
+_ENV_ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+_COMMAND_WRAPPERS = {"command", "env", "sudo"}
+_REMOTE_CAPABILITY_DEFAULTS: dict[AgentClientCapability, bool] = {
+    "launch": True,
+    "client_config": True,
+    "window_config": True,
+    "profile_config": True,
 }
+AGENT_RECORD_CHAT_EVENT_BATCH_SIZE = 500
+AGENT_RECORD_DETAIL_RELATED_EVENT_LIMIT = 500
 
 
 @dataclass(frozen=True)
@@ -124,6 +137,47 @@ class _WindowOverviewTimestamps:
     last_agent_event_at: datetime | None = None
     last_recent_usage_at: datetime | None = None
     last_agent_presence_at: datetime | None = None
+
+
+@router.get("/clients/{client_id}/agent-clients", response_model=AgentClientListOut)
+async def read_agent_clients(
+    client_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> AgentClientListOut:
+    client = await _require_client(session, client_id)
+    if client.runtime is not ClientRuntime.local:
+        runtime = RemoteRuntime(
+            client_id=client_id,
+            registry=request.app.state.client_connections,
+        )
+        try:
+            return AgentClientListOut.model_validate(await runtime.list_agent_clients())
+        except RemoteClientUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"message": "remote client unavailable", "reason": exc.reason},
+            ) from exc
+        except RemoteTerminalError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+
+    return AgentClientListOut(
+        agent_clients=[
+            {
+                "id": descriptor.id,
+                "provider_id": descriptor.provider_id,
+                "label": descriptor.label,
+                "aliases": list(descriptor.aliases),
+                "default_command": descriptor.default_command,
+                "command_names": list(descriptor.command_names),
+                "capabilities": asdict(descriptor.capabilities),
+            }
+            for descriptor in list_agent_client_descriptors()
+        ]
+    )
 
 
 def _runtime_client_from_model(client: Client) -> _RuntimeClient:
@@ -304,7 +358,7 @@ def to_agent_session_out(ai_session: AiSession) -> AgentSessionOut:
 
 
 def _canonical_provider(provider: str) -> str:
-    return _PROVIDER_ALIASES.get(provider, provider)
+    return get_agent_plugin_registry().canonical_provider(_PROVIDER_ALIASES.get(provider, provider))
 
 
 def _payload_provider(event: Event) -> str | None:
@@ -333,26 +387,52 @@ def _adapter_for_event(event: Event) -> AgentToolAdapter | None:
     return None
 
 
-def _projection_out(projection: AgentEventProjection) -> AgentEventProjectionOut:
+def _projection_out(
+    projection: AgentEventProjection,
+    sessions_by_source_id: dict[str, AiSession] | None = None,
+    subagent_targets_by_tool_use_id: dict[str, str] | None = None,
+) -> AgentEventProjectionOut:
+    sessions_by_source_id = sessions_by_source_id or {}
+    target_session_source_id = _projection_target_source_id(
+        projection,
+        subagent_targets_by_tool_use_id or {},
+    )
     return AgentEventProjectionOut(
         tone=projection.tone,
         label=projection.label,
         body=projection.body,
         body_format=projection.body_format,
         subtype=projection.subtype,
+        agent_message_type=_agent_message_type(projection.agent_message_type),
+        subagent_id=projection.subagent_id,
+        subagent_tool_use_id=projection.subagent_tool_use_id,
+        target_session_id=_target_session_id_for_source(target_session_source_id, sessions_by_source_id),
+        target_session_source_id=target_session_source_id,
     )
 
 
-def _project_event(event: Event) -> AgentEventProjectionOut:
+def _project_event(
+    event: Event,
+    sessions_by_source_id: dict[str, AiSession] | None = None,
+    subagent_targets_by_tool_use_id: dict[str, str] | None = None,
+) -> AgentEventProjectionOut:
     adapter = _adapter_for_event(event)
     projection: AgentEventProjection | None = None
     if adapter is not None:
         with contextlib.suppress(Exception):
             projection = adapter.project_event(event)
-    return _projection_out(projection or fallback_projection(event))
+    return _projection_out(
+        projection or fallback_projection(event),
+        sessions_by_source_id,
+        subagent_targets_by_tool_use_id,
+    )
 
 
-def to_agent_event_out(event: Event) -> AgentEventOut:
+def to_agent_event_out(
+    event: Event,
+    sessions_by_source_id: dict[str, AiSession] | None = None,
+    subagent_targets_by_tool_use_id: dict[str, str] | None = None,
+) -> AgentEventOut:
     return AgentEventOut(
         id=event.id,
         ai_session_id=event.ai_session_id,
@@ -360,7 +440,7 @@ def to_agent_event_out(event: Event) -> AgentEventOut:
         source_id=event.source_id,
         kind=event.kind,
         payload_json=event.payload_json,
-        projection=_project_event(event),
+        projection=_project_event(event, sessions_by_source_id, subagent_targets_by_tool_use_id),
         created_at=event.created_at,
     )
 
@@ -377,7 +457,43 @@ def _project_chat(event: Event) -> AgentChatProjection | None:
     return None
 
 
-def _chat_message_out(event: Event, projection: AgentChatProjection) -> AgentChatMessageOut:
+def _agent_message_type(value: str | None) -> Literal["agent", "subagent_call", "subagent_result"] | None:
+    if value in {"agent", "subagent_call", "subagent_result"}:
+        return value
+    return None
+
+
+def _target_session_id_for_source(
+    source_id: str | None,
+    sessions_by_source_id: dict[str, AiSession],
+) -> UUID | None:
+    if source_id is None:
+        return None
+    return sessions_by_source_id.get(source_id).id if source_id in sessions_by_source_id else None
+
+
+def _projection_target_source_id(
+    projection: AgentEventProjection | AgentChatProjection,
+    subagent_targets_by_tool_use_id: dict[str, str],
+) -> str | None:
+    if projection.target_session_source_id is not None:
+        return projection.target_session_source_id
+    if projection.subagent_tool_use_id is None:
+        return None
+    return subagent_targets_by_tool_use_id.get(projection.subagent_tool_use_id)
+
+
+def _chat_message_out(
+    event: Event,
+    projection: AgentChatProjection,
+    sessions_by_source_id: dict[str, AiSession] | None = None,
+    subagent_targets_by_tool_use_id: dict[str, str] | None = None,
+) -> AgentChatMessageOut:
+    sessions_by_source_id = sessions_by_source_id or {}
+    target_session_source_id = _projection_target_source_id(
+        projection,
+        subagent_targets_by_tool_use_id or {},
+    )
     return AgentChatMessageOut(
         id=event.id,
         ai_session_id=event.ai_session_id,
@@ -386,6 +502,11 @@ def _chat_message_out(event: Event, projection: AgentChatProjection) -> AgentCha
         role=projection.role,
         body=projection.body,
         body_format=projection.body_format,
+        agent_message_type=_agent_message_type(projection.agent_message_type),
+        subagent_id=projection.subagent_id,
+        subagent_tool_use_id=projection.subagent_tool_use_id,
+        target_session_id=_target_session_id_for_source(target_session_source_id, sessions_by_source_id),
+        target_session_source_id=target_session_source_id,
         created_at=event.created_at,
     )
 
@@ -437,12 +558,208 @@ def _command_history_item_out(event: Event, finished_by_sequence: dict[str, Even
     )
 
 
-def _dedupe_chat_messages(events: list[Event], role: AgentChatRole = "all") -> list[AgentChatMessageOut]:
+def _dedupe_chat_messages(
+    events: list[Event],
+    role: AgentChatRole = "all",
+    sessions_by_source_id: dict[str, AiSession] | None = None,
+) -> list[AgentChatMessageOut]:
+    sessions_by_source_id = sessions_by_source_id or _sessions_by_source_id(events)
+    subagent_targets_by_tool_use_id = _subagent_targets_by_tool_use_id(events)
     return [
-        _chat_message_out(event, projection)
+        _chat_message_out(
+            event,
+            projection,
+            sessions_by_source_id,
+            subagent_targets_by_tool_use_id,
+        )
         for event, projection in _deduped_chat_projection_items(events)
-        if role == "all" or projection.role == role
+        if _chat_role_matches(projection, role)
     ]
+
+
+@dataclass(frozen=True)
+class _ChatMessagePage:
+    messages: list[AgentChatMessageOut]
+    total: int
+    total_exact: bool
+    has_more: bool
+
+
+async def _load_chat_message_page(
+    session: AsyncSession,
+    *,
+    event_filters: list[object],
+    target_event_filters: list[object],
+    role: AgentChatRole,
+    sessions_by_source_id: dict[str, AiSession],
+    messages_limit: int,
+    messages_offset: int,
+) -> _ChatMessagePage:
+    raw_total = (
+        await session.scalar(select(func.count()).select_from(Event).where(*event_filters))
+    ) or 0
+    batch_size = max(messages_limit + messages_offset + 1, AGENT_RECORD_CHAT_EVENT_BATCH_SIZE)
+    target_count = messages_offset + messages_limit + 1
+    chat_items: list[tuple[Event, AgentChatProjection]] = []
+    pending_duplicate_items: list[tuple[Event, AgentChatProjection]] = []
+    target_events: list[Event] = []
+    raw_offset = 0
+    exhausted = True
+    deduped_items: list[tuple[Event, AgentChatProjection]] = []
+
+    while raw_offset < raw_total:
+        raw_events = list(
+            await session.scalars(
+                select(Event)
+                .options(selectinload(Event.ai_session))
+                .where(*event_filters)
+                .order_by(
+                    Event.created_at,
+                    case((Event.source_type == EventSourceType.terminal, 1), else_=0),
+                    Event.id,
+                )
+                .offset(raw_offset)
+                .limit(batch_size)
+            )
+        )
+        if not raw_events:
+            break
+        target_events.extend(raw_events)
+        raw_offset += len(raw_events)
+        next_items = pending_duplicate_items + _deduped_chat_projection_items(raw_events)
+        pending_duplicate_items = _trailing_duplicate_chat_projection_items(next_items)
+        chat_items = [*chat_items, *next_items[: len(next_items) - len(pending_duplicate_items)]]
+        deduped_items = _dedupe_chat_projection_items(chat_items)
+        if _matching_chat_item_count(deduped_items, role) >= target_count:
+            exhausted = False
+            break
+
+    if exhausted:
+        chat_items.extend(pending_duplicate_items)
+        deduped_items = _dedupe_chat_projection_items(chat_items)
+    target_events.extend(
+        await _load_antigravity_subagent_target_events(
+            session,
+            event_filters=target_event_filters,
+        )
+    )
+    subagent_targets_by_tool_use_id = _subagent_targets_by_tool_use_id(target_events)
+    messages = [
+        _chat_message_out(
+            event,
+            projection,
+            sessions_by_source_id,
+            subagent_targets_by_tool_use_id,
+        )
+        for event, projection in deduped_items
+        if _chat_role_matches(projection, role)
+    ]
+    paged_messages = messages[messages_offset : messages_offset + messages_limit]
+    has_more = len(messages) > messages_offset + len(paged_messages)
+    total = len(messages) if exhausted else messages_offset + len(paged_messages) + (1 if has_more else 0)
+    return _ChatMessagePage(
+        messages=paged_messages,
+        total=total,
+        total_exact=exhausted,
+        has_more=has_more,
+    )
+
+
+async def _load_antigravity_subagent_target_events(
+    session: AsyncSession,
+    *,
+    event_filters: list[object],
+) -> list[Event]:
+    return list(
+        await session.scalars(
+            select(Event)
+            .where(
+                *event_filters,
+                Event.kind == "tool_result",
+                Event.source_type == EventSourceType.agent_tool_record,
+                cast(Event.payload_json, Text).contains("antigravity_cli"),
+                cast(Event.payload_json, Text).contains("INVOKE_SUBAGENT"),
+            )
+            .order_by(Event.created_at, Event.id)
+            .limit(AGENT_RECORD_DETAIL_RELATED_EVENT_LIMIT)
+        )
+    )
+
+
+def _matching_chat_item_count(items: list[tuple[Event, AgentChatProjection]], role: AgentChatRole) -> int:
+    return sum(1 for _event, projection in items if _chat_role_matches(projection, role))
+
+
+def _sessions_by_source_id(events: list[Event]) -> dict[str, AiSession]:
+    sessions: dict[str, AiSession] = {}
+    for event in events:
+        if event.ai_session is not None:
+            sessions[event.ai_session.source_id] = event.ai_session
+    return sessions
+
+
+def _subagent_targets_by_tool_use_id(events: list[Event]) -> dict[str, str]:
+    targets: dict[str, str] = {}
+    for event in events:
+        payload = event.payload_json
+        raw_target = _raw_antigravity_subagent_target(payload)
+        if raw_target is not None:
+            targets.setdefault(raw_target[0], raw_target[1])
+        tool_use_result = payload.get("toolUseResult")
+        if isinstance(tool_use_result, dict):
+            tool_use_id = _string_value(tool_use_result.get("toolUseId"))
+            agent_id = _string_value(tool_use_result.get("agentId"))
+            if tool_use_id is not None and agent_id is not None:
+                targets.setdefault(tool_use_id, f"agent-{agent_id}")
+        subagent = payload.get("subagent")
+        if isinstance(subagent, dict):
+            tool_use_id = _string_value(subagent.get("toolUseId")) or _string_value(subagent.get("tool_use_id"))
+            agent_id = _string_value(payload.get("agentId")) or _string_value(subagent.get("agentId")) or _string_value(subagent.get("agent_id"))
+            if tool_use_id is not None and agent_id is not None:
+                targets.setdefault(tool_use_id, f"agent-{agent_id}")
+        matches = payload.get("subagent_tool_use_results")
+        if isinstance(matches, list):
+            for item in matches:
+                if not isinstance(item, dict):
+                    continue
+                tool_use_id = _string_value(item.get("tool_use_id")) or _string_value(item.get("toolUseId"))
+                agent_id = _string_value(item.get("agent_id")) or _string_value(item.get("agentId"))
+                if tool_use_id is not None and agent_id is not None:
+                    targets.setdefault(tool_use_id, f"agent-{agent_id}")
+    return targets
+
+
+def _raw_antigravity_subagent_target(payload: dict) -> tuple[str, str] | None:
+    provider = _string_value(payload.get("provider"))
+    if provider != "antigravity_cli":
+        return None
+    if _string_value(payload.get("type")) != "INVOKE_SUBAGENT":
+        return None
+    step_index = payload.get("step_index")
+    if not isinstance(step_index, int):
+        return None
+    content = _string_value(payload.get("content"))
+    if content is None:
+        return None
+    match = re.search(r'"conversationId"\s*:\s*"([^"]+)"', content)
+    if match is None:
+        return None
+    agent_id = match.group(1).strip()
+    if not agent_id:
+        return None
+    return f"step-{step_index - 1}", f"agent-{agent_id}"
+
+
+def _chat_role_matches(projection: AgentChatProjection, role: AgentChatRole) -> bool:
+    if role == "all":
+        return True
+    if role in {"subagent_call", "subagent_result"}:
+        return projection.agent_message_type == role
+    if role == "user":
+        return projection.role == "user"
+    return projection.role == role and (
+        projection.agent_message_type in {None, "agent"} if role == "agent" else True
+    )
 
 
 def _dedupe_chat_projection_items(
@@ -472,6 +789,18 @@ def _deduped_chat_projection_items(events: list[Event]) -> list[tuple[Event, Age
             continue
         items.append((event, projection))
     return _dedupe_chat_projection_items(items)
+
+
+def _trailing_duplicate_chat_projection_items(
+    items: list[tuple[Event, AgentChatProjection]],
+) -> list[tuple[Event, AgentChatProjection]]:
+    trailing: list[tuple[Event, AgentChatProjection]] = []
+    for event, projection in reversed(items):
+        if not projection.is_duplicate_candidate or projection.dedupe_key is None:
+            break
+        trailing.append((event, projection))
+    trailing.reverse()
+    return trailing
 
 
 def _dedupe_detail_events(events: list[Event]) -> list[Event]:
@@ -541,12 +870,66 @@ async def _agent_provider_for_window(session: AsyncSession, window: VirtualWindo
     terminal_agent = agent_from_command(latest_command.get("command") if latest_command else None)
     if terminal_agent is not None:
         return _canonical_provider(terminal_agent)
-    return _canonical_provider(agent_from_command(window.shell_command)) if window.shell_command else None
+    shell_agent = agent_from_command(window.shell_command)
+    return _canonical_provider(shell_agent) if shell_agent is not None else None
 
 
-def _require_supported_agent(provider: str | None) -> str:
-    if provider in {"codex", "claude_code", "cursor_cli"}:
-        return provider
+async def _agent_command_for_window(session: AsyncSession, window: VirtualWindow) -> str | None:
+    latest_command = await session.scalar(
+        select(Event.payload_json)
+        .where(
+            Event.client_id == window.client_id,
+            Event.virtual_window_id == window.id,
+            Event.kind == "terminal_input_command",
+        )
+        .order_by(desc(Event.created_at), desc(Event.id))
+        .limit(1)
+    )
+    if isinstance(latest_command, dict):
+        command = latest_command.get("command")
+        if isinstance(command, str) and command.strip():
+            return command
+    return window.shell_command
+
+
+def _require_supported_agent_capability(provider: str | None, capability: AgentClientCapability) -> str:
+    if provider is not None:
+        try:
+            plugin = get_agent_plugin_registry().by_provider(provider)
+        except ValueError:
+            pass
+        else:
+            if getattr(plugin.capabilities, capability):
+                return plugin.agent_client_id
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"agent client does not support {capability}",
+            )
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="agent config unavailable for this terminal",
+    )
+
+
+def _require_local_agent_capability(agent: str, capability: AgentClientCapability) -> str:
+    try:
+        plugin = get_agent_plugin_registry().by_agent_id(agent)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if not getattr(plugin.capabilities, capability):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"agent client does not support {capability}",
+        )
+    return plugin.agent_client_id
+
+
+def _require_supported_provider(provider: str | None) -> str:
+    if provider is not None:
+        try:
+            return get_agent_plugin_registry().by_provider(provider).provider_id
+        except ValueError:
+            pass
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail="agent config unavailable for this terminal",
@@ -595,6 +978,28 @@ def _agent_selection_from_schema(
     )
 
 
+def _agent_selection_payload(selection: agent_config_service.AgentConfigSelection) -> dict[str, object]:
+    return {
+        "agent": selection.agent,
+        "sections": [
+            {
+                "id": section.id,
+                "items": [
+                    {"id": item.id, "enabled": item.enabled}
+                    for item in section.items
+                ],
+            }
+            for section in selection.sections
+        ],
+    }
+
+
+def _launch_agent_kind(payload: WindowCreateIn) -> str:
+    if payload.agent_launch is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="agent launch is required")
+    return _require_local_agent_capability(payload.agent_launch.agent, "launch")
+
+
 def _agent_command_for_launch(payload: WindowCreateIn) -> str | None:
     launch = payload.agent_launch
     if launch is None:
@@ -606,19 +1011,251 @@ def _agent_for_launch(payload: WindowCreateIn) -> str | None:
     launch = payload.agent_launch
     if launch is None:
         return None
-    return _AGENT_PROVIDER_BY_KIND[launch.agent]
+    try:
+        return get_agent_plugin_registry().by_agent_id(launch.agent).provider_id
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+def _known_agent_for_launch(payload: WindowCreateIn) -> str | None:
+    try:
+        return _agent_for_launch(payload)
+    except HTTPException:
+        return None
 
 
 def _agent_config_for_launch(payload: WindowCreateIn) -> AgentConfigSelectionIn | None:
     launch = payload.agent_launch
     if launch is None or launch.config is None:
         return None
-    if launch.config.agent != launch.agent:
+    launch_agent = _launch_agent_kind(payload)
+    config_agent = agent_config_service.normalize_agent_kind(launch.config.agent)
+    if config_agent != launch_agent:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="agent launch config agent must match launch agent",
         )
     return launch.config
+
+
+def _remote_agent_for_launch(payload: WindowCreateIn) -> str:
+    launch = payload.agent_launch
+    if launch is None or not launch.agent.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="agent launch is required")
+    return launch.agent.strip()
+
+
+def _remote_agent_config_for_launch(payload: WindowCreateIn) -> AgentConfigSelectionIn | None:
+    launch = payload.agent_launch
+    if launch is None or launch.config is None:
+        return None
+    if launch.config.agent.strip().lower() != launch.agent.strip().lower():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="agent launch config agent must match launch agent",
+        )
+    if launch.config.agent.strip() != launch.agent.strip():
+        launch.config.agent = launch.agent.strip()
+    return launch.config
+
+
+def _remote_agent_descriptors(payload: dict[str, object]) -> list[dict[str, object]]:
+    agents = payload.get("agent_clients")
+    if not isinstance(agents, list):
+        return []
+    return [descriptor for descriptor in agents if isinstance(descriptor, dict)]
+
+
+def _remote_descriptor_agent_id(descriptor: dict[str, object]) -> str | None:
+    agent_id = descriptor.get("id")
+    if isinstance(agent_id, str) and agent_id.strip():
+        return agent_id.strip()
+    return None
+
+
+def _remote_descriptor_alias_candidates(descriptor: dict[str, object]) -> list[str]:
+    candidates: list[str] = []
+    for key in ("id", "provider_id", "default_command"):
+        value = descriptor.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+    for key in ("aliases", "command_names"):
+        values = descriptor.get(key)
+        if isinstance(values, list):
+            candidates.extend(value.strip() for value in values if isinstance(value, str) and value.strip())
+    return candidates
+
+
+def _remote_descriptor_for_agent(payload: dict[str, object], agent: str) -> dict[str, object] | None:
+    clean_agent = agent.strip().lower()
+    if not clean_agent:
+        return None
+    for descriptor in _remote_agent_descriptors(payload):
+        for candidate in _remote_descriptor_alias_candidates(descriptor):
+            if candidate.lower() == clean_agent:
+                return descriptor
+    return None
+
+
+def _remote_descriptor_supports_capability(
+    descriptor: dict[str, object],
+    capability: AgentClientCapability,
+) -> bool:
+    capabilities = descriptor.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return _REMOTE_CAPABILITY_DEFAULTS[capability]
+    value = capabilities.get(capability)
+    if isinstance(value, bool):
+        return value
+    return _REMOTE_CAPABILITY_DEFAULTS[capability]
+
+
+def _remote_agent_id_with_capability(
+    descriptors: dict[str, object],
+    agent: str,
+    capability: AgentClientCapability,
+) -> str:
+    clean_agent = agent.strip()
+    if not clean_agent:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="agent is required")
+    local_provider_id: str | None = None
+    with contextlib.suppress(HTTPException):
+        local_provider_id = _require_supported_provider(_canonical_provider(clean_agent))
+    descriptor = _remote_descriptor_for_agent(descriptors, clean_agent)
+    if descriptor is None and local_provider_id is not None:
+        descriptor = _remote_descriptor_for_agent(descriptors, local_provider_id)
+    if descriptor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent config unavailable for this terminal",
+        )
+    if not _remote_descriptor_supports_capability(descriptor, capability):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"agent client does not support {capability}",
+        )
+    if local_provider_id is not None and _remote_descriptor_for_agent(descriptors, local_provider_id) is descriptor:
+        return local_provider_id
+    agent_id = _remote_descriptor_agent_id(descriptor)
+    if agent_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent config unavailable for this terminal",
+        )
+    return agent_id
+
+
+async def _require_remote_agent_capability(
+    remote_runtime: RemoteRuntime,
+    agent: str,
+    capability: AgentClientCapability,
+) -> str:
+    return _remote_agent_id_with_capability(
+        await remote_runtime.list_agent_clients(),
+        agent,
+        capability,
+    )
+
+
+async def _require_remote_launch_capabilities(
+    payload: WindowCreateIn,
+    remote_runtime: RemoteRuntime,
+) -> None:
+    launch = payload.agent_launch
+    if launch is None:
+        return
+    descriptors = await remote_runtime.list_agent_clients()
+    _remote_agent_id_with_capability(descriptors, launch.agent, "launch")
+    if launch.config is not None:
+        _remote_agent_id_with_capability(descriptors, launch.config.agent, "client_config")
+    if _agent_profile_for_launch(payload) is not None:
+        _remote_agent_id_with_capability(descriptors, launch.agent, "profile_config")
+
+
+async def _remote_agent_request_id_for_capability(
+    remote_runtime: RemoteRuntime,
+    agent: str,
+    capability: AgentClientCapability,
+) -> str:
+    return await _require_remote_agent_capability(remote_runtime, agent, capability)
+
+
+async def _remote_agent_for_window(
+    session: AsyncSession,
+    window: VirtualWindow,
+    remote_runtime: RemoteRuntime,
+) -> str:
+    provider = await _agent_provider_for_window(session, window)
+    if provider is not None:
+        with contextlib.suppress(HTTPException):
+            return await _require_remote_agent_capability(remote_runtime, provider, "window_config")
+
+    descriptors = await remote_runtime.list_agent_clients()
+    remote_agent = _remote_agent_from_command(await _agent_command_for_window(session, window), descriptors)
+    if remote_agent is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent config unavailable for this terminal",
+        )
+    return _remote_agent_id_with_capability(descriptors, remote_agent, "window_config")
+
+
+def _remote_agent_from_command(command: str | None, payload: dict[str, object]) -> str | None:
+    if not command:
+        return None
+    command_agents = _remote_command_agent_map(payload)
+    for segment in _COMMAND_SEGMENT_PATTERN.split(command):
+        tokens = _command_tokens(segment)
+        while tokens:
+            token = tokens.pop(0)
+            if _ENV_ASSIGNMENT_PATTERN.match(token) or token in _COMMAND_WRAPPERS:
+                continue
+            agent = command_agents.get(posixpath.basename(token).lower())
+            if agent is not None:
+                return agent
+            break
+    return None
+
+
+def _remote_command_agent_map(payload: dict[str, object]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for descriptor in _remote_agent_descriptors(payload):
+        agent_id = _remote_descriptor_agent_id(descriptor)
+        if agent_id is None:
+            continue
+        for candidate in _remote_descriptor_command_candidates(descriptor):
+            result[posixpath.basename(candidate).lower()] = agent_id
+    return result
+
+
+def _remote_descriptor_command_candidates(descriptor: dict[str, object]) -> list[str]:
+    candidates: list[str] = []
+    for key in ("id", "provider_id", "default_command"):
+        value = descriptor.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+    for key in ("aliases", "command_names"):
+        values = descriptor.get(key)
+        if isinstance(values, list):
+            candidates.extend(value.strip() for value in values if isinstance(value, str) and value.strip())
+    return candidates
+
+
+def _command_tokens(segment: str) -> list[str]:
+    try:
+        return shlex.split(segment.strip())
+    except ValueError:
+        return segment.strip().split()
+
+
+def _agent_profile_for_launch(payload: WindowCreateIn) -> str | None:
+    launch = payload.agent_launch
+    if launch is None:
+        return None
+    profile_id = launch.profile_id
+    if profile_id is None or not profile_id.strip():
+        return None
+    return profile_id.strip()
 
 
 async def _assign_window_folder_path(
@@ -665,7 +1302,11 @@ async def _create_remote_virtual_window_for_client(
 ) -> WindowOut:
     client_id = client.id
     effective_shell = _agent_command_for_launch(payload)
-    agent_config_selection = _agent_config_for_launch(payload)
+    agent_config_selection = None
+    schema_selection = _remote_agent_config_for_launch(payload)
+    if schema_selection is not None:
+        agent_config_selection = _agent_selection_from_schema(schema_selection)
+    agent_profile_id = _agent_profile_for_launch(payload)
     connection = registry.get(client_id)
     if connection is None or getattr(connection, "closed", False):
         logger.warning(
@@ -679,6 +1320,16 @@ async def _create_remote_virtual_window_for_client(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="remote runtime unavailable",
         )
+    remote_runtime = RemoteRuntime(client_id=client_id, registry=registry)
+    try:
+        await _require_remote_launch_capabilities(payload, remote_runtime)
+    except RemoteClientUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="remote runtime unavailable",
+        ) from exc
+    except RemoteTerminalError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
     try:
         window = await create_window(
@@ -704,8 +1355,10 @@ async def _create_remote_virtual_window_for_client(
         cwd=payload.cwd,
         shell_command=effective_shell,
         agent_config_selection=(
-            agent_config_selection.model_dump(mode="json") if agent_config_selection else None
+            _agent_selection_payload(agent_config_selection) if agent_config_selection else None
         ),
+        agent_profile_id=agent_profile_id,
+        agent_profile_agent=_remote_agent_for_launch(payload) if agent_profile_id is not None else None,
         registry=registry,
         session_factory=session_factory,
         ui_event_hub=ui_event_hub,
@@ -714,7 +1367,7 @@ async def _create_remote_virtual_window_for_client(
         window,
         runtime_tags=runtime_tags_for_window(
             window,
-            terminal_agent=_agent_for_launch(payload) or agent_from_command(window.shell_command),
+            terminal_agent=_known_agent_for_launch(payload) or agent_from_command(window.shell_command),
         ),
     )
 
@@ -750,7 +1403,14 @@ async def _create_virtual_window_for_client(
     effective_shell = _agent_command_for_launch(payload) or get_settings().default_shell
     try:
         agent_config_selection = _agent_config_for_launch(payload)
-        if agent_config_selection is not None:
+        agent_profile_id = _agent_profile_for_launch(payload)
+        if agent_profile_id is not None:
+            agent_profile_service.materialize_agent_profile_for_window(
+                agent_profile_id,
+                _launch_agent_kind(payload),
+                window_id=str(window_id),
+            )
+        elif agent_config_selection is not None:
             agent_config_service.apply_agent_config_selection(
                 _agent_selection_from_schema(agent_config_selection),
                 window_id=str(window_id),
@@ -814,6 +1474,8 @@ def _schedule_remote_window_runtime_start(
     cwd: str | None,
     shell_command: str | None,
     agent_config_selection: dict[str, object] | None,
+    agent_profile_id: str | None,
+    agent_profile_agent: str | None,
     registry: ClientConnectionRegistry,
     session_factory: Callable[[], object],
     ui_event_hub,
@@ -825,6 +1487,8 @@ def _schedule_remote_window_runtime_start(
             cwd=cwd,
             shell_command=shell_command,
             agent_config_selection=agent_config_selection,
+            agent_profile_id=agent_profile_id,
+            agent_profile_agent=agent_profile_agent,
             registry=registry,
             session_factory=session_factory,
             ui_event_hub=ui_event_hub,
@@ -851,6 +1515,8 @@ async def _start_remote_window_runtime(
     cwd: str | None,
     shell_command: str | None,
     agent_config_selection: dict[str, object] | None,
+    agent_profile_id: str | None,
+    agent_profile_agent: str | None,
     registry: ClientConnectionRegistry,
     session_factory: Callable[[], object],
     ui_event_hub,
@@ -866,6 +1532,8 @@ async def _start_remote_window_runtime(
             shell_command=shell_command,
             window_id=window_id,
             agent_config_selection=agent_config_selection,
+            agent_profile_id=agent_profile_id,
+            agent_profile_agent=agent_profile_agent,
         )
     except RemoteClientUnavailable as exc:
         logger.warning(
@@ -1178,38 +1846,52 @@ async def read_window_agent_record_chat(
     messages_limit: AgentRecordLimit = 30,
     messages_offset: AgentRecordOffset = 0,
     role: AgentChatRole = "all",
+    session_id: UUID | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> AgentChatRecordOut:
     await _require_window_for_agent_record(session, client_id, window_id)
-    event_filters = (
-        Event.client_id == client_id,
-        Event.virtual_window_id == window_id,
-        or_(
-            Event.kind.in_(("user_message", "assistant_message")),
-            Event.kind.in_(("response_item", "event_msg")),
-        ),
-    )
-    candidate_events = list(
+    ai_sessions = list(
         await session.scalars(
-            select(Event)
-            .options(selectinload(Event.ai_session))
-            .where(*event_filters)
-            .order_by(
-                Event.created_at,
-                case((Event.source_type == EventSourceType.terminal, 1), else_=0),
-                Event.id,
-            )
+            select(AiSession)
+            .where(AiSession.client_id == client_id, AiSession.virtual_window_id == window_id)
+            .order_by(AiSession.created_at, AiSession.id)
         )
     )
-    messages = _dedupe_chat_messages(candidate_events, role)
-    paged_messages = messages[messages_offset : messages_offset + messages_limit]
-    return AgentChatRecordOut(
-        window_id=window_id,
-        messages=paged_messages,
-        messages_total=len(messages),
+    base_event_filters = [
+        Event.client_id == client_id,
+        Event.virtual_window_id == window_id,
+    ]
+    event_filters = [
+        *base_event_filters,
+        or_(
+            Event.kind.in_(("user_message", "assistant_message")),
+            and_(
+                Event.kind == "system_message",
+                Event.source_type == EventSourceType.agent_tool_record,
+            ),
+            Event.kind.in_(("response_item", "event_msg")),
+        ),
+    ]
+    if session_id is not None:
+        base_event_filters.append(Event.ai_session_id == session_id)
+        event_filters.append(Event.ai_session_id == session_id)
+    page = await _load_chat_message_page(
+        session,
+        event_filters=event_filters,
+        target_event_filters=base_event_filters,
+        role=role,
+        sessions_by_source_id={ai_session.source_id: ai_session for ai_session in ai_sessions},
         messages_limit=messages_limit,
         messages_offset=messages_offset,
-        messages_has_more=messages_offset + len(paged_messages) < len(messages),
+    )
+    return AgentChatRecordOut(
+        window_id=window_id,
+        messages=page.messages,
+        messages_total=page.total,
+        messages_total_exact=page.total_exact,
+        messages_limit=messages_limit,
+        messages_offset=messages_offset,
+        messages_has_more=page.has_more,
     )
 
 
@@ -1317,6 +1999,7 @@ async def read_window_agent_record_detail(
     window_id: UUID,
     events_limit: AgentRecordLimit = 100,
     events_offset: AgentRecordOffset = 0,
+    session_id: UUID | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> AgentRecordOut:
     await _require_window_for_agent_record(session, client_id, window_id)
@@ -1328,11 +2011,13 @@ async def read_window_agent_record_detail(
             .order_by(AiSession.created_at, AiSession.id)
         )
     )
-    event_filters = (
+    event_filters = [
         Event.client_id == client_id,
         Event.virtual_window_id == window_id,
         Event.kind != "terminal_output",
-    )
+    ]
+    if session_id is not None:
+        event_filters.append(Event.ai_session_id == session_id)
     events_total = await session.scalar(select(func.count()).select_from(Event).where(*event_filters))
     events = list(
         await session.scalars(
@@ -1349,11 +2034,51 @@ async def read_window_agent_record_detail(
         )
     )
     events = _dedupe_detail_events(events)
+    if events and session_id is None:
+        event_ids = {event.id for event in events}
+        sessions_by_source_id = {ai_session.source_id: ai_session for ai_session in ai_sessions}
+        target_session_ids = {
+            target_session.id
+            for event in events
+            if (projection := _project_chat(event)) is not None
+            and projection.agent_message_type == "subagent_call"
+            and projection.target_session_source_id is not None
+            and (target_session := sessions_by_source_id.get(projection.target_session_source_id)) is not None
+        }
+        if target_session_ids:
+            related_events = list(
+                await session.scalars(
+                    select(Event)
+                    .options(selectinload(Event.ai_session))
+                    .where(
+                        Event.client_id == client_id,
+                        Event.virtual_window_id == window_id,
+                        Event.ai_session_id.in_(target_session_ids),
+                        Event.kind != "terminal_output",
+                    )
+                    .order_by(
+                        Event.created_at,
+                        case((Event.source_type == EventSourceType.terminal, 1), else_=0),
+                        Event.id,
+                    )
+                    .limit(AGENT_RECORD_DETAIL_RELATED_EVENT_LIMIT)
+                )
+            )
+            for event in related_events:
+                if event.id in event_ids:
+                    continue
+                events.append(event)
+                event_ids.add(event.id)
     raw_events_total = events_total or 0
+    sessions_by_source_id = {ai_session.source_id: ai_session for ai_session in ai_sessions}
+    subagent_targets_by_tool_use_id = _subagent_targets_by_tool_use_id(events)
     return AgentRecordOut(
         window_id=window_id,
         sessions=[to_agent_session_out(ai_session) for ai_session in ai_sessions],
-        events=[to_agent_event_out(event) for event in events],
+        events=[
+            to_agent_event_out(event, sessions_by_source_id, subagent_targets_by_tool_use_id)
+            for event in events
+        ],
         events_total=raw_events_total,
         events_limit=events_limit,
         events_offset=events_offset,
@@ -1367,9 +2092,10 @@ async def read_window_agent_record(
     window_id: UUID,
     events_limit: AgentRecordLimit = 100,
     events_offset: AgentRecordOffset = 0,
+    session_id: UUID | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> AgentRecordOut:
-    return await read_window_agent_record_detail(client_id, window_id, events_limit, events_offset, session)
+    return await read_window_agent_record_detail(client_id, window_id, events_limit, events_offset, session_id, session)
 
 
 @router.get("/clients/{client_id}/windows/{window_id}/agent-config", response_model=AgentConfigOut)
@@ -1383,13 +2109,17 @@ async def read_window_agent_config(
     window = await get_window_for_client(session, client_id, window_id)
     if window is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="window not found")
-    agent = _require_supported_agent(await _agent_provider_for_window(session, window))
     if client.runtime is ClientRuntime.local:
-        return _agent_config_out(agent_config_service.list_agent_config(agent))
+        provider = await _agent_provider_for_window(session, window)
+        local_agent = _require_supported_agent_capability(provider, "window_config")
+        return _agent_config_out(
+            agent_config_service.list_window_agent_config(local_agent, window_id=str(window_id))
+        )
 
     remote_runtime = RemoteRuntime(client_id=client_id, registry=_client_connection_registry(request))
     try:
-        payload = await remote_runtime.get_agent_config(window_id=window_id, agent=agent)
+        remote_agent = await _remote_agent_for_window(session, window, remote_runtime)
+        payload = await remote_runtime.get_agent_config(window_id=window_id, agent=remote_agent)
     except RemoteClientUnavailable as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1408,13 +2138,15 @@ async def read_client_agent_config(
     session: AsyncSession = Depends(get_session),
 ) -> AgentConfigOut:
     client = await _require_client(session, client_id)
-    supported_agent = _require_supported_agent(_canonical_provider(agent))
     if client.runtime is ClientRuntime.local:
+        supported_agent = _require_supported_agent_capability(_canonical_provider(agent), "client_config")
         return _agent_config_out(agent_config_service.list_agent_config(supported_agent))
 
     remote_runtime = RemoteRuntime(client_id=client_id, registry=_client_connection_registry(request))
     try:
-        payload = await remote_runtime.get_agent_config(agent=supported_agent)
+        payload = await remote_runtime.get_agent_config(
+            agent=await _remote_agent_request_id_for_capability(remote_runtime, agent, "client_config")
+        )
     except RemoteClientUnavailable as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1442,15 +2174,17 @@ async def update_window_agent_config_item(
     window = await get_window_for_client(session, client_id, window_id)
     if window is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="window not found")
-    agent = _require_supported_agent(await _agent_provider_for_window(session, window))
     if client.runtime is ClientRuntime.local:
+        provider = await _agent_provider_for_window(session, window)
+        local_agent = _require_supported_agent_capability(provider, "window_config")
         try:
             return _agent_config_out(
-                agent_config_service.set_agent_config_item_enabled(
-                    agent,
+                agent_config_service.set_window_agent_config_item_enabled(
+                    local_agent,
                     section_id,
                     item_id,
                     payload.enabled,
+                    window_id=str(window_id),
                 )
             )
         except ValueError as exc:
@@ -1458,9 +2192,10 @@ async def update_window_agent_config_item(
 
     remote_runtime = RemoteRuntime(client_id=client_id, registry=_client_connection_registry(request))
     try:
+        remote_agent = await _remote_agent_for_window(session, window, remote_runtime)
         response_payload = await remote_runtime.set_agent_config_enabled(
             window_id=window_id,
-            agent=agent,
+            agent=remote_agent,
             section_id=section_id,
             item_id=item_id,
             enabled=payload.enabled,
@@ -1625,6 +2360,14 @@ async def delete_virtual_window(
         tmux_manager,
         _client_connection_registry(request),
     )
+    if client.runtime is ClientRuntime.local:
+        await aux_terminal_registry_from_state(request.app.state).remove(client_id, window_id)
+    else:
+        await kill_remote_aux_terminal(
+            client_id=client_id,
+            parent_window_id=window_id,
+            registry=_client_connection_registry(request),
+        )
     await ui_event_hub_from_state(request.app.state).publish_invalidation(
         ["tree", "window", "search"],
         client_id=client_id,

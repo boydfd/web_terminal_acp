@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from time import monotonic
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from sqlalchemy.orm import load_only
 
 from app.models import VirtualWindow
 from app.repositories.git_worktree import list_window_git_bindings, pending_commit_window_ids
+from app.repositories.folders import window_project_path_expression, window_visible_at_expression
 from app.schemas import ClientWindowsActivityOut, GitWorktreeActivityOut, WindowActivityOut
 from app.services import cache_backend
 from app.services.terminal_work_status import (
@@ -43,14 +45,22 @@ async def load_client_windows_activity(
     client_id: UUID,
     *,
     include_runtime_tags: bool = False,
+    visible_since: datetime | None = None,
+    project_path: str | None = None,
 ) -> ClientWindowsActivityOut:
+    filters = [
+        VirtualWindow.client_id == client_id,
+        VirtualWindow.folder_id.is_not(None),
+    ]
+    if visible_since is not None:
+        filters.append(window_visible_at_expression() >= visible_since)
+    if project_path is not None:
+        filters.append(window_project_path_expression() == project_path)
+
     window_ids = list(
         await session.scalars(
             select(VirtualWindow.id)
-            .where(
-                VirtualWindow.client_id == client_id,
-                VirtualWindow.folder_id.is_not(None),
-            )
+            .where(*filters)
             .order_by(VirtualWindow.id)
         )
     )

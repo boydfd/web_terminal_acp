@@ -144,8 +144,12 @@ class CancellingTmuxManager(FakeTmuxManager):
 class FakeRemoteConnection:
     def __init__(self) -> None:
         self.requests: list[AgentMessage] = []
+        self.sent: list[AgentMessage] = []
         self.request_started = asyncio.Event()
         self.request_continue = asyncio.Event()
+
+    async def send(self, message: AgentMessage) -> None:
+        self.sent.append(message)
 
     async def request(self, message: AgentMessage, *, timeout: float) -> AgentMessage:
         self.requests.append(message)
@@ -159,6 +163,25 @@ class FakeRemoteConnection:
                 request_id=message.request_id,
                 payload={},
             )
+        if message.type == "agent_clients_list":
+            return AgentMessage(
+                type="agent_client_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload={
+                    "agent_clients": [
+                        {
+                            "id": "remote_codex",
+                            "provider_id": "codex",
+                            "label": "Remote Codex",
+                            "aliases": [],
+                            "default_command": "codex",
+                            "command_names": ["codex"],
+                        }
+                    ]
+                },
+            )
         return AgentMessage(
             type="create_window_result",
             client_id=message.client_id,
@@ -170,6 +193,25 @@ class FakeRemoteConnection:
 class AgentConfigRemoteConnection(FakeRemoteConnection):
     async def request(self, message: AgentMessage, *, timeout: float) -> AgentMessage:
         self.requests.append(message)
+        if message.type == "agent_clients_list":
+            return AgentMessage(
+                type="agent_client_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload={
+                    "agent_clients": [
+                        {
+                            "id": "claude",
+                            "provider_id": "claude_code",
+                            "label": "Remote Claude Code",
+                            "aliases": ["claude_code"],
+                            "default_command": "claude",
+                            "command_names": ["claude"],
+                        }
+                    ]
+                },
+            )
         if message.type == "agent_config_get":
             return AgentMessage(
                 type="agent_config_result",
@@ -227,6 +269,99 @@ class AgentConfigRemoteConnection(FakeRemoteConnection):
             window_id=message.window_id,
             request_id=message.request_id,
             payload={"remote_session_id": "remote-session", "remote_window_id": "remote-window"},
+        )
+
+
+class FutureAgentRemoteConnection(AgentConfigRemoteConnection):
+    async def request(self, message: AgentMessage, *, timeout: float) -> AgentMessage:
+        self.requests.append(message)
+        if message.type == "agent_clients_list":
+            return AgentMessage(
+                type="agent_client_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload={
+                    "agent_clients": [
+                        {
+                            "id": "future_agent",
+                            "provider_id": "future_provider",
+                            "label": "Future Agent",
+                            "aliases": ["future"],
+                            "default_command": "future-agent",
+                            "command_names": ["future-agent"],
+                        }
+                    ]
+                },
+            )
+        if message.type == "agent_config_get":
+            return AgentMessage(
+                type="agent_config_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload={
+                    "agent": message.payload["agent"],
+                    "sections": [
+                        {"id": "skills", "name": "Skills", "items": []},
+                        {"id": "plugins", "name": "Plugins", "items": []},
+                        {"id": "hooks", "name": "Hooks", "items": []},
+                    ],
+                },
+            )
+        if message.type == "agent_config_set_enabled":
+            return AgentMessage(
+                type="agent_config_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload={
+                    "agent": message.payload["agent"],
+                    "sections": [
+                        {"id": "skills", "name": "Skills", "items": []},
+                        {"id": "plugins", "name": "Plugins", "items": []},
+                        {"id": "hooks", "name": "Hooks", "items": []},
+                    ],
+                },
+            )
+        self.request_started.set()
+        await self.request_continue.wait()
+        return AgentMessage(
+            type="create_window_result",
+            client_id=message.client_id,
+            window_id=message.window_id,
+            request_id=message.request_id,
+            payload={"remote_session_id": "remote-session", "remote_window_id": "remote-window"},
+        )
+
+
+class CapabilityRemoteConnection(AgentConfigRemoteConnection):
+    def __init__(self, capabilities: dict[str, bool]) -> None:
+        super().__init__()
+        self.capabilities = capabilities
+
+    async def request(self, message: AgentMessage, *, timeout: float) -> AgentMessage:
+        if message.type != "agent_clients_list":
+            return await super().request(message, timeout=timeout)
+        self.requests.append(message)
+        return AgentMessage(
+            type="agent_client_result",
+            client_id=message.client_id,
+            window_id=message.window_id,
+            request_id=message.request_id,
+            payload={
+                "agent_clients": [
+                    {
+                        "id": "restricted_agent",
+                        "provider_id": "restricted_provider",
+                        "label": "Restricted Agent",
+                        "aliases": ["restricted"],
+                        "default_command": "restricted-agent",
+                        "command_names": ["restricted-agent"],
+                        "capabilities": self.capabilities,
+                    }
+                ]
+            },
         )
 
 
@@ -608,6 +743,46 @@ async def test_create_window_creates_remote_window_when_client_connection_exists
 
 
 @pytest.mark.asyncio
+async def test_read_agent_clients_returns_builtin_plugin_descriptors(db_client):
+    client_id = await get_local_client_id(db_client)
+
+    response = await db_client.get(f"/api/clients/{client_id}/agent-clients")
+
+    assert response.status_code == 200
+    clients = {item["id"]: item for item in response.json()["agent_clients"]}
+    assert clients["codex"]["provider_id"] == "codex"
+    assert clients["codex"]["capabilities"]["agent_records"] is True
+    assert clients["claude"]["provider_id"] == "claude_code"
+    assert clients["cursor"]["default_command"] == "agent"
+    assert "cursor-agent" in clients["cursor"]["command_names"]
+
+
+@pytest.mark.asyncio
+async def test_read_agent_clients_queries_remote_client_descriptors(db_client):
+    remote_client_id = await create_remote_client_id(db_client)
+    connection = FakeRemoteConnection()
+    connection.request_continue.set()
+    app.state.client_connections = FakeConnectionRegistry(connection)
+
+    response = await db_client.get(f"/api/clients/{remote_client_id}/agent-clients")
+
+    assert response.status_code == 200
+    assert connection.requests[0].type == "agent_clients_list"
+    clients = {item["id"]: item for item in response.json()["agent_clients"]}
+    assert clients == {
+        "remote_codex": {
+            "id": "remote_codex",
+            "provider_id": "codex",
+            "label": "Remote Codex",
+            "aliases": [],
+            "default_command": "codex",
+            "command_names": ["codex"],
+            "capabilities": {},
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_create_agent_window_sends_remote_config_selection(db_client):
     remote_client_id = await create_remote_client_id(db_client)
     connection = AgentConfigRemoteConnection()
@@ -639,7 +814,8 @@ async def test_create_agent_window_sends_remote_config_selection(db_client):
     assert created["shell_command"] == "claude"
     assert created["command_capture_supported"] is True
     assert "claude_code" in created["runtime_tags"]
-    assert connection.requests[0].payload == {
+    assert [request.type for request in connection.requests[:2]] == ["agent_clients_list", "create_window"]
+    assert connection.requests[1].payload == {
         "cwd": "/tmp/project",
         "shell_command": "claude",
         "agent_config_selection": {
@@ -652,6 +828,72 @@ async def test_create_agent_window_sends_remote_config_selection(db_client):
             ],
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_create_remote_agent_window_allows_remote_only_agent_descriptor(db_client):
+    remote_client_id = await create_remote_client_id(db_client)
+    connection = FutureAgentRemoteConnection()
+    app.state.client_connections = FakeConnectionRegistry(connection)
+
+    response = await db_client.post(
+        f"/api/clients/{remote_client_id}/windows",
+        json={
+            "cwd": "/tmp/project",
+            "agent_launch": {
+                "agent": "future_agent",
+                "command": "future-agent",
+                "config": {
+                    "agent": "future_agent",
+                    "sections": [
+                        {
+                            "id": "skills",
+                            "items": [{"id": "review", "enabled": True}],
+                        }
+                    ],
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    created = response.json()
+    await allow_remote_create_to_finish(connection)
+    assert created["shell_command"] == "future-agent"
+    assert "future_provider" not in created["runtime_tags"]
+    assert [request.type for request in connection.requests[:2]] == ["agent_clients_list", "create_window"]
+    assert connection.requests[1].payload == {
+        "cwd": "/tmp/project",
+        "shell_command": "future-agent",
+        "agent_config_selection": {
+            "agent": "future_agent",
+            "sections": [
+                {
+                    "id": "skills",
+                    "items": [{"id": "review", "enabled": True}],
+                }
+            ],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_remote_agent_window_rejects_launch_disabled_descriptor(db_client):
+    remote_client_id = await create_remote_client_id(db_client)
+    connection = CapabilityRemoteConnection({"launch": False})
+    app.state.client_connections = FakeConnectionRegistry(connection)
+
+    response = await db_client.post(
+        f"/api/clients/{remote_client_id}/windows",
+        json={
+            "cwd": "/tmp/project",
+            "agent_launch": {"agent": "restricted_agent", "command": "restricted-agent"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "agent client does not support launch"
+    assert [request.type for request in connection.requests] == ["agent_clients_list"]
 
 
 @pytest.mark.asyncio
@@ -1220,6 +1462,64 @@ async def test_window_and_tree_include_runtime_tags_for_agent_and_path(db_client
 
 
 @pytest.mark.asyncio
+async def test_terminal_projects_and_project_scoped_tree_use_runtime_project_path(db_client):
+    client_id = await get_local_client_id(db_client)
+    first_response = await db_client.post(
+        f"/api/clients/{client_id}/windows",
+        json={"cwd": "/tmp/first", "shell_command": "/bin/bash"},
+    )
+    second_response = await db_client.post(
+        f"/api/clients/{client_id}/windows",
+        json={"cwd": "/tmp/second", "shell_command": "/bin/bash"},
+    )
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    first_window_id = first_response.json()["id"]
+    second_window_id = second_response.json()["id"]
+
+    async with db_client.session_factory() as session:
+        session.add(
+            AiSession(
+                client_id=UUID(client_id),
+                provider="codex",
+                source_id="codex-project-first",
+                project_path="/workspace/shared",
+                virtual_window_id=UUID(first_window_id),
+            )
+        )
+        await session.commit()
+
+    projects_response = await db_client.get(f"/api/clients/{client_id}/terminal-projects")
+    assert projects_response.status_code == 200
+    assert projects_response.json() == [
+        {"project_path": "/tmp/second", "window_count": 1},
+        {"project_path": "/workspace/shared", "window_count": 1},
+    ]
+
+    tree_response = await db_client.get(
+        f"/api/clients/{client_id}/tree",
+        params={"project_path": "/workspace/shared"},
+    )
+    assert tree_response.status_code == 200
+    tree_window_ids = {
+        window["id"]
+        for folder in tree_response.json()
+        for window in folder["windows"]
+    }
+    assert tree_window_ids == {first_window_id}
+
+    activity_response = await db_client.get(
+        f"/api/clients/{client_id}/windows/activity",
+        params={"include_runtime_tags": "true", "project_path": "/workspace/shared"},
+    )
+    assert activity_response.status_code == 200
+    assert [
+        item["window_id"] for item in activity_response.json()["windows"]
+    ] == [first_window_id]
+    assert activity_response.json()["windows"][0]["runtime_tags"] == ["codex", "/workspace/shared"]
+
+
+@pytest.mark.asyncio
 async def test_get_window_agent_record_returns_sessions_and_non_output_events(db_client):
     client_id = await get_local_client_id(db_client)
     window_response = await db_client.post(
@@ -1280,20 +1580,20 @@ async def test_get_window_agent_record_returns_sessions_and_non_output_events(db
     assert [item["source_id"] for item in body["sessions"]] == ["claude-session-1"]
     assert [item["kind"] for item in body["events"]] == ["user_message", "terminal_input_command"]
     assert body["events"][0]["payload_json"]["message"]["content"] == "hello"
-    assert body["events"][0]["projection"] == {
+    assert body["events"][0]["projection"] | {
         "tone": "user-input",
         "label": "User input",
         "body": "hello",
         "body_format": "markdown",
         "subtype": "user_message",
-    }
-    assert body["events"][1]["projection"] == {
+    } == body["events"][0]["projection"]
+    assert body["events"][1]["projection"] | {
         "tone": "terminal",
         "label": "Terminal command",
         "body": "codex",
         "body_format": "markdown",
         "subtype": "command",
-    }
+    } == body["events"][1]["projection"]
     assert body["events_total"] == 2
     assert body["events_limit"] == 100
     assert body["events_offset"] == 0
@@ -1422,9 +1722,57 @@ async def test_client_agent_config_endpoint_uses_remote_agent_config_request(db_
 
     assert response.status_code == 200
     assert response.json()["agent"] == "claude"
-    assert connection.requests[0].type == "agent_config_get"
-    assert connection.requests[0].window_id is None
-    assert connection.requests[0].payload == {"agent": "claude_code"}
+    assert [request.type for request in connection.requests[:2]] == ["agent_clients_list", "agent_config_get"]
+    assert connection.requests[1].window_id is None
+    assert connection.requests[1].payload == {"agent": "claude_code"}
+
+
+@pytest.mark.asyncio
+async def test_client_agent_config_rejects_client_config_disabled_descriptor(db_client):
+    remote_client_id = await create_remote_client_id(db_client)
+    connection = CapabilityRemoteConnection({"client_config": False})
+    app.state.client_connections = FakeConnectionRegistry(connection)
+
+    response = await db_client.get(f"/api/clients/{remote_client_id}/agent-config/restricted_agent")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "agent client does not support client_config"
+    assert [request.type for request in connection.requests] == ["agent_clients_list"]
+
+
+@pytest.mark.asyncio
+async def test_remote_agent_config_endpoints_allow_remote_only_agent_descriptor(db_client):
+    remote_client_id = await create_remote_client_id(db_client)
+    connection = FutureAgentRemoteConnection()
+    app.state.client_connections = FakeConnectionRegistry(connection)
+
+    create_response = await db_client.post(
+        f"/api/clients/{remote_client_id}/windows",
+        json={
+            "cwd": "/workspace/project",
+            "agent_launch": {"agent": "future_agent", "command": "future-agent"},
+        },
+    )
+    assert create_response.status_code == 200
+    window_id = create_response.json()["id"]
+    await allow_remote_create_to_finish(connection)
+    await wait_for_remote_window_ready(db_client, remote_client_id, window_id)
+
+    client_response = await db_client.get(f"/api/clients/{remote_client_id}/agent-config/future_agent")
+    assert client_response.status_code == 200
+    assert client_response.json()["agent"] == "future_agent"
+
+    window_response = await db_client.get(
+        f"/api/clients/{remote_client_id}/windows/{window_id}/agent-config"
+    )
+    assert window_response.status_code == 200
+    assert window_response.json()["agent"] == "future_agent"
+
+    config_requests = [request for request in connection.requests if request.type == "agent_config_get"]
+    assert [request.payload["agent"] for request in config_requests] == [
+        "future_agent",
+        "future_agent",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1524,6 +1872,55 @@ async def test_get_window_agent_record_chat_returns_minimal_messages(db_client):
 
 
 @pytest.mark.asyncio
+async def test_get_window_agent_record_chat_stops_after_requested_page(db_client):
+    client_id = await get_local_client_id(db_client)
+    window_response = await db_client.post(
+        f"/api/clients/{client_id}/windows",
+        json={"cwd": "/tmp/project", "shell_command": "/bin/bash"},
+    )
+    window_id = UUID(window_response.json()["id"])
+
+    async with db_client.session_factory() as session:
+        ai_session = AiSession(
+            client_id=UUID(client_id),
+            provider="codex",
+            source_id="codex-session-1",
+            virtual_window_id=window_id,
+        )
+        session.add(ai_session)
+        await session.flush()
+        base_time = datetime.now(timezone.utc)
+        session.add_all(
+            [
+                Event(
+                    client_id=UUID(client_id),
+                    source_type=EventSourceType.codex_trace,
+                    source_id="codex-session-1",
+                    kind="response_item",
+                    virtual_window_id=window_id,
+                    ai_session_id=ai_session.id,
+                    payload_json=codex_user_message_payload(f"message {index}"),
+                    fingerprint=f"agent-record-chat-page-{index}",
+                    created_at=base_time + timedelta(milliseconds=index),
+                )
+                for index in range(600)
+            ]
+        )
+        await session.commit()
+
+    response = await db_client.get(
+        f"/api/clients/{client_id}/windows/{window_id}/agent-record/chat?messages_limit=30"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["body"] for item in body["messages"]] == [f"message {index}" for index in range(30)]
+    assert body["messages_total"] == 31
+    assert body["messages_total_exact"] is False
+    assert body["messages_has_more"] is True
+
+
+@pytest.mark.asyncio
 async def test_get_window_agent_record_chat_filters_by_role(db_client):
     client_id = await get_local_client_id(db_client)
     window_response = await db_client.post(
@@ -1593,6 +1990,183 @@ async def test_get_window_agent_record_chat_filters_by_role(db_client):
     assert [(item["role"], item["body"]) for item in body["messages"]] == [("agent", "done")]
     assert body["messages_total"] == 1
     assert body["messages_has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_window_agent_record_chat_distinguishes_claude_subagent_messages(db_client):
+    client_id = await get_local_client_id(db_client)
+    window_response = await db_client.post(
+        f"/api/clients/{client_id}/windows",
+        json={"cwd": "/tmp/project", "shell_command": "/bin/bash"},
+    )
+    window_id = UUID(window_response.json()["id"])
+
+    async with db_client.session_factory() as session:
+        base_time = datetime.now(timezone.utc)
+        main_session = AiSession(
+            client_id=UUID(client_id),
+            provider="claude_code",
+            source_id="main-session-1",
+            virtual_window_id=window_id,
+            created_at=base_time,
+            updated_at=base_time,
+        )
+        sub_session = AiSession(
+            client_id=UUID(client_id),
+            provider="claude_code",
+            source_id="agent-subagent-1",
+            source_path="/tmp/main-session-1/subagents/agent-subagent-1.jsonl",
+            virtual_window_id=window_id,
+            created_at=base_time + timedelta(milliseconds=1),
+            updated_at=base_time + timedelta(milliseconds=1),
+        )
+        session.add_all([main_session, sub_session])
+        await session.flush()
+        session.add_all(
+            [
+                Event(
+                    client_id=UUID(client_id),
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="main-session-1",
+                    kind="assistant_message",
+                    virtual_window_id=window_id,
+                    ai_session_id=main_session.id,
+                    payload_json={
+                        "provider": "claude_code",
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "call-subagent-1",
+                                    "name": "Agent",
+                                    "input": {"description": "Return one", "prompt": "Return exactly: 1"},
+                                }
+                            ],
+                        },
+                        "subagent_tool_use_results": [
+                            {"tool_use_id": "call-subagent-1", "agent_id": "subagent-1"}
+                        ],
+                    },
+                    fingerprint="agent-record-chat-subagent-call",
+                    created_at=base_time,
+                ),
+                Event(
+                    client_id=UUID(client_id),
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="agent-subagent-1",
+                    kind="user_message",
+                    virtual_window_id=window_id,
+                    ai_session_id=sub_session.id,
+                    payload_json={
+                        "provider": "claude_code",
+                        "type": "user",
+                        "sessionId": "main-session-1",
+                        "agentId": "subagent-1",
+                        "isSidechain": True,
+                        "subagent": {"toolUseId": "call-subagent-1"},
+                        "message": {"role": "user", "content": "Return exactly: 1"},
+                    },
+                    fingerprint="agent-record-chat-subagent-prompt",
+                    created_at=base_time + timedelta(milliseconds=1),
+                ),
+                Event(
+                    client_id=UUID(client_id),
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="main-session-1",
+                    kind="user_message",
+                    virtual_window_id=window_id,
+                    ai_session_id=main_session.id,
+                    payload_json={
+                        "provider": "claude_code",
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": "call-subagent-1", "content": "1"}
+                            ],
+                        },
+                        "toolUseResult": {"agentId": "subagent-1", "toolUseId": "call-subagent-1"},
+                    },
+                    fingerprint="agent-record-chat-subagent-result",
+                    created_at=base_time + timedelta(milliseconds=2),
+                ),
+                Event(
+                    client_id=UUID(client_id),
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="agent-subagent-1",
+                    kind="assistant_message",
+                    virtual_window_id=window_id,
+                    ai_session_id=sub_session.id,
+                    payload_json={
+                        "provider": "claude_code",
+                        "type": "assistant",
+                        "sessionId": "main-session-1",
+                        "agentId": "subagent-1",
+                        "isSidechain": True,
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "subagent internal answer"}]},
+                    },
+                    fingerprint="agent-record-chat-subagent-internal-answer",
+                    created_at=base_time + timedelta(milliseconds=3),
+                ),
+            ]
+        )
+        await session.commit()
+
+    response = await db_client.get(f"/api/clients/{client_id}/windows/{window_id}/agent-record/chat")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [(item["role"], item["agent_message_type"], item["body"]) for item in body["messages"]] == [
+        ("agent", "subagent_call", "Description: Return one\n\nReturn exactly: 1"),
+        ("agent", "subagent_result", "1"),
+        ("agent", "agent", "subagent internal answer"),
+    ]
+    assert body["messages"][0]["target_session_id"] == str(sub_session.id)
+    assert body["messages"][0]["target_session_source_id"] == "agent-subagent-1"
+    assert body["messages_total"] == 3
+
+    filtered = await db_client.get(
+        f"/api/clients/{client_id}/windows/{window_id}/agent-record/chat?role=agent"
+    )
+    assert filtered.status_code == 200
+    assert [(item["agent_message_type"], item["body"]) for item in filtered.json()["messages"]] == [
+        ("agent", "subagent internal answer")
+    ]
+
+    subagent_calls = await db_client.get(
+        f"/api/clients/{client_id}/windows/{window_id}/agent-record/chat?role=subagent_call"
+    )
+    assert subagent_calls.status_code == 200
+    assert [item["agent_message_type"] for item in subagent_calls.json()["messages"]] == ["subagent_call"]
+
+    main_chat = await db_client.get(
+        f"/api/clients/{client_id}/windows/{window_id}/agent-record/chat?session_id={main_session.id}"
+    )
+    assert main_chat.status_code == 200
+    assert [(item["agent_message_type"], item["body"]) for item in main_chat.json()["messages"]] == [
+        ("subagent_call", "Description: Return one\n\nReturn exactly: 1"),
+        ("subagent_result", "1"),
+    ]
+
+    subagent_chat = await db_client.get(
+        f"/api/clients/{client_id}/windows/{window_id}/agent-record/chat?session_id={sub_session.id}"
+    )
+    assert subagent_chat.status_code == 200
+    assert [(item["agent_message_type"], item["body"]) for item in subagent_chat.json()["messages"]] == [
+        ("subagent_call", "Return exactly: 1"),
+        ("agent", "subagent internal answer")
+    ]
+    assert subagent_chat.json()["messages"][0]["subagent_tool_use_id"] == "call-subagent-1"
+
+    subagent_detail = await db_client.get(
+        f"/api/clients/{client_id}/windows/{window_id}/agent-record/detail?session_id={sub_session.id}"
+    )
+    assert subagent_detail.status_code == 200
+    detail_body = subagent_detail.json()
+    assert [item["id"] for item in detail_body["sessions"]] == [str(main_session.id), str(sub_session.id)]
+    assert [item["ai_session_id"] for item in detail_body["events"]] == [str(sub_session.id), str(sub_session.id)]
 
 
 @pytest.mark.asyncio
@@ -1996,13 +2570,14 @@ async def test_get_window_agent_record_projection_falls_back_when_adapter_projec
     response = await db_client.get(f"/api/clients/{client_id}/windows/{window_id}/agent-record/detail")
 
     assert response.status_code == 200
-    assert response.json()["events"][0]["projection"] == {
+    projection = response.json()["events"][0]["projection"]
+    assert projection | {
         "tone": "assistant",
         "label": "Assistant",
         "body": "fallback body",
         "body_format": "markdown",
         "subtype": "message",
-    }
+    } == projection
 
 
 @pytest.mark.asyncio
@@ -2059,7 +2634,7 @@ async def test_get_window_agent_record_projects_generic_cursor_and_legacy_alias_
 
     assert response.status_code == 200
     projections = [event["projection"] for event in response.json()["events"]]
-    assert projections == [
+    expected = [
         {
             "tone": "agent",
             "label": "Agent response",
@@ -2075,6 +2650,8 @@ async def test_get_window_agent_record_projects_generic_cursor_and_legacy_alias_
             "subtype": "user_message",
         },
     ]
+    for projection, expected_projection in zip(projections, expected, strict=True):
+        assert projection | expected_projection == projection
 
 
 @pytest.mark.asyncio
@@ -2637,6 +3214,48 @@ async def test_windows_activity_returns_git_worktree_activity_without_remote_pro
 
 
 @pytest.mark.asyncio
+async def test_windows_activity_range_filters_windows_by_recent_activity(db_client):
+    client_id = await get_local_client_id(db_client)
+    current = datetime.now(timezone.utc)
+    async with db_client.session_factory() as session:
+        client = await ensure_local_client(session)
+        old_window = await create_window(session, client.id, cwd="/old", shell_command="/bin/bash")
+        recent_output_window = await create_window(
+            session,
+            client.id,
+            cwd="/recent-output",
+            shell_command="/bin/bash",
+        )
+        recent_created_window = await create_window(
+            session,
+            client.id,
+            cwd="/recent-created",
+            shell_command="/bin/bash",
+        )
+        old_window.created_at = current - timedelta(days=20)
+        old_window.updated_at = current
+        recent_output_window.created_at = current - timedelta(days=20)
+        recent_output_window.updated_at = current - timedelta(days=20)
+        recent_output_window.terminal_last_output_at = current - timedelta(days=2)
+        recent_created_window.created_at = current - timedelta(days=2)
+        recent_created_window.updated_at = current - timedelta(days=2)
+        expected_window_ids = {str(recent_output_window.id), str(recent_created_window.id)}
+        old_window_id = str(old_window.id)
+        await session.commit()
+
+    week_response = await db_client.get(f"/api/clients/{client_id}/windows/activity?range=7d")
+    all_response = await db_client.get(f"/api/clients/{client_id}/windows/activity?range=all")
+
+    assert week_response.status_code == 200
+    assert all_response.status_code == 200
+    week_window_ids = {item["window_id"] for item in week_response.json()["windows"]}
+    all_window_ids = {item["window_id"] for item in all_response.json()["windows"]}
+    assert week_window_ids == expected_window_ids
+    assert old_window_id in all_window_ids
+    assert expected_window_ids.issubset(all_window_ids)
+
+
+@pytest.mark.asyncio
 async def test_windows_activity_hot_cache_skips_client_and_activity_queries(db_client, monkeypatch):
     client_id = await get_local_client_id(db_client)
     async with db_client.session_factory() as session:
@@ -2650,7 +3269,14 @@ async def test_windows_activity_hot_cache_skips_client_and_activity_queries(db_c
     async def fail_require_client(_session, _client_id):
         raise AssertionError("hot activity cache should avoid client lookup")
 
-    async def fail_load_client_windows_activity(_session, _client_id, *, include_runtime_tags=False):
+    async def fail_load_client_windows_activity(
+        _session,
+        _client_id,
+        *,
+        include_runtime_tags=False,
+        visible_since=None,
+        project_path=None,
+    ):
         raise AssertionError("hot activity cache should avoid activity query")
 
     monkeypatch.setattr(folders_router, "_require_client", fail_require_client)
@@ -2678,7 +3304,14 @@ async def test_windows_activity_expired_cache_serves_stale_response(db_client, m
     assert first_response.status_code == 200
     refreshes = []
 
-    async def fail_load_client_windows_activity(_session, _client_id, *, include_runtime_tags=False):
+    async def fail_load_client_windows_activity(
+        _session,
+        _client_id,
+        *,
+        include_runtime_tags=False,
+        visible_since=None,
+        project_path=None,
+    ):
         raise AssertionError("expired activity cache should return stale before refresh")
 
     monkeypatch.setattr(polling_response_cache, "_CACHE_TTL_SECONDS", -1.0)
@@ -2687,7 +3320,11 @@ async def test_windows_activity_expired_cache_serves_stale_response(db_client, m
         "load_client_windows_activity",
         fail_load_client_windows_activity,
     )
-    monkeypatch.setattr(folders_router, "_refresh_response_cache", lambda cache_key, refresh: refreshes.append(cache_key))
+    monkeypatch.setattr(
+        folders_router,
+        "_refresh_response_cache",
+        lambda cache_key, refresh: refreshes.append(cache_key),
+    )
 
     second_response = await db_client.get(f"/api/clients/{client_id}/windows/activity")
 

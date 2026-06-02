@@ -1,0 +1,4 @@
+interface:
+  display_name: "Slow SQL Analysis"
+  short_description: "Analyze and document Web Terminal slow SQL fixes."
+  default_prompt: "Analyze the latest Web Terminal slow SQL logs, fix root causes if needed, and record the analysis under docs/performance-tuning/slow-sqls/."

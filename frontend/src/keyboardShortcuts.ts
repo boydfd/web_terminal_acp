@@ -4,6 +4,7 @@ export type KeyboardShortcutId =
   | "switch-client"
   | "new-terminal"
   | "new-terminal-project"
+  | "toggle-aux-terminal"
   | "quick-input"
   | "expand-record"
   | "locate-terminal"
@@ -32,6 +33,7 @@ export const KEYBOARD_SHORTCUT_DEFINITIONS: KeyboardShortcutDefinition[] = [
   { id: "switch-client", label: "切换 Client", defaultShortcut: { key: "c", alt: true, shift: true } },
   { id: "new-terminal", label: "新建终端", defaultShortcut: { key: "n", alt: true } },
   { id: "new-terminal-project", label: "按项目新建", defaultShortcut: { key: "n", alt: true, shift: true } },
+  { id: "toggle-aux-terminal", label: "Aux terminal", defaultShortcut: { key: "a", alt: true, shift: true } },
   { id: "quick-input", label: "快速输入", defaultShortcut: { key: "i", alt: true } },
   { id: "expand-record", label: "展开 Agent 记录", defaultShortcut: { key: "r", alt: true } },
   { id: "locate-terminal", label: "定位当前终端", defaultShortcut: { key: "l", alt: true } },

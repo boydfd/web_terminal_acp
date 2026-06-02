@@ -86,6 +86,41 @@ async def test_create_window_sends_request_and_returns_remote_runtime_window() -
 
 
 @pytest.mark.asyncio
+async def test_list_agent_clients_queries_remote_client() -> None:
+    client_id = uuid4()
+    response = AgentMessage(
+        type="agent_client_result",
+        client_id=client_id,
+        request_id="response-request",
+        payload={
+            "agent_clients": [
+                {
+                    "id": "codex",
+                    "provider_id": "codex",
+                    "label": "Codex",
+                    "aliases": [],
+                    "default_command": "codex",
+                    "command_names": ["codex"],
+                }
+            ]
+        },
+    )
+    connection = FakeConnection(response)
+    runtime = RemoteRuntime(client_id=client_id, registry=FakeRegistry(connection), request_timeout=7.5)
+
+    payload = await runtime.list_agent_clients()
+
+    assert payload == response.payload
+    assert len(connection.requests) == 1
+    message, timeout = connection.requests[0]
+    assert timeout == 7.5
+    assert message.type == "agent_clients_list"
+    assert message.client_id == client_id
+    assert message.request_id is not None
+    assert message.payload == {}
+
+
+@pytest.mark.asyncio
 async def test_create_window_raises_when_remote_client_is_unavailable() -> None:
     client_id = uuid4()
     runtime = RemoteRuntime(client_id=client_id, registry=FakeRegistry(None))

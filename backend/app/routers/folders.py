@@ -3,6 +3,7 @@ from uuid import UUID
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.exc import IntegrityError
@@ -11,9 +12,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import SessionLocal, get_session
 from app.models import Client
 from app.repositories.clients import ensure_local_client, get_client
-from app.repositories.folders import build_tree, get_or_create_folder_by_path
+from app.repositories.folders import build_tree, get_or_create_folder_by_path, list_terminal_projects
 from app.routers.ui_events import ui_event_hub_from_state
-from app.schemas import ClientWindowsActivityOut, FolderCreateIn, FolderOut, TreeFolderOut
+from app.schemas import (
+    ClientWindowsActivityOut,
+    FolderCreateIn,
+    FolderOut,
+    TerminalProjectOut,
+    TreeFolderOut,
+)
 from app.services.polling_response_cache import (
     CachedJsonResponse,
     begin_response_cache_refresh,
@@ -23,6 +30,7 @@ from app.services.polling_response_cache import (
     response_cache_scope,
     store_json_response,
 )
+from app.services.terminal_time_ranges import terminal_visible_since
 from app.services.window_activity_api import load_client_windows_activity
 
 router = APIRouter(prefix="/api", tags=["folders"])
@@ -37,8 +45,15 @@ async def _require_client(session: AsyncSession, client_id: UUID) -> Client:
 
 
 @router.get("/clients/{client_id}/tree", response_model=list[TreeFolderOut], response_model_exclude_none=True)
-async def get_client_tree(client_id: UUID, session: AsyncSession = Depends(get_session)):
-    cache_key = ("tree", response_cache_scope(session), client_id)
+async def get_client_tree(
+    client_id: UUID,
+    time_range: str | None = Query(default=None, alias="range"),
+    project_path: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+):
+    visible_since = terminal_visible_since(time_range)
+    cache_project_path = _normalized_project_path(project_path)
+    cache_key = ("tree", response_cache_scope(session), client_id, time_range or "all", cache_project_path)
     cached = _cached_or_stale_response(cache_key)
     if cached is not None and not cached.expired:
         return cached.response
@@ -49,12 +64,47 @@ async def get_client_tree(client_id: UUID, session: AsyncSession = Depends(get_s
                 refresh_session,
                 client_id,
                 require_client=True,
+                visible_since=visible_since,
+                project_path=cache_project_path,
+                cache_key=cache_key,
             ),
         )
         return cached.response
     await _require_client(session, client_id)
-    tree = await build_tree(session, client_id)
+    tree = await build_tree(session, client_id, visible_since=visible_since, project_path=cache_project_path)
     return _store_response(cache_key, tree, resources={"tree"}, client_id=client_id)
+
+
+@router.get(
+    "/clients/{client_id}/terminal-projects",
+    response_model=list[TerminalProjectOut],
+    response_model_exclude_none=True,
+)
+async def get_client_terminal_projects(
+    client_id: UUID,
+    time_range: str | None = Query(default=None, alias="range"),
+    session: AsyncSession = Depends(get_session),
+):
+    visible_since = terminal_visible_since(time_range)
+    cache_key = ("terminal-projects", response_cache_scope(session), client_id, time_range or "all")
+    cached = _cached_or_stale_response(cache_key)
+    if cached is not None and not cached.expired:
+        return cached.response
+    if cached is not None:
+        _refresh_response_cache(
+            cache_key,
+            lambda refresh_session: _build_terminal_projects_response(
+                refresh_session,
+                client_id,
+                require_client=True,
+                visible_since=visible_since,
+                cache_key=cache_key,
+            ),
+        )
+        return cached.response
+    await _require_client(session, client_id)
+    projects = await list_terminal_projects(session, client_id, visible_since=visible_since)
+    return _store_response(cache_key, projects, resources={"tree"}, client_id=client_id)
 
 
 @router.get(
@@ -65,9 +115,20 @@ async def get_client_tree(client_id: UUID, session: AsyncSession = Depends(get_s
 async def get_client_windows_activity(
     client_id: UUID,
     include_runtime_tags: bool = Query(default=False),
+    time_range: str | None = Query(default=None, alias="range"),
+    project_path: str | None = Query(default=None),
     session: AsyncSession = Depends(get_session),
 ) -> ClientWindowsActivityOut | Response:
-    cache_key = ("activity", response_cache_scope(session), client_id, include_runtime_tags)
+    visible_since = terminal_visible_since(time_range)
+    cache_project_path = _normalized_project_path(project_path)
+    cache_key = (
+        "activity",
+        response_cache_scope(session),
+        client_id,
+        include_runtime_tags,
+        time_range or "all",
+        cache_project_path,
+    )
     cached = _cached_or_stale_response(cache_key)
     if cached is not None and not cached.expired:
         return cached.response
@@ -78,6 +139,9 @@ async def get_client_windows_activity(
                 refresh_session,
                 client_id,
                 include_runtime_tags=include_runtime_tags,
+                visible_since=visible_since,
+                project_path=cache_project_path,
+                cache_key=cache_key,
             ),
         )
         return cached.response
@@ -86,14 +150,22 @@ async def get_client_windows_activity(
         session,
         client_id,
         include_runtime_tags=include_runtime_tags,
+        visible_since=visible_since,
+        project_path=cache_project_path,
     )
     return _store_response(cache_key, activity, resources={"window", "tree"}, client_id=client_id)
 
 
 @router.get("/tree", response_model=list[TreeFolderOut], response_model_exclude_none=True)
-async def get_tree(session: AsyncSession = Depends(get_session)):
+async def get_tree(
+    time_range: str | None = Query(default=None, alias="range"),
+    project_path: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+):
     client = await ensure_local_client(session)
-    cache_key = ("tree", response_cache_scope(session), client.id)
+    visible_since = terminal_visible_since(time_range)
+    cache_project_path = _normalized_project_path(project_path)
+    cache_key = ("tree", response_cache_scope(session), client.id, time_range or "all", cache_project_path)
     cached = _cached_or_stale_response(cache_key)
     if cached is not None and not cached.expired:
         return cached.response
@@ -104,12 +176,22 @@ async def get_tree(session: AsyncSession = Depends(get_session)):
                 refresh_session,
                 client.id,
                 require_client=False,
+                visible_since=visible_since,
+                project_path=cache_project_path,
+                cache_key=cache_key,
             ),
         )
         return cached.response
-    tree = await build_tree(session, client.id)
+    tree = await build_tree(session, client.id, visible_since=visible_since, project_path=cache_project_path)
     await session.commit()
     return _store_response(cache_key, tree, resources={"tree"}, client_id=client.id)
+
+
+def _normalized_project_path(project_path: str | None) -> str | None:
+    if project_path is None:
+        return None
+    normalized = project_path.strip()
+    return normalized or None
 
 
 async def _get_or_create_folder_and_commit(session: AsyncSession, client_id: UUID, path: str):
@@ -166,11 +248,28 @@ async def _build_tree_response(
     client_id: UUID,
     *,
     require_client: bool,
+    visible_since: datetime | None,
+    project_path: str | None,
+    cache_key: tuple[object, ...],
 ) -> Response:
     if require_client:
         await _require_client(session, client_id)
-    tree = await build_tree(session, client_id)
-    return _store_response(("tree", response_cache_scope(session), client_id), tree, resources={"tree"}, client_id=client_id)
+    tree = await build_tree(session, client_id, visible_since=visible_since, project_path=project_path)
+    return _store_response(cache_key, tree, resources={"tree"}, client_id=client_id)
+
+
+async def _build_terminal_projects_response(
+    session: AsyncSession,
+    client_id: UUID,
+    *,
+    require_client: bool,
+    visible_since: datetime | None,
+    cache_key: tuple[object, ...],
+) -> Response:
+    if require_client:
+        await _require_client(session, client_id)
+    projects = await list_terminal_projects(session, client_id, visible_since=visible_since)
+    return _store_response(cache_key, projects, resources={"tree"}, client_id=client_id)
 
 
 async def _build_activity_response(
@@ -178,15 +277,20 @@ async def _build_activity_response(
     client_id: UUID,
     *,
     include_runtime_tags: bool,
+    visible_since: datetime | None,
+    project_path: str | None,
+    cache_key: tuple[object, ...],
 ) -> Response:
     await _require_client(session, client_id)
     activity = await load_client_windows_activity(
         session,
         client_id,
         include_runtime_tags=include_runtime_tags,
+        visible_since=visible_since,
+        project_path=project_path,
     )
     return _store_response(
-        ("activity", response_cache_scope(session), client_id, include_runtime_tags),
+        cache_key,
         activity,
         resources={"window", "tree"},
         client_id=client_id,

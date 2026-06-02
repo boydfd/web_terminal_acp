@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  CODEX_COMPOSER_SUBMIT_INPUT,
   clearLegacyCustomQuickKeys,
   decodeQuickKeyInput,
   filterCustomQuickKeys,
+  agentDirectSubmitInput,
   normalizeCustomQuickKeys,
-  readLegacyCustomQuickKeys
+  readLegacyCustomQuickKeys,
+  TERMINAL_ENTER_INPUT
 } from "../src/terminalQuickKeys";
 
 afterEach(() => {
@@ -15,6 +18,15 @@ afterEach(() => {
 describe("terminalQuickKeys", () => {
   it("decodes special key tokens into terminal input bytes", () => {
     expect(decodeQuickKeyInput("git status{Enter}{Ctrl-C}{ArrowUp}")).toBe("git status\r\x03\x1b[A");
+  });
+
+  it("uses the Codex enhanced enter key for direct agent submits", () => {
+    expect(agentDirectSubmitInput(["codex", "/workspace/project"])).toBe(CODEX_COMPOSER_SUBMIT_INPUT);
+  });
+
+  it("uses a normal terminal enter for non-Codex direct agent submits", () => {
+    expect(agentDirectSubmitInput(["claude_code", "/workspace/project"])).toBe(TERMINAL_ENTER_INPUT);
+    expect(agentDirectSubmitInput(undefined)).toBe(TERMINAL_ENTER_INPUT);
   });
 
   it("decodes custom Ctrl key tokens dynamically", () => {

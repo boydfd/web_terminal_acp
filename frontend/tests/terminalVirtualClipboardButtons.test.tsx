@@ -208,6 +208,45 @@ describe("TerminalPane virtual clipboard controls", () => {
     expect(latestTerminal?.options.theme).toBe(nextTheme);
   });
 
+  it("can connect through an aux terminal websocket without selecting windows", () => {
+    installTerminalPaneDomMocks();
+
+    act(() => {
+      root?.render(
+        <TerminalPane
+          clientId="client-1"
+          windowId="window-1"
+          webSocketUrl={(clientId, windowId, viewId) => `ws://aux/${clientId}/${windowId}?view_id=${viewId}`}
+          selectionEnabled={false}
+          priorityEnabled={false}
+        />
+      );
+    });
+
+    const connectMessage = workerInstances[0].messages.find((message) => message.type === "connect") as {
+      type: string;
+      url: string;
+    } | undefined;
+    expect(connectMessage?.url).toMatch(/^ws:\/\/aux\/client-1\/window-1\?view_id=/);
+
+    act(() => {
+      root?.render(
+        <TerminalPane
+          clientId="client-1"
+          windowId="window-2"
+          webSocketUrl={(clientId, windowId, viewId) => `ws://aux/${clientId}/${windowId}?view_id=${viewId}`}
+          selectionEnabled={false}
+          priorityEnabled={false}
+        />
+      );
+    });
+
+    const jsonMessages = workerInstances.flatMap((worker) => (
+      worker.messages.filter((message) => message.type === "json")
+    ));
+    expect(jsonMessages).toHaveLength(0);
+  });
+
   it("keeps native paste events available for Ctrl/Cmd+V and prevents xterm from sending Ctrl-V", () => {
     installTerminalPaneDomMocks();
 

@@ -337,6 +337,96 @@ async def test_collect_summary_context_includes_generic_agent_tool_record_with_a
 
 
 @pytest.mark.asyncio
+async def test_collect_summary_context_excludes_subagent_prompt_from_session_messages(session_factory):
+    created_at = datetime(2026, 5, 20, 12, 0, tzinfo=timezone.utc)
+    async with session_factory() as session:
+        window = await create_local_window(session)
+        main_session = AiSession(
+            client_id=window.client_id,
+            provider="claude_code",
+            source_id="main-session-1",
+            project_path=window.cwd,
+            virtual_window_id=window.id,
+        )
+        sub_session = AiSession(
+            client_id=window.client_id,
+            provider="claude_code",
+            source_id="agent-subagent-1",
+            project_path=window.cwd,
+            virtual_window_id=window.id,
+        )
+        session.add_all([main_session, sub_session])
+        await session.flush()
+        session.add_all(
+            [
+                Event(
+                    client_id=window.client_id,
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="main-session-1",
+                    kind="user_message",
+                    virtual_window_id=window.id,
+                    ai_session_id=main_session.id,
+                    payload_json={
+                        "provider": "claude_code",
+                        "type": "user",
+                        "message": {"role": "user", "content": "主 agent 用户需求"},
+                    },
+                    fingerprint="summary-main-user-prompt",
+                    created_at=created_at,
+                ),
+                Event(
+                    client_id=window.client_id,
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="agent-subagent-1",
+                    kind="user_message",
+                    virtual_window_id=window.id,
+                    ai_session_id=sub_session.id,
+                    payload_json={
+                        "provider": "claude_code",
+                        "type": "user",
+                        "sessionId": "main-session-1",
+                        "agentId": "subagent-1",
+                        "isSidechain": True,
+                        "subagent": {"toolUseId": "call-subagent-1"},
+                        "message": {"role": "user", "content": "subagent 内部 prompt"},
+                    },
+                    fingerprint="summary-subagent-user-prompt",
+                    created_at=created_at + timedelta(seconds=1),
+                ),
+                Event(
+                    client_id=window.client_id,
+                    source_type=EventSourceType.agent_tool_record,
+                    source_id="agent-subagent-1",
+                    kind="assistant_message",
+                    virtual_window_id=window.id,
+                    ai_session_id=sub_session.id,
+                    payload_json={
+                        "provider": "claude_code",
+                        "type": "assistant",
+                        "sessionId": "main-session-1",
+                        "agentId": "subagent-1",
+                        "isSidechain": True,
+                        "message": {"role": "assistant", "content": "subagent 返回的信息"},
+                    },
+                    fingerprint="summary-subagent-answer",
+                    created_at=created_at + timedelta(seconds=2),
+                ),
+            ]
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        window = (await session.execute(select(VirtualWindow))).scalar_one()
+        context = await collect_summary_context(session, window)
+
+    assert context[0]["payload"]["session_messages"] == [
+        {"role": "user", "content": "主 agent 用户需求"},
+        {"role": "assistant", "content": "subagent 返回的信息"},
+    ]
+    assert "subagent 内部 prompt" not in json.dumps(context, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
 async def test_collect_summary_context_filters_non_summary_session_content(session_factory):
     created_at = datetime(2026, 5, 20, 12, 0, tzinfo=timezone.utc)
     async with session_factory() as session:

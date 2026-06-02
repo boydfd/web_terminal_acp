@@ -8,6 +8,7 @@ type AgentConfigPickerProps = {
   isLoading?: boolean;
   isError?: boolean;
   isFetching?: boolean;
+  readOnly?: boolean;
   onSelectionChange: (selection: AgentConfigSelection) => void;
 };
 
@@ -47,6 +48,7 @@ export function AgentConfigPicker({
   isLoading = false,
   isError = false,
   isFetching = false,
+  readOnly = false,
   onSelectionChange
 }: AgentConfigPickerProps) {
   const mergedConfig = mergeConfigWithSelection(config, selection);
@@ -60,6 +62,7 @@ export function AgentConfigPicker({
       title="配置"
       metaPrefix="launch config"
       emptyMessage="Failed to load agent config."
+      readOnly={readOnly}
       onToggleItem={(sectionId, itemId, nextEnabled) => {
         if (selection === null) {
           return;

@@ -57,6 +57,10 @@ type TerminalPaneProps = {
   customQuickKeys?: CustomQuickKey[];
   onCustomQuickKeySubmit?: (quickKey: CustomQuickKey) => boolean;
   onTerminalConnectionStatusChange?: (status: TerminalConnectionStatus) => void;
+  webSocketUrl?: (clientId: string, windowId: string, viewId: string) => string;
+  selectionEnabled?: boolean;
+  priorityEnabled?: boolean;
+  autoFocus?: boolean;
   theme?: ITheme;
 };
 
@@ -220,6 +224,10 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   customQuickKeys = [],
   onCustomQuickKeySubmit,
   onTerminalConnectionStatusChange,
+  webSocketUrl = terminalWebSocketUrl,
+  selectionEnabled = true,
+  priorityEnabled = true,
+  autoFocus = true,
   theme,
 }, ref) {
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -232,6 +240,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   const activeWindowIdRef = useRef<string | null>(null);
   const initialWindowIdRef = useRef<string | null>(null);
   const viewIdRef = useRef<string>(createBrowserUuid());
+  const autoFocusRef = useRef(autoFocus);
   const onTerminalSelectionRef = useRef<TerminalPaneProps["onTerminalSelection"]>(onTerminalSelection);
   const onQuickInputOpenChangeRef = useRef<TerminalPaneProps["onQuickInputOpenChange"]>(onQuickInputOpenChange);
   const onQuickInputDraftChangeRef = useRef<TerminalPaneProps["onQuickInputDraftChange"]>(onQuickInputDraftChange);
@@ -265,6 +274,10 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     onTerminalConnectionStatusChangeRef.current?.(status);
     setConnectionStatus(status);
   }, []);
+
+  useEffect(() => {
+    autoFocusRef.current = autoFocus;
+  }, [autoFocus]);
 
   useEffect(() => {
     onTerminalSelectionRef.current = onTerminalSelection;
@@ -537,13 +550,17 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   }), [focusTerminal, openQuickInput, scheduleFitAndNotifyResize, submitQuickInput, updateQuickInputDraft]);
 
   const sendSelectWindow = useCallback((nextWindowId: string) => {
+    if (!selectionEnabled) {
+      return;
+    }
+
     const worker = socketWorkerRef.current;
     if (worker === null || !socketOpenRef.current) {
       return;
     }
 
     worker.postMessage({ type: "json", data: JSON.stringify({ type: "select_window", window_id: nextWindowId }) });
-  }, []);
+  }, [selectionEnabled]);
 
   useEffect(() => {
     if (clientId === null || windowId === null) {
@@ -594,9 +611,12 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
 
     const terminalViewLease = { viewId: viewIdRef.current, clientId, windowId: initialWindowId };
     const isCurrentViewLowPriority = () => {
-      return document.hidden || isTerminalViewLowPriority(viewIdRef.current);
+      return document.hidden || (priorityEnabled && isTerminalViewLowPriority(viewIdRef.current));
     };
     const claimCurrentTerminalView = () => {
+      if (!priorityEnabled) {
+        return;
+      }
       claimActiveTerminalView(terminalViewLease);
     };
     const claimVisibleCurrentTerminalView = () => {
@@ -952,7 +972,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
           scheduleFitAndNotifyResize();
           scheduleFitUntilFilled();
           const pendingWindowId = activeWindowIdRef.current;
-          if (pendingWindowId !== null && pendingWindowId !== initialWindowId) {
+          if (selectionEnabled && pendingWindowId !== null && pendingWindowId !== initialWindowId) {
             sendSocketJson({ type: "select_window", window_id: pendingWindowId });
           }
           return;
@@ -1099,7 +1119,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
         }
       };
 
-      worker.postMessage({ type: "connect", url: terminalWebSocketUrl(clientId, initialWindowId, viewIdRef.current) });
+      worker.postMessage({ type: "connect", url: webSocketUrl(clientId, initialWindowId, viewIdRef.current) });
     };
 
     const reconcileViewPriority = () => {
@@ -1133,7 +1153,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     };
 
     const handleTerminalVisibilityChange = () => {
-      if (!document.hidden) {
+      if (autoFocusRef.current && !document.hidden) {
         focusCurrentTerminal();
       }
       reconcileViewPriority();
@@ -1471,7 +1491,9 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       attachRenderResizeObserver();
       scheduleFitAndNotifyResize();
       scheduleFitUntilFilled();
-      focusCurrentTerminal();
+      if (autoFocusRef.current) {
+        focusCurrentTerminal();
+      }
       connectSocketWorker();
     };
 
@@ -1550,9 +1572,12 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     claimTerminalViewPriority,
     clearScheduledFits,
     clientId,
+    priorityEnabled,
     scheduleFitAndNotifyResize,
+    selectionEnabled,
     updateConnectionStatus,
     hasSelectedWindow,
+    webSocketUrl,
   ]);
 
   useEffect(() => {

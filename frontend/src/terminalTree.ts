@@ -1,4 +1,4 @@
-import type { TreeFolder, TreeFolderCore, TreeWindow, WindowActivity, WorkStatus } from "./types";
+import type { TerminalProject, TreeFolder, TreeFolderCore, TreeWindow, WindowActivity, WorkStatus } from "./types";
 
 export const DEFAULT_WORK_STATUS: WorkStatus = {
   state: "LONG_IDLE",
@@ -80,4 +80,33 @@ export function activityHasWorkingTerminal(
   }
 
   return activity.windows.some((window) => window.work_status.state === "WORKING");
+}
+
+export function projectPathFromRuntimeTags(runtimeTags: string[] | null | undefined): string | null {
+  for (const tag of runtimeTags ?? []) {
+    if (tag.startsWith("/")) {
+      return tag;
+    }
+  }
+
+  return null;
+}
+
+export function projectPathForWindow(window: {
+  cwd?: string | null;
+  runtime_tags?: string[] | null;
+} | null | undefined): string | null {
+  if (!window) {
+    return null;
+  }
+
+  return projectPathFromRuntimeTags(window.runtime_tags) ?? window.cwd ?? null;
+}
+
+export function firstProjectPath(projects: TerminalProject[] | undefined): string | null {
+  return projects?.[0]?.project_path ?? null;
+}
+
+export function projectListContains(projects: TerminalProject[] | undefined, projectPath: string | null): boolean {
+  return projectPath !== null && (projects ?? []).some((project) => project.project_path === projectPath);
 }

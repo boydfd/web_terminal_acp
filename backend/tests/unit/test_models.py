@@ -138,7 +138,7 @@ def test_alembic_revision_graph_has_unique_single_head():
     revisions = [revision.revision for revision in script.walk_revisions()]
 
     assert len(revisions) == len(set(revisions))
-    assert script.get_heads() == ["20260531_0030"]
+    assert script.get_heads() == ["20260602_0031"]
 
 
 def test_sqlite_alembic_upgrade_from_ambiguous_0028_creates_terminal_notifications(
@@ -261,6 +261,7 @@ def test_metadata_schema_constraints_match_spec():
         ("events", ("source_type", "created_at", "id")),
         ("events", ("client_id", "virtual_window_id", "source_type", "created_at", "id")),
         ("events", ("client_id", "virtual_window_id", "kind", "created_at", "id")),
+        ("events", ("client_id", "virtual_window_id", "created_at", "id")),
         ("summary_jobs", ("virtual_window_id",)),
         ("summary_jobs", ("status", "run_after")),
         ("window_title_history", ("client_id", "virtual_window_id", "created_at", "id")),
@@ -284,6 +285,33 @@ def test_metadata_schema_constraints_match_spec():
     )
     assert agent_activity_index.dialect_options["postgresql"]["where"] is not None
     assert agent_activity_index.dialect_options["sqlite"]["where"] is not None
+
+    terminal_input_index = next(
+        index
+        for index in Event.__table__.indexes
+        if index.name == "ix_events_terminal_input_window_created"
+    )
+    terminal_finished_index = next(
+        index
+        for index in Event.__table__.indexes
+        if index.name == "ix_events_terminal_finished_window_created"
+    )
+    assert tuple(terminal_input_index.columns.keys()) == (
+        "client_id",
+        "virtual_window_id",
+        "created_at",
+        "id",
+    )
+    assert tuple(terminal_finished_index.columns.keys()) == (
+        "client_id",
+        "virtual_window_id",
+        "created_at",
+        "id",
+    )
+    assert terminal_input_index.dialect_options["postgresql"]["where"] is not None
+    assert terminal_input_index.dialect_options["sqlite"]["where"] is not None
+    assert terminal_finished_index.dialect_options["postgresql"]["where"] is not None
+    assert terminal_finished_index.dialect_options["sqlite"]["where"] is not None
 
     assert Client.__table__.c.status.server_default is not None
     assert Client.__table__.c.runtime.server_default is not None

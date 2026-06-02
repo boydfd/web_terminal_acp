@@ -211,8 +211,9 @@ export function WindowDetail({
     }) => retrySummary(clientId, windowId, { allow_title_folder_override: allowTitleFolderOverride }),
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ["window", variables.clientId, variables.windowId] });
-      queryClient.invalidateQueries({ queryKey: ["tree", variables.clientId] });
-      queryClient.invalidateQueries({ queryKey: ["window-activity", variables.clientId] });
+      queryClient.invalidateQueries({ queryKey: ["tree", variables.clientId], exact: false });
+      queryClient.invalidateQueries({ queryKey: ["terminal-projects", variables.clientId], exact: false });
+      queryClient.invalidateQueries({ queryKey: ["window-activity", variables.clientId], exact: false });
     }
   });
   const renameMutation = useMutation({
@@ -227,13 +228,14 @@ export function WindowDetail({
     }) => updateWindowTitle(clientId, windowId, title),
     onSuccess: (updated, variables) => {
       queryClient.setQueryData(["window", variables.clientId, variables.windowId], updated);
-      queryClient.setQueryData<TreeFolderCore[]>(
-        ["tree", variables.clientId],
+      queryClient.setQueriesData<TreeFolderCore[]>(
+        { queryKey: ["tree", variables.clientId], exact: false },
         (current) => renameTreeWindow(current, variables.windowId, updated.title)
       );
       queryClient.invalidateQueries({ queryKey: ["window", variables.clientId, variables.windowId] });
-      queryClient.invalidateQueries({ queryKey: ["tree", variables.clientId] });
-      queryClient.invalidateQueries({ queryKey: ["window-activity", variables.clientId] });
+      queryClient.invalidateQueries({ queryKey: ["tree", variables.clientId], exact: false });
+      queryClient.invalidateQueries({ queryKey: ["terminal-projects", variables.clientId], exact: false });
+      queryClient.invalidateQueries({ queryKey: ["window-activity", variables.clientId], exact: false });
       queryClient.invalidateQueries({ queryKey: ["title-history", variables.clientId, variables.windowId] });
       queryClient.invalidateQueries({ queryKey: ["terminal-recents", variables.clientId] });
       setTitleDraft(updated.title);
@@ -468,9 +470,13 @@ export function WindowDetail({
                 isFetching={agentRecord.isFetching}
                 onModeChange={agentRecord.setMode}
                 onChatRoleFilterChange={agentRecord.setChatRoleFilter}
+                onOpenSubagent={(sessionId, originMessageId) => {
+                  agentRecord.setJumpRequest({ sessionId, originMessageId });
+                  agentRecord.setExpanded(true);
+                }}
                 onExpand={() => agentRecord.setExpanded(true)}
                 expandShortcutLabel={agentRecordShortcutLabel}
-                onSessionChange={agentRecord.resetPages}
+                onSessionChange={agentRecord.setSelectedSessionId}
                 onPreviousPage={agentRecord.previousPage}
                 onNextPage={agentRecord.nextPage}
               />
@@ -492,8 +498,13 @@ export function WindowDetail({
                 onQuickInputSubmit={onQuickInputSubmit}
                 onModeChange={agentRecord.setMode}
                 onChatRoleFilterChange={agentRecord.setChatRoleFilter}
-                onClose={() => agentRecord.setExpanded(false)}
-                onSessionChange={agentRecord.resetPages}
+                jumpRequest={agentRecord.jumpRequest}
+                onClose={() => {
+                  agentRecord.setExpanded(false);
+                  agentRecord.setJumpRequest(null);
+                  agentRecord.setSelectedSessionId(null);
+                }}
+                onSessionChange={agentRecord.setSelectedSessionId}
                 onPreviousPage={agentRecord.previousPage}
                 onNextPage={agentRecord.nextPage}
               />

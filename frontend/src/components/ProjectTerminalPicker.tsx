@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
-  AGENT_LAUNCH_OPTIONS,
-  agentLaunchForKind,
+  DEFAULT_AGENT_CLIENTS,
+  agentLaunchForClient,
+  agentLaunchOptions,
   isAgentLaunchKind,
 } from "../agentLaunch";
 import type { AgentLaunchMode } from "../agentLaunch";
-import type { AgentLaunchKind, AgentLaunchConfig, ProjectSummary } from "../types";
+import type { AgentClient, AgentLaunchKind, AgentLaunchConfig, ProjectSummary } from "../types";
 import { projectGroupLabel } from "../terminalGrouping";
 import { useOverlayFocus } from "./useOverlayFocus";
 
@@ -14,6 +15,7 @@ type ProjectTerminalPickerProps = {
   isOpen: boolean;
   projectPaths: string[];
   projectSummaries: ProjectSummary[];
+  agentClients?: AgentClient[];
   loadingProjects?: boolean;
   creatingTerminal?: boolean;
   createTerminalDisabled?: boolean;
@@ -31,6 +33,7 @@ export function ProjectTerminalPicker({
   isOpen,
   projectPaths,
   projectSummaries,
+  agentClients: agentClientsProp,
   loadingProjects,
   creatingTerminal,
   createTerminalDisabled,
@@ -42,6 +45,8 @@ export function ProjectTerminalPicker({
   const [activeIndex, setActiveIndex] = useState(0);
   const [selectedMode, setSelectedMode] = useState<AgentLaunchMode>("shell");
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const agentClients = agentClientsProp ?? DEFAULT_AGENT_CLIENTS;
+  const launchOptions = useMemo(() => agentLaunchOptions(agentClients), [agentClients]);
   const projectSummaryLookup = useMemo(() => {
     const lookup = new Map<string, ProjectSummary>();
     for (const summary of projectSummaries) {
@@ -88,8 +93,8 @@ export function ProjectTerminalPicker({
 
   const activeOption = filteredOptions[activeIndex] ?? null;
   const createTerminalForProject = useCallback((projectPath: string) => {
-    onCreateTerminal(projectPath, isAgentLaunchKind(selectedMode) ? agentLaunchForKind(selectedMode) : null);
-  }, [onCreateTerminal, selectedMode]);
+    onCreateTerminal(projectPath, isAgentLaunchKind(selectedMode) ? agentLaunchForClient(selectedMode, agentClients) : null);
+  }, [agentClients, onCreateTerminal, selectedMode]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -104,10 +109,10 @@ export function ProjectTerminalPicker({
       if (event.key === "Tab") {
         event.preventDefault();
         setSelectedMode((currentMode) => {
-          const currentIndex = AGENT_LAUNCH_OPTIONS.findIndex((option) => option.id === currentMode);
+          const currentIndex = launchOptions.findIndex((option) => option.id === currentMode);
           const offset = event.shiftKey ? -1 : 1;
-          const nextIndex = (currentIndex + offset + AGENT_LAUNCH_OPTIONS.length) % AGENT_LAUNCH_OPTIONS.length;
-          return AGENT_LAUNCH_OPTIONS[nextIndex].id;
+          const nextIndex = (currentIndex + offset + launchOptions.length) % launchOptions.length;
+          return launchOptions[nextIndex].id;
         });
         return;
       }
@@ -143,7 +148,8 @@ export function ProjectTerminalPicker({
     creatingTerminal,
     filteredOptions,
     isOpen,
-    createTerminalForProject
+    createTerminalForProject,
+    launchOptions
   ]);
 
   const handleEscape = useCallback(() => {
@@ -202,7 +208,7 @@ export function ProjectTerminalPicker({
         </div>
 
         <div className="project-terminal-picker-agent-tabs" role="tablist" aria-label="Agent">
-          {AGENT_LAUNCH_OPTIONS.map((option) => (
+          {launchOptions.map((option) => (
             <button
               key={option.id}
               type="button"

@@ -16,6 +16,10 @@ class AgentEventProjection:
     body: str
     body_format: Literal["markdown", "json"] = "markdown"
     subtype: str | None = None
+    agent_message_type: str | None = None
+    subagent_id: str | None = None
+    subagent_tool_use_id: str | None = None
+    target_session_source_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -26,6 +30,10 @@ class AgentChatProjection:
     dedupe_key: str | None = None
     is_canonical: bool = True
     is_duplicate_candidate: bool = False
+    agent_message_type: str | None = None
+    subagent_id: str | None = None
+    subagent_tool_use_id: str | None = None
+    target_session_source_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +66,8 @@ class AgentToolAdapter(Protocol):
     def project_event(self, event: Event) -> AgentEventProjection: ...
 
     def project_chat(self, event: Event) -> AgentChatProjection | None: ...
+
+    def is_completion(self, event: Event) -> bool: ...
 
     def summary_text(self, event: Event) -> str: ...
 

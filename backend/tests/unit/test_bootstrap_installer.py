@@ -115,13 +115,20 @@ def test_client_app_file_contents_packages_agent_tool_watchers():
     files = client_app_file_contents()
 
     assert "client_agent/git_worktree.py" in files
+    assert "client_agent/aux_terminal.py" in files
     assert "client_agent/agent_commands.py" in files
     assert "client_agent/agent_idle.py" in files
     assert "client_agent/agent_tool_watchers.py" in files
     assert "client_agent/agent_work_presence.py" in files
+    assert "client_agent/antigravity_watcher.py" in files
     assert "client_agent/cursor_watcher.py" in files
+    assert "agent_plugins/__init__.py" in files
+    assert "agent_plugins/builtins.py" in files
+    assert "agent_plugins/registry.py" in files
+    assert "agent_plugins/types.py" in files
     assert "client_agent/outbound.py" in files
     assert "services/agent_config.py" in files
+    assert "services/agent_profiles.py" in files
     idle_source = files["client_agent/agent_idle.py"]
     watcher_source = files["client_agent/agent_tool_watchers.py"]
     presence_source = files["client_agent/agent_work_presence.py"]
@@ -133,6 +140,12 @@ def test_client_app_file_contents_packages_agent_tool_watchers():
     assert "from app.client_agent.agent_work_presence import" in watcher_source
     assert "def detect_agent_work_presence" in presence_source
     assert "app.agent_tools" not in presence_source
+    assert "from app.models" not in files["agent_plugins/__init__.py"]
+    assert "app.agent_tools" not in files["agent_plugins/types.py"]
+    assert "app.agent_tools" not in files["agent_plugins/builtins.py"]
+    plugin_source = files["agent_plugins/builtins.py"]
+    assert "tool_adapter_module=\"codex\"" in plugin_source
+    assert "tool_adapter_class=\"CodexAdapter\"" in plugin_source
     assert "class BulkUploadWriter" in outbound_source
 
 
@@ -143,10 +156,19 @@ def test_packaged_client_agent_runner_imports_from_isolated_bundle(tmp_path):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
 
-    env = {**os.environ, "PYTHONPATH": str(bundle_root)}
+    command = (
+        "import sys; "
+        f"sys.path.insert(0, {str(bundle_root)!r}); "
+        "import app.client_agent.runner"
+    )
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONNOUSERSITE": "1",
+    }
     result = subprocess.run(
-        [sys.executable, "-c", "import app.client_agent.runner"],
+        [sys.executable, "-I", "-c", command],
         check=False,
+        cwd=bundle_root,
         env=env,
         stderr=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -210,6 +232,7 @@ async def test_bootstrap_client_creates_client_and_uploads_config(db_session_fac
     assert "app.client_agent.agent_tool_watchers" in ssh.uploads["~/.web-terminal-acp/app/app/client_agent/runner.py"]
     assert "~/.web-terminal-acp/app/app/client_agent/agent_tool_watchers.py" in ssh.uploads
     assert "~/.web-terminal-acp/app/app/client_agent/agent_commands.py" in ssh.uploads
+    assert "~/.web-terminal-acp/app/app/client_agent/antigravity_watcher.py" in ssh.uploads
     assert "~/.web-terminal-acp/app/app/client_agent/codex_watcher.py" in ssh.uploads
     assert "~/.web-terminal-acp/app/app/client_agent/cursor_watcher.py" in ssh.uploads
     assert any("mkdir -p ~/.web-terminal-acp/npm-global/bin" in command for command in ssh.commands)

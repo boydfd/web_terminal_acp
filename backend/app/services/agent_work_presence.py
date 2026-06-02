@@ -6,6 +6,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_tools.common import stable_hash
+from app.db import prefer_deferred_commit
 from app.models import Event, EventSourceType
 from app.repositories.events import _select_event_by_fingerprint
 from app.repositories.windows import get_window_for_client
@@ -24,6 +25,8 @@ async def touch_agent_work_presence(
     reasons: list[str],
     observed_at: datetime | None = None,
 ) -> Event:
+    await prefer_deferred_commit(session)
+
     window = await get_window_for_client(session, client_id, window_id)
     if window is None:
         raise ValueError("window not found for client")

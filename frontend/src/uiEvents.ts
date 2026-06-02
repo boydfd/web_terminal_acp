@@ -94,6 +94,7 @@ export function queryKeysForUiInvalidation(event: UiInvalidateEvent): QueryKey[]
   }
   if (clientId !== null && resources.has("tree")) {
     keys.push(["tree", clientId]);
+    keys.push(["terminal-projects", clientId]);
   }
   if (clientId !== null && resources.has("terminal_notifications")) {
     keys.push(["terminal-notifications", clientId]);
@@ -123,7 +124,13 @@ export function queryKeysForUiInvalidation(event: UiInvalidateEvent): QueryKey[]
 
 export function applyUiInvalidation(queryClient: QueryClient, event: UiInvalidateEvent): void {
   for (const queryKey of queryKeysForUiInvalidation(event)) {
-    void queryClient.invalidateQueries({ queryKey });
+    const exact = (
+      queryKey.length > 0
+      && queryKey[0] !== "tree"
+      && queryKey[0] !== "terminal-projects"
+      && queryKey[0] !== "window-activity"
+    );
+    void queryClient.invalidateQueries({ queryKey, exact });
   }
 }
 
@@ -147,6 +154,7 @@ export function scheduleWindowActivityRefresh(
   const timer = window.setTimeout(() => {
     void queryClient.refetchQueries({
       queryKey: ["window-activity", event.client_id],
+      exact: false,
       type: "active"
     });
     onComplete?.(timer);

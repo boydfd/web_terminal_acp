@@ -7,7 +7,7 @@ from elasticsearch import ApiError, AsyncElasticsearch
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import get_session
+from app.db import get_session, prefer_deferred_commit
 from app.models import Event
 from app.repositories.clients import ensure_local_client
 from app.routers.ui_events import ui_event_hub_from_state
@@ -52,6 +52,8 @@ async def ingest_codex_trace(
 ) -> IngestEventOut:
     reject_oversized_payload(payload)
     local_client = await ensure_local_client(session)
+    await session.commit()
+    await prefer_deferred_commit(session)
     try:
         event = await receive_codex_trace(
             session, payload, client_id=local_client.id, es_client=es_client

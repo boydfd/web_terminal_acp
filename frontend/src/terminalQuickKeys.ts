@@ -15,8 +15,11 @@ export type TerminalSpecialKey = {
   aliases?: string[];
 };
 
+export const TERMINAL_ENTER_INPUT = "\r";
+export const CODEX_COMPOSER_SUBMIT_INPUT = "\x1b[13u";
+
 export const TERMINAL_SPECIAL_KEYS: TerminalSpecialKey[] = [
-  { token: "Enter", label: "Enter", value: "\r", aliases: ["Return"] },
+  { token: "Enter", label: "Enter", value: TERMINAL_ENTER_INPUT, aliases: ["Return"] },
   { token: "Escape", label: "Esc", value: "\x1b", aliases: ["Esc"] },
   { token: "Tab", label: "Tab", value: "\t" },
   { token: "Backspace", label: "Backspace", value: "\x7f" },
@@ -226,6 +229,14 @@ export function decodeQuickKeyInput(input: string): string {
       ?? decodeFunctionKeyToken(normalizedToken)
       ?? match;
   });
+}
+
+export function agentDirectSubmitInput(runtimeTags: string[] | null | undefined): string {
+  if (runtimeTags?.includes("codex")) {
+    return CODEX_COMPOSER_SUBMIT_INPUT;
+  }
+
+  return TERMINAL_ENTER_INPUT;
 }
 
 export function customQuickKeySearchText(quickKey: CustomQuickKey): string {

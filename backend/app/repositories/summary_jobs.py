@@ -268,7 +268,7 @@ def _command_from_event(event: Event, window: VirtualWindow) -> dict[str, Any]:
 def _session_messages_from_event(event: Event) -> list[dict[str, Any]]:
     session_messages: list[dict[str, Any]] = []
     chat = _ai_event_chat(event)
-    if chat is not None:
+    if chat is not None and chat.agent_message_type != "subagent_call":
         role = "assistant" if chat.role == "agent" else chat.role
         if role in {"user", "assistant"}:
             session_messages.append({"role": role, "content": _bounded_text(chat.body)})

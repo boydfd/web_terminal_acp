@@ -66,6 +66,158 @@ def test_claude_code_tool_result_user_event_is_not_chat() -> None:
     assert projection.label == "Tool response"
 
 
+def test_claude_code_projects_agent_tool_use_as_subagent_call_chat() -> None:
+    event = make_event(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call-subagent-1",
+                        "name": "Agent",
+                        "input": {
+                            "description": "Return one",
+                            "prompt": "Return exactly: 1",
+                            "subagent_type": "claude",
+                        },
+                    }
+                ],
+            },
+            "subagent_tool_use_results": [
+                {"tool_use_id": "call-subagent-1", "agent_id": "subagent-1"},
+            ],
+        },
+        kind="assistant_message",
+    )
+
+    adapter = ClaudeCodeAdapter()
+    chat = adapter.project_chat(event)
+    projection = adapter.project_event(event)
+
+    assert chat is not None
+    assert chat.role == "agent"
+    assert chat.agent_message_type == "subagent_call"
+    assert chat.subagent_id == "subagent-1"
+    assert chat.subagent_tool_use_id == "call-subagent-1"
+    assert chat.target_session_source_id == "agent-subagent-1"
+    assert chat.body == "Description: Return one\n\nType: claude\n\nReturn exactly: 1"
+    assert projection.tone == "subagent-call"
+    assert projection.label == "Subagent call"
+
+
+def test_claude_code_projects_agent_tool_result_as_subagent_result_chat() -> None:
+    event = make_event(
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-subagent-1",
+                        "content": [
+                            {"type": "text", "text": "1"},
+                            {"type": "text", "text": "agentId: subagent-1\n<usage>tokens</usage>"},
+                        ],
+                    }
+                ],
+            },
+            "toolUseResult": {"agentId": "subagent-1", "toolUseId": "call-subagent-1"},
+        },
+        kind="user_message",
+    )
+
+    adapter = ClaudeCodeAdapter()
+    chat = adapter.project_chat(event)
+    projection = adapter.project_event(event)
+
+    assert chat is not None
+    assert chat.role == "agent"
+    assert chat.agent_message_type == "subagent_result"
+    assert chat.subagent_id == "subagent-1"
+    assert chat.subagent_tool_use_id == "call-subagent-1"
+    assert chat.target_session_source_id == "agent-subagent-1"
+    assert chat.body == "1"
+    assert projection.tone == "subagent-result"
+    assert projection.label == "Subagent result"
+
+
+def test_claude_code_projects_subagent_prompt_as_main_agent_call_chat_and_uses_agent_source_id() -> None:
+    payload = {
+        "type": "user",
+        "sessionId": "main-session-1",
+        "agentId": "subagent-1",
+        "isSidechain": True,
+        "subagent": {"toolUseId": "call-subagent-1"},
+        "message": {"role": "user", "content": "Return exactly: 1"},
+    }
+    event = make_event(payload, kind="user_message")
+
+    adapter = ClaudeCodeAdapter()
+    normalized = adapter.normalize(payload, source_path="/tmp/agent-subagent-1.jsonl", cursor=0)
+    chat = adapter.project_chat(event)
+    projection = adapter.project_event(event)
+
+    assert normalized.source_id == "agent-subagent-1"
+    assert chat is not None
+    assert chat.role == "agent"
+    assert chat.agent_message_type == "subagent_call"
+    assert chat.subagent_id == "subagent-1"
+    assert chat.subagent_tool_use_id == "call-subagent-1"
+    assert chat.target_session_source_id is None
+    assert chat.body == "Return exactly: 1"
+    assert projection.tone == "subagent-context"
+    assert projection.label == "Subagent prompt"
+
+
+def test_claude_code_subagent_tool_use_and_sidechain_prompt_share_chat_dedupe_key() -> None:
+    adapter = ClaudeCodeAdapter()
+    tool_use = make_event(
+        {
+            "type": "assistant",
+            "sessionId": "main-session-1",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call-subagent-1",
+                        "name": "Agent",
+                        "input": {"prompt": "Return exactly: 1"},
+                    }
+                ],
+            },
+            "subagent_tool_use_results": [
+                {"tool_use_id": "call-subagent-1", "agent_id": "subagent-1"},
+            ],
+        },
+        kind="assistant_message",
+    )
+    sidechain_prompt = make_event(
+        {
+            "type": "user",
+            "sessionId": "main-session-1",
+            "agentId": "subagent-1",
+            "isSidechain": True,
+            "subagent": {"toolUseId": "call-subagent-1"},
+            "message": {"role": "user", "content": "Return exactly: 1"},
+        },
+        kind="user_message",
+    )
+
+    canonical = adapter.project_chat(tool_use)
+    duplicate = adapter.project_chat(sidechain_prompt)
+
+    assert canonical is not None
+    assert duplicate is not None
+    assert canonical.dedupe_key == duplicate.dedupe_key
+    assert canonical.is_canonical is True
+    assert duplicate.is_canonical is False
+    assert duplicate.is_duplicate_candidate is True
+
+
 def test_claude_code_projects_assistant_chat_from_text_block() -> None:
     event = make_event(
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},

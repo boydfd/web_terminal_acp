@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from app.agent_plugins import get_agent_plugin_registry
 from app.client_agent.agent_commands import format_agent_command
 from app.client_agent.agent_work_presence import (
     AgentProcess,
@@ -41,18 +42,6 @@ _SESSION_ID_SUFFIX = re.compile(
     re.IGNORECASE,
 )
 
-_DEFAULT_COMMANDS = {
-    "claude_code": "claude",
-    "codex": "codex",
-    "cursor_cli": "agent",
-}
-
-_CURSOR_COMMANDS = {"agent", "cursor", "cursor-agent"}
-_PROVIDER_COMMANDS = {
-    "claude_code": {"claude"},
-    "codex": {"codex"},
-    "cursor_cli": _CURSOR_COMMANDS,
-}
 _CLAUDE_LOCAL_COMMAND_PREFIXES = (
     "<local-command-caveat>",
     "<bash-input>",
@@ -375,13 +364,13 @@ def latest_session_ref(window_id: UUID, provider: str) -> AgentSessionRef | None
 def latest_resume_command(window_id: UUID, *, project_path: str | None = None) -> str | None:
     candidates = [
         session
-        for provider in _DEFAULT_COMMANDS
+        for provider in _default_commands()
         if (session := latest_session_ref(window_id, provider)) is not None
     ]
     if not candidates:
         return None
     session = max(candidates, key=lambda candidate: candidate.last_output_at)
-    command_name = _DEFAULT_COMMANDS.get(session.provider)
+    command_name = _default_commands().get(session.provider)
     if command_name is None:
         return None
     return resume_command(
@@ -779,9 +768,24 @@ def _root_agent_process(processes: tuple[AgentProcess, ...]) -> AgentProcess | N
 
 def _resume_command_name(provider: str, detected_command: str | None) -> str | None:
     detected_command = detected_command or ""
-    if detected_command in _PROVIDER_COMMANDS.get(provider, set()):
+    commands = _provider_commands().get(provider, set())
+    if detected_command in commands:
         return detected_command
-    return _DEFAULT_COMMANDS.get(provider)
+    return _default_commands().get(provider)
+
+
+def _default_commands() -> dict[str, str]:
+    return {
+        plugin.provider_id: plugin.command.default_command
+        for plugin in get_agent_plugin_registry().all()
+    }
+
+
+def _provider_commands() -> dict[str, set[str]]:
+    return {
+        plugin.provider_id: set(plugin.command.command_names)
+        for plugin in get_agent_plugin_registry().all()
+    }
 
 
 def _suspended_agent_from_dict(value: dict[str, Any]) -> SuspendedAgent | None:

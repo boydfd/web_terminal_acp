@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 _TAG_PATTERNS = (
+    re.compile(r"<user_request>\s*(.*?)\s*</user_request>", re.DOTALL | re.IGNORECASE),
     re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL | re.IGNORECASE),
     re.compile(r"<objective>\s*(.*?)\s*</objective>", re.DOTALL | re.IGNORECASE),
 )

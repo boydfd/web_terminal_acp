@@ -1,4 +1,0 @@
-interface:
-  display_name: "Android App Release"
-  short_description: "Build signed Android APKs for Web Terminal ACP"
-  default_prompt: "Use $android-app-release to package, sign, and verify the Web Terminal ACP Android app."

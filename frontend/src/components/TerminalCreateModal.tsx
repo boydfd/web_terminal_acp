@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import { fetchClientAgentConfig } from "../api";
+import { fetchAgentClients, fetchAgentProfileConfig, fetchAgentProfiles, fetchClientAgentConfig } from "../api";
 import {
-  AGENT_LAUNCH_OPTIONS,
+  DEFAULT_AGENT_CLIENTS,
+  agentClientCapability,
+  agentDefaultCommand,
+  agentLaunchOptions,
   configToSelection,
   isAgentLaunchKind,
   readDefaultAgentCommands,
@@ -61,11 +64,33 @@ export function TerminalCreateModal({
   const [commands, setCommands] = useState<Record<AgentLaunchKind, string>>(() => readDefaultAgentCommands());
   const [configPanelOpen, setConfigPanelOpen] = useState(false);
   const [selection, setSelection] = useState<AgentConfigSelection | null>(null);
+  const [selectedProfileId, setSelectedProfileId] = useState<string>("");
   const panelRef = useRef<HTMLElement | null>(null);
+  const agentClientsQuery = useQuery({
+    queryKey: ["agent-clients", clientId],
+    queryFn: () => fetchAgentClients(clientId as string),
+    enabled: isOpen && clientId !== null,
+    staleTime: 60000
+  });
+  const agentClients = agentClientsQuery.data?.agent_clients ?? DEFAULT_AGENT_CLIENTS;
+  const launchOptions = agentLaunchOptions(agentClients);
+  const profilesQuery = useQuery({
+    queryKey: ["agent-profiles", clientId],
+    queryFn: () => fetchAgentProfiles(clientId as string),
+    enabled: isOpen && clientId !== null,
+    staleTime: 10000
+  });
+  const profiles = profilesQuery.data?.profiles ?? [];
+  const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) ?? null;
+  const configSupported = isAgentLaunchKind(mode)
+    ? agentClientCapability(mode, agentClients, "client_config")
+    : false;
   const configQuery = useQuery({
-    queryKey: ["client-agent-config", clientId, mode],
-    queryFn: () => fetchClientAgentConfig(clientId as string, mode as AgentLaunchKind),
-    enabled: isOpen && clientId !== null && isAgentLaunchKind(mode) && configPanelOpen,
+    queryKey: ["client-agent-config", clientId, mode, selectedProfileId],
+    queryFn: () => selectedProfile !== null
+      ? fetchAgentProfileConfig(clientId as string, selectedProfile.id, mode as AgentLaunchKind)
+      : fetchClientAgentConfig(clientId as string, mode as AgentLaunchKind),
+    enabled: isOpen && clientId !== null && isAgentLaunchKind(mode) && configPanelOpen && configSupported,
     staleTime: 10000
   });
   const activeSelection = isAgentLaunchKind(mode) ? selectionForConfig(mode, selection) : null;
@@ -76,6 +101,7 @@ export function TerminalCreateModal({
       setCommands(readDefaultAgentCommands());
       setConfigPanelOpen(context.showConfigInitially === true);
       setSelection(null);
+      setSelectedProfileId("");
       return;
     }
 
@@ -84,11 +110,16 @@ export function TerminalCreateModal({
       setCommands(readDefaultAgentCommands());
       setConfigPanelOpen(false);
       setSelection(null);
+      setSelectedProfileId("");
     }
   }, [context, isOpen]);
 
   useEffect(() => {
     if (!isAgentLaunchKind(mode) || configQuery.data === undefined) {
+      return;
+    }
+    if (selectedProfile !== null) {
+      setSelection(configToSelection(configQuery.data));
       return;
     }
     setSelection((current) => {
@@ -97,7 +128,21 @@ export function TerminalCreateModal({
       }
       return configToSelection(configQuery.data);
     });
-  }, [configQuery.data, mode]);
+  }, [configQuery.data, mode, selectedProfile]);
+
+  useEffect(() => {
+    if (!isAgentLaunchKind(mode) || selectedProfile !== null || selectedProfileId !== "") {
+      return;
+    }
+    setSelection(null);
+  }, [mode, selectedProfile, selectedProfileId]);
+
+  useEffect(() => {
+    if (selectedProfileId === "" || selectedProfile !== null || profilesQuery.isLoading) {
+      return;
+    }
+    setSelectedProfileId("");
+  }, [profilesQuery.isLoading, selectedProfile, selectedProfileId]);
 
   const command = isAgentLaunchKind(mode) ? commands[mode] : "";
   const handleEscape = useCallback(() => {
@@ -112,13 +157,16 @@ export function TerminalCreateModal({
     if (!isAgentLaunchKind(mode)) {
       return "未配置";
     }
+    if (selectedProfile !== null) {
+      return selectedProfile.name;
+    }
     if (activeSelection === null) {
       return "使用当前配置";
     }
     const total = selectionItemCount(activeSelection);
     const enabled = selectedEnabledCount(activeSelection);
     return total > 0 ? `${enabled}/${total} enabled` : "空配置";
-  }, [activeSelection, mode]);
+  }, [activeSelection, mode, selectedProfile]);
 
   if (!isOpen || context === null) {
     return null;
@@ -135,8 +183,9 @@ export function TerminalCreateModal({
       agent_launch: isAgentLaunchKind(mode)
         ? {
             agent: mode,
-            command: command.trim() || readDefaultAgentCommands()[mode],
-            config: activeSelection
+            command: command.trim() || agentDefaultCommand(mode, agentClients),
+            config: selectedProfile !== null ? null : activeSelection,
+            profile_id: selectedProfile?.id ?? null
           }
         : null
     });
@@ -168,7 +217,7 @@ export function TerminalCreateModal({
         </div>
 
         <div className="terminal-create-agent-tabs" role="tablist" aria-label="Agent">
-          {AGENT_LAUNCH_OPTIONS.map((option) => (
+          {launchOptions.map((option) => (
             <button
               key={option.id}
               type="button"
@@ -188,25 +237,51 @@ export function TerminalCreateModal({
         {isAgentLaunchKind(mode) && (
           <>
             <label className="settings-field">
+              <span>Agent</span>
+              <select
+                value={selectedProfileId}
+                onChange={(event) => {
+                  const nextProfileId = event.target.value;
+                  const nextProfile = profiles.find((profile) => profile.id === nextProfileId) ?? null;
+                  setSelectedProfileId(nextProfileId);
+                  if (nextProfile !== null) {
+                    setMode(nextProfile.default_agent_client);
+                    setConfigPanelOpen(false);
+                  }
+                  setSelection(null);
+                }}
+                disabled={profilesQuery.isLoading}
+              >
+                <option value="">直接配置 agent-client</option>
+                {profiles.map((profile) => (
+                  <option key={profile.id} value={profile.id}>
+                    {profile.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="settings-field">
               <span>启动命令</span>
               <input
                 value={command}
                 onChange={(event) => setCommands((current) => ({ ...current, [mode]: event.target.value }))}
-                placeholder={readDefaultAgentCommands()[mode]}
+                placeholder={agentDefaultCommand(mode, agentClients)}
               />
             </label>
-            <button
-              type="button"
-              className="settings-nav-row terminal-create-config-row"
-              onClick={() => setConfigPanelOpen((open) => !open)}
-            >
-              <span>配置</span>
-              <strong>{configSummary}</strong>
-            </button>
+            {configSupported && (
+              <button
+                type="button"
+                className="settings-nav-row terminal-create-config-row"
+                onClick={() => setConfigPanelOpen((open) => !open)}
+              >
+                <span>配置</span>
+                <strong>{configSummary}</strong>
+              </button>
+            )}
           </>
         )}
 
-        {isAgentLaunchKind(mode) && configPanelOpen && (
+        {isAgentLaunchKind(mode) && configPanelOpen && configSupported && (
           <div className="terminal-create-config-panel">
             <AgentConfigPicker
               config={configQuery.data ?? null}
@@ -214,7 +289,8 @@ export function TerminalCreateModal({
               isLoading={configQuery.isLoading}
               isError={configQuery.isError}
               isFetching={configQuery.isFetching}
-              onSelectionChange={setSelection}
+              readOnly={selectedProfile !== null}
+              onSelectionChange={selectedProfile === null ? setSelection : () => {}}
             />
           </div>
         )}

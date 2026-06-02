@@ -6,6 +6,7 @@ import logging
 import os
 import pty
 import select
+import signal
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
@@ -62,6 +63,13 @@ def _write_all_pty_input(master_fd: int, data: bytes) -> None:
         if written <= 0:
             raise BlockingIOError("PTY input write made no progress")
         remaining = remaining[written:]
+
+
+def _notify_process_window_change(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        process.send_signal(signal.SIGWINCH)
 
 
 @dataclass
@@ -217,6 +225,7 @@ class LocalTerminalRuntime:
             session.master_fd,
             ResizeControl(cols=cols, rows=rows),
         )
+        _notify_process_window_change(session.process)
         session.size = size
         previous_resize_task = session.resize_task
         if previous_resize_task is not None and not previous_resize_task.done():

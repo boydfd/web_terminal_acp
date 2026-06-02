@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import base64
+import gzip
 import posixpath
 import re
 import shlex
+import sys
+import textwrap
 from dataclasses import dataclass
 from uuid import UUID
 
+from app.agent_plugins import get_agent_plugin_registry
 from app.client_agent.agent_commands import agent_command_with_permission_flag
 
 _SAFE_SHELL_VALUE = re.compile(r"^[A-Za-z0-9_@%+=:,./-]+$")
+_SHELL_FUNCTION_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 AGENT_NPM_GLOBAL_BIN = "~/.web-terminal-acp/npm-global/bin"
 
 
@@ -16,6 +22,7 @@ AGENT_NPM_GLOBAL_BIN = "~/.web-terminal-acp/npm-global/bin"
 class ManagedShellCommand:
     command: str
     command_capture_supported: bool
+    hook_script: str | None = None
 
 
 def build_managed_shell_command(
@@ -26,28 +33,13 @@ def build_managed_shell_command(
     server_url: str,
     project_path: str | None = None,
 ) -> ManagedShellCommand:
-    codex_home = f"~/.web-terminal-acp/codex-homes/{window_id}"
-    claude_code_home = f"~/.web-terminal-acp/claude-code-homes/{window_id}"
-    cursor_home = f"~/.web-terminal-acp/cursor-homes/{window_id}"
-    storage_env = {
-        "CLAUDE_CONFIG_DIR": claude_code_home,
-        "CURSOR_AGENT_HOME": cursor_home,
-        "CURSOR_CONFIG_DIR": cursor_home,
-        "CURSOR_DATA_DIR": cursor_home,
-    }
     env = {
         "WEB_TERMINAL_CLIENT_ID": str(client_id),
         "WEB_TERMINAL_WINDOW_ID": str(window_id),
         "WEB_TERMINAL_SERVER_URL": server_url,
         "WEB_TERMINAL_COMMAND_HOOK": "1",
         "WEB_TERMINAL_PROJECT_PATH": project_path or "",
-        "WEB_TERMINAL_CODEX_HOME": codex_home,
-        "WEB_TERMINAL_CLAUDE_CODE_HOME": claude_code_home,
-        "WEB_TERMINAL_CURSOR_HOME": cursor_home,
-        "WEB_TERMINAL_ORIGINAL_CODEX_HOME": "~/.codex",
-        "WEB_TERMINAL_ORIGINAL_CLAUDE_CODE_HOME": "~/.claude",
-        "WEB_TERMINAL_ORIGINAL_CURSOR_DIR": "~/.cursor",
-        **storage_env,
+        **_agent_shell_environment(str(window_id)),
     }
     assignments = " ".join(
         [
@@ -58,14 +50,18 @@ def build_managed_shell_command(
     shell_name = posixpath.basename(shell)
 
     if shell_name == "bash":
+        hook_script = _bash_hook_script()
         return ManagedShellCommand(
-            command=f"{assignments} {_shell_quote(shell)} -lc {_shell_quote(_bash_launcher(shell))}",
+            command=f"{assignments} {_shell_quote(shell)} -lc {_shell_quote(_bash_launcher(shell, hook_script))}",
             command_capture_supported=True,
+            hook_script=hook_script,
         )
     if shell_name == "zsh":
+        hook_script = _zsh_hook_script()
         return ManagedShellCommand(
-            command=f"{assignments} {_shell_quote(shell)} -fc {_shell_quote(_zsh_launcher(shell))}",
+            command=f"{assignments} {_shell_quote(shell)} -fc {_shell_quote(_zsh_launcher(shell, hook_script))}",
             command_capture_supported=True,
+            hook_script=hook_script,
         )
 
     return ManagedShellCommand(
@@ -74,26 +70,72 @@ def build_managed_shell_command(
     )
 
 
-def _bash_launcher(shell: str) -> str:
+def _agent_shell_environment(window_id: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for plugin in get_agent_plugin_registry().all():
+        for key, value in plugin.storage.shell_env_aliases.items():
+            env[key] = value.format(window_id=window_id)
+    for plugin in get_agent_plugin_registry().all():
+        for key, value in plugin.storage.env.items():
+            if key == "CODEX_HOME":
+                continue
+            env[key] = value.format(window_id=window_id)
+    return env
+
+
+def _shell_words(values: tuple[str, ...]) -> str:
+    return " ".join(_shell_quote(value) for value in values)
+
+
+def _env_path_prepare_lines() -> str:
+    keys = sorted({key for plugin in get_agent_plugin_registry().all() for key in plugin.storage.env})
+    return "\n".join(f"  __web_terminal_mkdir_env_path {_shell_quote(key)}" for key in keys)
+
+
+def _agent_home_prepare_lines() -> str:
+    lines = ["  __web_terminal_prepare_agent_command_path"]
+    for plugin in get_agent_plugin_registry().all():
+        function_name = plugin.storage.shell_prepare_function
+        if function_name is None:
+            continue
+        if not _SHELL_FUNCTION_NAME.fullmatch(function_name):
+            raise ValueError(f"invalid agent shell prepare function: {function_name}")
+        lines.append(f"  {function_name}")
+    lines.append(_env_path_prepare_lines())
+    lines.append(
+        "  export WEB_TERMINAL_CLAUDE_CODE_HOME WEB_TERMINAL_CURSOR_HOME WEB_TERMINAL_ANTIGRAVITY_HOME WEB_TERMINAL_ANTIGRAVITY_COMMAND_HOME"
+    )
+    return "\n".join(line for line in lines if line)
+
+
+def _bash_launcher(shell: str, hook_script: str) -> str:
     quoted_shell = _shell_quote(shell)
     return f"""__web_terminal_rc=$(mktemp)
 chmod 600 "$__web_terminal_rc"
-cat > "$__web_terminal_rc" <<'WEB_TERMINAL_BASH_RC'
-{_bash_hook_script()}
-WEB_TERMINAL_BASH_RC
+{_decode_hook_to_path("$__web_terminal_rc", hook_script, "WEB_TERMINAL_BASH_RC_GZ")}
 exec {quoted_shell} --rcfile "$__web_terminal_rc" -i
 """
 
 
-def _zsh_launcher(shell: str) -> str:
+def _zsh_launcher(shell: str, hook_script: str) -> str:
     quoted_shell = _shell_quote(shell)
     return f"""__web_terminal_zdotdir=$(mktemp -d)
 chmod 700 "$__web_terminal_zdotdir"
-cat > "$__web_terminal_zdotdir/.zshrc" <<'WEB_TERMINAL_ZSH_RC'
-{_zsh_hook_script()}
-WEB_TERMINAL_ZSH_RC
+{_decode_hook_to_path("$__web_terminal_zdotdir/.zshrc", hook_script, "WEB_TERMINAL_ZSH_RC_GZ")}
 export ZDOTDIR="$__web_terminal_zdotdir"
 exec {quoted_shell} -i
+"""
+
+
+def _decode_hook_to_path(path: str, hook_script: str, marker: str) -> str:
+    payload = "\n".join(
+        textwrap.wrap(base64.b64encode(gzip.compress(hook_script.encode("utf-8"))).decode("ascii"), 76)
+    )
+    return f"""{_shell_quote(sys.executable)} -c 'import base64,gzip,sys; sys.stdout.write(gzip.decompress(base64.b64decode(sys.stdin.read())).decode("utf-8"))' > "{path}" <<'{marker}'
+{payload}
+{marker}
+__web_terminal_decode_status=$?
+[ "$__web_terminal_decode_status" -eq 0 ] || exit "$__web_terminal_decode_status"
 """
 
 
@@ -125,7 +167,9 @@ exec {command}
 
 
 def _agent_environment_script() -> str:
-    return r'''__web_terminal_prepare_codex_home() {
+    codex_plugin = get_agent_plugin_registry().by_agent_id("codex")
+    claude_plugin = get_agent_plugin_registry().by_agent_id("claude")
+    script = r'''__web_terminal_prepare_codex_home() {
   [ -n "$WEB_TERMINAL_CODEX_HOME" ] || return 0
   __web_terminal_source_codex_home="${WEB_TERMINAL_ORIGINAL_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}"
   case "$__web_terminal_source_codex_home" in
@@ -201,6 +245,9 @@ __web_terminal_prepare_claude_code_home() {
   esac
   mkdir -p "$WEB_TERMINAL_CLAUDE_CODE_HOME/projects" 2>/dev/null || true
   __web_terminal_source_claude_json="${WEB_TERMINAL_ORIGINAL_CLAUDE_JSON:-$HOME/.claude.json}"
+  case "$__web_terminal_source_claude_json" in
+    "~/"*) __web_terminal_source_claude_json="$HOME/${__web_terminal_source_claude_json#"~/"}" ;;
+  esac
   if [ -e "$__web_terminal_source_claude_json" ] && [ ! -e "$WEB_TERMINAL_CLAUDE_CODE_HOME/.claude.json" ]; then
     ln -s "$__web_terminal_source_claude_json" "$WEB_TERMINAL_CLAUDE_CODE_HOME/.claude.json" 2>/dev/null || true
   fi
@@ -294,6 +341,52 @@ __web_terminal_prepare_cursor_home() {
   export CURSOR_CONFIG_DIR="$managed_cursor"
   export CURSOR_DATA_DIR="$managed_cursor"
 }
+__web_terminal_prepare_antigravity_home() {
+  [ -n "$WEB_TERMINAL_ANTIGRAVITY_HOME" ] || return 0
+  local managed_antigravity source_antigravity item base command_home original_home workspace_root
+  case "$WEB_TERMINAL_ANTIGRAVITY_HOME" in
+    "~/"*) managed_antigravity="$HOME/${WEB_TERMINAL_ANTIGRAVITY_HOME#"~/"}" ;;
+    *) managed_antigravity="$WEB_TERMINAL_ANTIGRAVITY_HOME" ;;
+  esac
+  case "${WEB_TERMINAL_ORIGINAL_ANTIGRAVITY_CLI_HOME:-$HOME/.gemini/antigravity-cli}" in
+    "~/"*) source_antigravity="$HOME/${WEB_TERMINAL_ORIGINAL_ANTIGRAVITY_CLI_HOME#"~/"}" ;;
+    *) source_antigravity="${WEB_TERMINAL_ORIGINAL_ANTIGRAVITY_CLI_HOME:-$HOME/.gemini/antigravity-cli}" ;;
+  esac
+  mkdir -p "$managed_antigravity" 2>/dev/null || true
+  find "$source_antigravity" -mindepth 1 -maxdepth 1 2>/dev/null | while IFS= read -r item; do
+    base="${item##*/}"
+    case "$base" in
+      brain|cache|log|scratch) continue ;;
+    esac
+    [ -e "$managed_antigravity/$base" ] && continue
+    ln -sf "$item" "$managed_antigravity/$base" 2>/dev/null || true
+  done
+  if [ -f "$source_antigravity/cache/onboarding.json" ] && [ ! -f "$managed_antigravity/cache/onboarding.json" ]; then
+    mkdir -p "$managed_antigravity/cache" 2>/dev/null || true
+    cp "$source_antigravity/cache/onboarding.json" "$managed_antigravity/cache/onboarding.json" 2>/dev/null || true
+  fi
+  command_home="${WEB_TERMINAL_ANTIGRAVITY_COMMAND_HOME:-}"
+  if [ -n "$command_home" ]; then
+    case "$command_home" in
+      "~/"*) command_home="$HOME/${command_home#"~/"}" ;;
+    esac
+    mkdir -p "$command_home/.gemini" 2>/dev/null || true
+    if [ ! -e "$command_home/.gemini/antigravity-cli" ] && [ ! -L "$command_home/.gemini/antigravity-cli" ]; then
+      ln -s "$managed_antigravity" "$command_home/.gemini/antigravity-cli" 2>/dev/null || true
+    fi
+  fi
+  original_home="${WEB_TERMINAL_ORIGINAL_HOME:-$HOME}"
+  case "$original_home" in
+    "~"*) original_home="$HOME${original_home#\~}" ;;
+  esac
+  workspace_root="${AGY_PROXY_WORKSPACE_LINK_ROOT:-$original_home/agy-workspaces}"
+  case "$workspace_root" in
+    "~"*) workspace_root="$original_home${workspace_root#\~}" ;;
+  esac
+  export WEB_TERMINAL_ANTIGRAVITY_HOME="$managed_antigravity"
+  export WEB_TERMINAL_ANTIGRAVITY_COMMAND_HOME="${command_home:-$HOME}"
+  export AGY_PROXY_WORKSPACE_LINK_ROOT="$workspace_root"
+}
 __web_terminal_missing_claude_env() {
   { [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; } || return 0
   [ -n "${ANTHROPIC_BASE_URL:-}" ] || [ -n "${CLAUDE_CODE_API_BASE_URL:-}" ] || return 0
@@ -352,32 +445,29 @@ __web_terminal_agent_arg_present() {
   done
   return 1
 }
-__web_terminal_install_agent_permission_wrappers() {
-  unalias codex 2>/dev/null || true
-  codex() {
-    if __web_terminal_agent_arg_present --dangerously-bypass-approvals-and-sandbox "$@"; then
-      command codex "$@"
-    else
-      command codex --dangerously-bypass-approvals-and-sandbox "$@"
-    fi
-  }
-  unalias claude 2>/dev/null || true
-  claude() {
-    if __web_terminal_agent_arg_present --dangerously-skip-permissions "$@"; then
-      command claude "$@"
-    else
-      command claude --dangerously-skip-permissions "$@"
-    fi
-  }
-  unalias agent 2>/dev/null || true
-  agent() {
-    command agent "$@"
-  }
-  unalias cursor 2>/dev/null || true
-  cursor() {
-    command cursor "$@"
-  }
+__web_terminal_run_agent_command() {
+  __web_terminal_command_name="$1"
+  shift
+  case "$__web_terminal_command_name" in
+    agy|agy-p)
+      __web_terminal_prepare_antigravity_home
+      HOME="$WEB_TERMINAL_ANTIGRAVITY_COMMAND_HOME" AGY_PROXY_WORKSPACE_LINK_ROOT="$AGY_PROXY_WORKSPACE_LINK_ROOT" command "$__web_terminal_command_name" "$@"
+      ;;
+    *)
+      command "$__web_terminal_command_name" "$@"
+      ;;
+  esac
 }
+__web_terminal_run_agent_command_with_permission() {
+  __web_terminal_command_name="$1"
+  __web_terminal_permission_flag="$2"
+  shift 2
+  if [ -n "$__web_terminal_permission_flag" ] && ! __web_terminal_agent_arg_present "$__web_terminal_permission_flag" "$@"; then
+    set -- "$__web_terminal_permission_flag" "$@"
+  fi
+  __web_terminal_run_agent_command "$__web_terminal_command_name" "$@"
+}
+''' + _agent_permission_wrapper_script() + r'''
 __web_terminal_prepare_direct_agent_launch() {
   __web_terminal_prepare_agent_command_path
   if [ -n "$1" ] && ! __web_terminal_agent_command_available "$1"; then
@@ -386,9 +476,46 @@ __web_terminal_prepare_direct_agent_launch() {
   fi
   __web_terminal_install_agent_permission_wrappers
 }
-__web_terminal_prepare_agent_homes
+  __web_terminal_prepare_agent_homes
 __web_terminal_prepare_cursor_home
 '''
+    return (
+        script.replace(
+            "auth.json config.toml hooks hooks.json hooks.disabled.json AGENTS.md skills skills.disabled plugins plugins.disabled plugin_marketplaces.json",
+            _shell_words(("auth.json", *codex_plugin.storage.config_item_names)),
+        )
+        .replace(
+            "history.json history.jsonl",
+            _shell_words(codex_plugin.storage.history_item_names),
+            1,
+        )
+        .replace(
+            "settings.json settings.local.json commands hooks hooks.disabled.json plugins plugins.disabled skills skills.disabled api-key-helper.sh",
+            _shell_words(claude_plugin.storage.config_item_names),
+        )
+        .replace(
+            "history.json history.jsonl file-history",
+            _shell_words(claude_plugin.storage.history_item_names),
+        )
+        .replace(
+            """  __web_terminal_prepare_agent_command_path
+  __web_terminal_prepare_codex_home
+  __web_terminal_prepare_claude_code_home
+  case "$WEB_TERMINAL_CURSOR_HOME" in
+    "~/"*) WEB_TERMINAL_CURSOR_HOME="$HOME/${WEB_TERMINAL_CURSOR_HOME#"~/"}" ;;
+  esac
+  export CURSOR_AGENT_HOME="$WEB_TERMINAL_CURSOR_HOME"
+  export CURSOR_CONFIG_DIR="$WEB_TERMINAL_CURSOR_HOME"
+  export CURSOR_DATA_DIR="$WEB_TERMINAL_CURSOR_HOME"
+  __web_terminal_mkdir_env_path CLAUDE_CONFIG_DIR
+  __web_terminal_mkdir_env_path CURSOR_AGENT_HOME
+  __web_terminal_mkdir_env_path CURSOR_CONFIG_DIR
+  __web_terminal_mkdir_env_path CURSOR_DATA_DIR
+  export WEB_TERMINAL_CLAUDE_CODE_HOME WEB_TERMINAL_CURSOR_HOME""",
+            _agent_home_prepare_lines(),
+        )
+        .replace("\n__web_terminal_prepare_cursor_home\n", "\n")
+    )
 
 
 def _common_hook_script() -> str:
@@ -559,7 +686,21 @@ def _shell_quote(value: str) -> str:
 
 
 def _exec_command(value: str) -> str:
-    return agent_command_with_permission_flag(value) or _shell_quote(value)
+    command = agent_command_with_permission_flag(value)
+    if command is None:
+        return _shell_quote(value)
+    command_name = _direct_agent_command_name(command)
+    return _direct_agent_command_with_env(command, command_name)
+
+
+def _direct_agent_command_with_env(command: str, command_name: str | None) -> str:
+    if command_name not in {"agy", "agy-p"}:
+        return command
+    return (
+        "HOME=\"$WEB_TERMINAL_ANTIGRAVITY_COMMAND_HOME\" "
+        "AGY_PROXY_WORKSPACE_LINK_ROOT=\"$AGY_PROXY_WORKSPACE_LINK_ROOT\" "
+        f"{command}"
+    )
 
 
 def _is_direct_agent_command(value: str) -> bool:
@@ -577,7 +718,34 @@ def _direct_agent_command_name(value: str) -> str | None:
         if token in {"command", "env", "sudo"}:
             continue
         basename = posixpath.basename(token)
-        if basename in {"codex", "claude", "agent", "cursor"}:
+        if basename in get_agent_plugin_registry().command_names():
             return basename
         return None
     return None
+
+
+def _agent_permission_wrapper_script() -> str:
+    lines = ["__web_terminal_install_agent_permission_wrappers() {"]
+    for plugin in get_agent_plugin_registry().all():
+        for command_name in plugin.command.command_names:
+            lines.append(f"  unalias {command_name} 2>/dev/null || true")
+            permission_flag = plugin.command.permission_flag
+            if not _SHELL_FUNCTION_NAME.fullmatch(command_name):
+                helper = (
+                    f"__web_terminal_run_agent_command_with_permission {command_name} {_shell_quote(permission_flag)}"
+                    if permission_flag
+                    else f"__web_terminal_run_agent_command {command_name}"
+                )
+                lines.append(f"  alias {command_name}={_shell_quote(helper)}")
+                continue
+            lines.append(f"  {command_name}() {{")
+            if permission_flag:
+                quoted_flag = _shell_quote(permission_flag)
+                lines.append(
+                    f"    __web_terminal_run_agent_command_with_permission {command_name} {quoted_flag} \"$@\""
+                )
+            else:
+                lines.append(f"    __web_terminal_run_agent_command {command_name} \"$@\"")
+            lines.append("  }")
+    lines.append("}")
+    return "\n".join(lines)

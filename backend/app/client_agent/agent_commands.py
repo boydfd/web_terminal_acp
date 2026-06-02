@@ -4,15 +4,8 @@ import posixpath
 import re
 import shlex
 
-CODEX_BYPASS_APPROVALS_AND_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
-CLAUDE_SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
+from app.agent_plugins import get_agent_plugin_registry
 
-_AGENT_PERMISSION_FLAGS = {
-    "codex": CODEX_BYPASS_APPROVALS_AND_SANDBOX_FLAG,
-    "claude": CLAUDE_SKIP_PERMISSIONS_FLAG,
-    "cursor": None,
-    "agent": None,
-}
 _ENV_ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 _COMMAND_WRAPPERS = {"command", "env", "sudo"}
 
@@ -20,13 +13,29 @@ _COMMAND_WRAPPERS = {"command", "env", "sudo"}
 def agent_permission_flag(command_name: str | None) -> str | None:
     if not command_name:
         return None
-    return _AGENT_PERMISSION_FLAGS.get(posixpath.basename(command_name))
+    provider = get_agent_plugin_registry().provider_for_command_name(command_name)
+    if provider is None:
+        return None
+    return get_agent_plugin_registry().by_provider(provider).command.permission_flag
 
 
 def is_known_agent_command(command_name: str | None) -> bool:
     if not command_name:
         return False
-    return posixpath.basename(command_name) in _AGENT_PERMISSION_FLAGS
+    return get_agent_plugin_registry().provider_for_command_name(command_name) is not None
+
+
+def agent_provider_from_command(command: str | None) -> str | None:
+    if not command:
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    command_index = _agent_command_index(tokens)
+    if command_index is None:
+        return None
+    return get_agent_plugin_registry().provider_for_command_name(tokens[command_index])
 
 
 def format_agent_command(command_name: str, *args: str) -> str:

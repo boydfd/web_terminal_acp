@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_WORK_STATUS, mergeTreeWithActivity, windowActivityMap } from "../src/terminalTree";
+import {
+  DEFAULT_WORK_STATUS,
+  firstProjectPath,
+  mergeTreeWithActivity,
+  projectListContains,
+  projectPathForWindow,
+  windowActivityMap
+} from "../src/terminalTree";
 import type { TreeFolderCore } from "../src/types";
 
 const sampleTree: TreeFolderCore[] = [
@@ -56,5 +63,25 @@ describe("terminalTree", () => {
     expect(merged?.[0]?.windows[0]?.work_status).toEqual(DEFAULT_WORK_STATUS);
     expect(merged?.[0]?.windows[0]?.runtime_tags).toEqual([]);
     expect(merged?.[0]?.windows[0]?.git_worktree).toBeNull();
+  });
+
+  it("resolves the selected project from runtime tags before cwd", () => {
+    expect(projectPathForWindow({
+      cwd: "/tmp/fallback",
+      runtime_tags: ["codex", "/workspace/project"]
+    })).toBe("/workspace/project");
+    expect(projectPathForWindow({ cwd: "/tmp/fallback", runtime_tags: ["codex"] })).toBe("/tmp/fallback");
+    expect(projectPathForWindow(null)).toBeNull();
+  });
+
+  it("handles terminal project lists", () => {
+    const projects = [
+      { project_path: "/workspace/a", window_count: 2 },
+      { project_path: "/workspace/b", window_count: 1 }
+    ];
+
+    expect(firstProjectPath(projects)).toBe("/workspace/a");
+    expect(projectListContains(projects, "/workspace/b")).toBe(true);
+    expect(projectListContains(projects, "/workspace/missing")).toBe(false);
   });
 });

@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db import prefer_deferred_commit
 from app.models import Event, EventSourceType, VirtualWindow
 from app.services.search_index import index_terminal_chunk_without_event
 from app.services.summary_scheduler import schedule_summary_after_terminal_input
@@ -46,6 +47,7 @@ async def record_terminal_input_command(
 ) -> Event | None:
     if is_auto_resume_command(raw_command):
         return None
+    await prefer_deferred_commit(session)
     redacted_command = redact_terminal_command(raw_command)
     captured_at_value = _serialize_datetime(captured_at)
     fingerprint = _terminal_input_fingerprint(window_id, redacted_command, captured_at_value, sequence)
@@ -155,6 +157,7 @@ async def record_terminal_command_finished(
     if raw_command is not None and is_auto_resume_command(raw_command):
         return None
 
+    await prefer_deferred_commit(session)
     redacted_command = redact_terminal_command(raw_command or "")
     captured_at_value = _serialize_datetime(captured_at)
     fingerprint = f"terminal_command_finished:{window_id}:{sequence}"
@@ -330,6 +333,7 @@ async def _touch_terminal_output_activity(
     if window is None or window.client_id != client_id:
         return False
 
+    await prefer_deferred_commit(session)
     window.terminal_last_output_at = datetime.now(UTC)
     await session.commit()
     _terminal_output_activity_touched_at[key] = now

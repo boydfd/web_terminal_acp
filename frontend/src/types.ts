@@ -164,6 +164,11 @@ export type ClientWindowsActivity = {
   windows: Array<WindowActivity & { window_id: string }>;
 };
 
+export type TerminalProject = {
+  project_path: string;
+  window_count: number;
+};
+
 export type TerminalNotification = {
   id: string;
   client_id: string;
@@ -253,6 +258,11 @@ export type AgentEventProjection = {
   body: string;
   body_format: "markdown" | "json";
   subtype: string | null;
+  agent_message_type: AgentMessageType | null;
+  subagent_id: string | null;
+  subagent_tool_use_id: string | null;
+  target_session_id: string | null;
+  target_session_source_id: string | null;
 };
 
 export type AgentRecordEvent = {
@@ -284,10 +294,17 @@ export type AgentChatMessage = {
   role: "user" | "agent";
   body: string;
   body_format: "markdown" | "json";
+  agent_message_type: AgentMessageType | null;
+  subagent_id: string | null;
+  subagent_tool_use_id: string | null;
+  target_session_id: string | null;
+  target_session_source_id: string | null;
   created_at: string;
 };
 
-export type AgentChatRoleFilter = "all" | "user" | "agent";
+export type AgentMessageType = "agent" | "subagent_call" | "subagent_result";
+
+export type AgentChatRoleFilter = "all" | "user" | "agent" | "subagent_call" | "subagent_result";
 
 export type AgentRecordDisplayMode = "chat" | "detail";
 
@@ -295,6 +312,7 @@ export type AgentChatRecord = {
   window_id: string;
   messages: AgentChatMessage[];
   messages_total: number;
+  messages_total_exact?: boolean;
   messages_limit: number;
   messages_offset: number;
   messages_has_more: boolean;
@@ -314,11 +332,47 @@ export type AgentConfigSection = {
 };
 
 export type AgentConfig = {
-  agent: "codex" | "claude" | "cursor";
+  agent: string;
   sections: AgentConfigSection[];
 };
 
 export type AgentLaunchKind = AgentConfig["agent"];
+
+export type AgentClient = {
+  id: string;
+  provider_id: string;
+  label: string;
+  aliases: string[];
+  default_command: string;
+  command_names: string[];
+  capabilities?: {
+    launch?: boolean;
+    client_config?: boolean;
+    window_config?: boolean;
+    profile_config?: boolean;
+    agent_records?: boolean;
+    runtime_tags?: boolean;
+    work_presence?: boolean;
+  };
+};
+
+export type AgentClientList = {
+  agent_clients: AgentClient[];
+};
+
+export type AgentProfile = {
+  id: string;
+  name: string;
+  description: string | null;
+  default_agent_client: AgentLaunchKind;
+  agent_md: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AgentProfileList = {
+  profiles: AgentProfile[];
+};
 
 export type AgentConfigSelectionItem = {
   id: string;
@@ -340,6 +394,7 @@ export type AgentLaunchConfig = {
   command?: string | null;
   config?: AgentConfigSelection | null;
   template_id?: string | null;
+  profile_id?: string | null;
 };
 
 export type CommandHistoryItem = {

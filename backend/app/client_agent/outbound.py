@@ -153,8 +153,8 @@ class BulkUploadWriter:
             self._task = asyncio.create_task(self._run())
 
     async def send_terminal_output(self, message: AgentMessage) -> None:
-        if message.type != "terminal_output":
-            raise ValueError("BulkUploadWriter.send_terminal_output requires terminal_output messages")
+        if message.type not in {"terminal_output", "aux_terminal_output"}:
+            raise ValueError("BulkUploadWriter.send_terminal_output requires terminal output messages")
         if message.window_id is None:
             raise ValueError("terminal_output messages require window_id")
         for chunk in self._split_terminal_output(message):

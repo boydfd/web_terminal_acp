@@ -130,6 +130,9 @@ class CursorCliAdapter:
             return AgentChatProjection("agent", body, dedupe_key=f"{source}:assistant:{body}")
         return None
 
+    def is_completion(self, event: Event) -> bool:
+        return string_value(event.payload_json.get("role")) == "assistant" and _message_text(event.payload_json) is not None
+
     def summary_text(self, event: Event) -> str:
         return _message_text(event.payload_json) or json_text(event.payload_json)
 

@@ -18,6 +18,7 @@ describe("keyboardShortcuts", () => {
     expect(keyboardShortcutLabel(effectiveKeyboardShortcut("settings", {}))).toBe("Alt+,");
     expect(keyboardShortcutLabel(effectiveKeyboardShortcut("switch-terminal-global", {}))).toBe("Alt+Shift+W");
     expect(keyboardShortcutLabel(effectiveKeyboardShortcut("switch-client", {}))).toBe("Alt+Shift+C");
+    expect(keyboardShortcutLabel(effectiveKeyboardShortcut("toggle-aux-terminal", {}))).toBe("Alt+Shift+A");
 
     writeKeyboardShortcutBindings({ settings: { key: "s", ctrl: true } });
 

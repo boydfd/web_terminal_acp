@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable
@@ -12,12 +14,21 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+from app.agent_plugins import get_agent_plugin_registry
 from app.client_agent.agent_work_presence import (
     PRESENCE_SEND_INTERVAL_SECONDS,
     detect_agent_work_presence,
 )
 from app.client_agent.ai_events import ManagedAiEvent, managed_event_from_payload
-from app.client_agent.codex_watcher import iter_codex_session_files, read_new_codex_events
+from app.client_agent.antigravity_watcher import (
+    antigravity_session_id_from_transcript_path,
+    iter_antigravity_transcript_files,
+)
+from app.client_agent.codex_watcher import (
+    codex_sessions_dir,
+    iter_codex_session_files,
+    read_new_codex_events,
+)
 from app.client_agent.cursor_watcher import read_cursor_store_events
 from app.client_agent.terminal import ClientTerminalMultiplexer
 from app.client_agent.tmux_runtime import ClientTmuxRuntime
@@ -99,6 +110,116 @@ def iter_claude_code_transcript_files_for_session(window_id: UUID | str, session
     return sorted(path for path in root.rglob(f"{session_id}.jsonl") if path.is_file())
 
 
+def _global_codex_sessions_dir() -> Path:
+    return Path.home() / ".codex" / "sessions"
+
+
+def _global_claude_code_projects_dir() -> Path:
+    return Path.home() / ".claude" / "projects"
+
+
+def _relative_to(path: Path, root: Path) -> Path | None:
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        return None
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    with contextlib.suppress(OSError):
+        return left.samefile(right)
+    return False
+
+
+def _hardlink_file_to_global(source: Path, target: Path) -> None:
+    if target.exists() or target.is_symlink():
+        if not _same_file(source, target):
+            logger.debug(
+                "skipping agent session global hardlink because target already exists",
+                extra={"source_path": str(source), "target_path": str(target)},
+            )
+        return
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.link(source, target)
+    except FileExistsError:
+        return
+    except FileNotFoundError:
+        return
+    except OSError:
+        logger.warning(
+            "failed to hardlink agent session into global home",
+            exc_info=True,
+            extra={"source_path": str(source), "target_path": str(target)},
+        )
+
+
+def sync_codex_session_file_to_global(window_id: UUID | str, path: Path) -> None:
+    relative_path = _relative_to(path, codex_sessions_dir(window_id))
+    if relative_path is None:
+        return
+    _hardlink_file_to_global(path, _global_codex_sessions_dir() / relative_path)
+
+
+def sync_claude_code_transcript_file_to_global(window_id: UUID | str, path: Path) -> None:
+    relative_path = _relative_to(path, claude_code_projects_dir(window_id))
+    if relative_path is None:
+        return
+    _hardlink_file_to_global(path, _global_claude_code_projects_dir() / relative_path)
+
+
+def _claude_subagent_meta_path(path: Path) -> Path | None:
+    if path.parent.name != "subagents" or not path.name.startswith("agent-") or path.suffix != ".jsonl":
+        return None
+    return path.with_suffix(".meta.json")
+
+
+def _read_claude_subagent_meta(path: Path) -> dict[str, Any] | None:
+    meta_path = _claude_subagent_meta_path(path)
+    if meta_path is None or not meta_path.is_file():
+        return None
+    try:
+        parsed = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _subagent_id_from_path(path: Path) -> str | None:
+    if path.parent.name != "subagents" or not path.name.startswith("agent-") or path.suffix != ".jsonl":
+        return None
+    return path.stem.removeprefix("agent-") or None
+
+
+def _claude_subagent_result_index(window_id: UUID | str) -> dict[str, list[dict[str, str]]]:
+    root = claude_code_projects_dir(window_id)
+    if not root.exists():
+        return {}
+    matches: dict[str, list[dict[str, str]]] = {}
+    for meta_path in sorted(root.rglob("subagents/agent-*.meta.json")):
+        try:
+            parsed = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        tool_use_id = parsed.get("toolUseId")
+        if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+            continue
+        agent_id = meta_path.stem.removeprefix("agent-").removesuffix(".meta")
+        if not agent_id:
+            continue
+        matches.setdefault(tool_use_id.strip(), []).append(
+            {
+                "agent_id": agent_id,
+                "tool_use_id": tool_use_id.strip(),
+                "source_path": str(meta_path.with_name(f"agent-{agent_id}.jsonl")),
+            }
+        )
+    return matches
+
+
 def _initial_process_scan_delay(window_id: UUID, interval_seconds: float) -> float:
     if interval_seconds <= 0:
         return 0.0
@@ -124,19 +245,31 @@ class AgentToolWatcherState:
     cursor_seen_blob_ids: dict[Path, set[str]] = field(default_factory=dict)
     cursor_last_rowids: dict[Path, int] = field(default_factory=dict)
     cursor_discovery_started: bool = False
+    antigravity_offsets: dict[Path, int] = field(default_factory=dict)
+    antigravity_transcript_files: list[Path] = field(default_factory=list)
+    antigravity_transcript_files_refreshed_at: float = 0.0
+    antigravity_subagent_targets: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
-AGENT_TOOL_COLLECTORS: tuple[tuple[str, str], ...] = (
-    ("codex", "collect_codex_watch_events"),
-    ("claude_code", "collect_claude_code_watch_events"),
-    ("cursor_cli", "collect_cursor_watch_events"),
-)
+def _agent_tool_collectors() -> tuple[tuple[str, str], ...]:
+    collectors: list[tuple[str, str]] = []
+    for plugin in get_agent_plugin_registry().all():
+        collector_name = plugin.watch_collector_name
+        if collector_name is None:
+            continue
+        if not collector_name.isidentifier() or not callable(globals().get(collector_name)):
+            raise ValueError(
+                f"agent plugin {plugin.agent_client_id!r} has invalid watch collector {collector_name!r}"
+            )
+        collectors.append((plugin.provider_id, collector_name))
+    return tuple(collectors)
 
 
 @dataclass
 class AgentToolWatchWindow:
     window_id: UUID
     project_path: str | None
+    providers: frozenset[str] | None = None
     state: AgentToolWatcherState = field(default_factory=AgentToolWatcherState)
     initialized: bool = False
     sleep_seconds: float = AGENT_WATCH_IDLE_INTERVAL_SECONDS
@@ -176,10 +309,18 @@ class UnifiedAgentToolWatcher:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run())
 
-    def watch_window(self, window_id: UUID, project_path: str | None) -> None:
+    def watch_window(
+        self,
+        window_id: UUID,
+        project_path: str | None,
+        *,
+        providers: frozenset[str] | set[str] | None = None,
+    ) -> None:
+        provider_filter = _normalize_provider_filter(providers)
         existing = self._windows.get(window_id)
         if existing is not None:
             existing.project_path = project_path
+            existing.providers = provider_filter
             self._wakeup.set()
             return
 
@@ -187,6 +328,7 @@ class UnifiedAgentToolWatcher:
         self._windows[window_id] = AgentToolWatchWindow(
             window_id=window_id,
             project_path=project_path,
+            providers=provider_filter,
             next_event_scan_at=now,
             next_process_scan_at=now
             + _initial_process_scan_delay(window_id, self._process_scan_interval),
@@ -285,6 +427,7 @@ class UnifiedAgentToolWatcher:
                 client_id=self._client_id,
                 window_id=window_id,
                 project_path=window.project_path,
+                providers=window.providers,
             )
             if self._windows.get(window_id) is not window:
                 return
@@ -387,6 +530,17 @@ def initialize_agent_tool_watcher_state(state: AgentToolWatcherState, *, window_
         state.cursor_seen_blob_ids.setdefault(path, set())
     state.cursor_discovery_started = True
 
+    state.antigravity_transcript_files = iter_antigravity_transcript_files(window_id)
+    state.antigravity_transcript_files_refreshed_at = time.monotonic()
+    bootstrap_antigravity_path = _recent_latest_antigravity_transcript_file(
+        state.antigravity_transcript_files
+    )
+    for path in state.antigravity_transcript_files:
+        try:
+            state.antigravity_offsets[path] = 0 if path == bootstrap_antigravity_path else _jsonl_tail_resume_offset(path)
+        except FileNotFoundError:
+            state.antigravity_offsets.pop(path, None)
+
 
 def _recent_latest_codex_session_file(paths: list[Path]) -> Path | None:
     latest_path: Path | None = None
@@ -403,6 +557,10 @@ def _recent_latest_codex_session_file(paths: list[Path]) -> Path | None:
             latest_path = path
             latest_mtime = stat.st_mtime
     return latest_path
+
+
+def _recent_latest_antigravity_transcript_file(paths: list[Path]) -> Path | None:
+    return _recent_latest_codex_session_file(paths)
 
 
 def _jsonl_tail_resume_offset(path: Path) -> int:
@@ -462,6 +620,21 @@ def _cached_claude_code_jsonl_files(state: AgentToolWatcherState, window_id: UUI
         state.claude_code_jsonl_files = iter_claude_code_jsonl_files(window_id)
         state.claude_code_jsonl_files_refreshed_at = now
     return sorted({*state.claude_code_jsonl_files, *state.claude_code_history_jsonl_files})
+
+
+def _cached_antigravity_transcript_files(state: AgentToolWatcherState, window_id: UUID) -> list[Path]:
+    now = time.monotonic()
+    if state.antigravity_transcript_files_refreshed_at == 0.0 or (
+        now - state.antigravity_transcript_files_refreshed_at >= AGENT_WATCH_DISCOVERY_INTERVAL_SECONDS
+    ):
+        known_paths = set(state.antigravity_transcript_files)
+        for path in iter_antigravity_transcript_files(window_id):
+            if path not in known_paths:
+                state.antigravity_transcript_files.append(path)
+                state.antigravity_offsets.setdefault(path, 0)
+                known_paths.add(path)
+        state.antigravity_transcript_files_refreshed_at = now
+    return state.antigravity_transcript_files
 
 
 def _refresh_claude_code_history_sessions(state: AgentToolWatcherState, window_id: UUID) -> None:
@@ -563,6 +736,7 @@ def collect_codex_watch_events(
 ) -> list[ManagedAiEvent]:
     events: list[ManagedAiEvent] = []
     for path in _cached_codex_session_files(state, window_id):
+        sync_codex_session_file_to_global(window_id, path)
         offset = state.codex_offsets.get(path, 0)
         try:
             if offset > path.stat().st_size:
@@ -602,8 +776,12 @@ def collect_claude_code_watch_events(
     project_path: str | None,
 ) -> list[ManagedAiEvent]:
     _refresh_claude_code_history_sessions(state, window_id)
+    subagent_results_by_tool_use_id = _claude_subagent_result_index(window_id)
     events: list[ManagedAiEvent] = []
     for path in _cached_claude_code_jsonl_files(state, window_id):
+        sync_claude_code_transcript_file_to_global(window_id, path)
+        subagent_meta = _read_claude_subagent_meta(path)
+        path_subagent_id = _subagent_id_from_path(path)
         offset = state.claude_code_offsets.get(path, 0)
         try:
             if offset > path.stat().st_size:
@@ -617,6 +795,11 @@ def collect_claude_code_watch_events(
             payload.setdefault("WEB_TERMINAL_CLIENT_ID", str(client_id))
             payload.setdefault("WEB_TERMINAL_WINDOW_ID", str(window_id))
             payload.setdefault("WEB_TERMINAL_PROJECT_PATH", project_path or "")
+            if subagent_meta is not None:
+                payload.setdefault("subagent", subagent_meta)
+                payload.setdefault("agentId", path_subagent_id or subagent_meta.get("agentId") or subagent_meta.get("agent_id"))
+                payload.setdefault("isSidechain", True)
+            _attach_claude_subagent_call_matches(payload, subagent_results_by_tool_use_id)
             events.append(
                 ManagedAiEvent(
                     provider="claude_code",
@@ -630,6 +813,29 @@ def collect_claude_code_watch_events(
                 )
             )
     return events
+
+
+def _attach_claude_subagent_call_matches(
+    payload: dict[str, Any],
+    matches_by_tool_use_id: dict[str, list[dict[str, str]]],
+) -> None:
+    content = payload.get("message")
+    if isinstance(content, dict):
+        content = content.get("content")
+    if not isinstance(content, list):
+        return
+    matches: list[dict[str, str]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "tool_use" or block.get("name") != "Agent":
+            continue
+        tool_use_id = block.get("id")
+        if not isinstance(tool_use_id, str):
+            continue
+        matches.extend(matches_by_tool_use_id.get(tool_use_id, []))
+    if matches:
+        payload.setdefault("subagent_tool_use_results", matches)
 
 
 def read_new_jsonl_events(
@@ -727,6 +933,163 @@ def collect_cursor_watch_events(
     return events
 
 
+def _extract_conversation_id(content: str | None) -> str | None:
+    if not content:
+        return None
+    match = re.search(r'"conversationId"\s*:\s*"([^"]+)"', content)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _extract_antigravity_parent_message_sender(content: str | None) -> str | None:
+    if not content:
+        return None
+    match = re.search(r"\[Message\]\s+.*?\bsender=(\S+)\s+", content, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def collect_antigravity_watch_events(
+    state: AgentToolWatcherState,
+    *,
+    client_id: UUID,
+    window_id: UUID,
+    project_path: str | None,
+) -> list[ManagedAiEvent]:
+    # Pass 1: Read all new payloads and populate state.antigravity_subagent_targets
+    all_payloads: list[tuple[Path, str, list[tuple[dict[str, Any], int]], int]] = []
+    for path in _cached_antigravity_transcript_files(state, window_id):
+        offset = state.antigravity_offsets.get(path, 0)
+        try:
+            if offset > path.stat().st_size:
+                offset = 0
+            payloads, next_offset = read_new_jsonl_events(path, offset)
+        except FileNotFoundError:
+            state.antigravity_offsets.pop(path, None)
+            continue
+            
+        session_id = antigravity_session_id_from_transcript_path(path) or path.parent.parent.parent.name
+        
+        # Look for INVOKE_SUBAGENT events to populate targets
+        for payload, line_offset in payloads:
+            raw_type = payload.get("type")
+            step_index = payload.get("step_index")
+            if raw_type == "INVOKE_SUBAGENT" and isinstance(step_index, int):
+                content = payload.get("content")
+                subagent_id = _extract_conversation_id(content)
+                if subagent_id:
+                    tool_use_id = f"step-{step_index - 1}"
+                    state.antigravity_subagent_targets[subagent_id] = {
+                        "parent_session_id": session_id,
+                        "tool_use_id": tool_use_id,
+                        "agent_id": subagent_id,
+                        "source_path": str(path),
+                    }
+                    
+        all_payloads.append((path, session_id, payloads, next_offset))
+
+    # Pass 2: Process all payloads and build events
+    events: list[ManagedAiEvent] = []
+    for path, session_id, payloads, next_offset in all_payloads:
+        state.antigravity_offsets[path] = next_offset
+        
+        # Check if this session is a subagent session
+        is_subagent = session_id in state.antigravity_subagent_targets
+        subagent_meta = state.antigravity_subagent_targets.get(session_id)
+        
+        resolved_session_id = f"agent-{session_id}" if is_subagent else session_id
+        
+        # Construct a virtual subagent source path for subagent tree linking in the frontend
+        subagent_source_path = None
+        if is_subagent and subagent_meta:
+            subagent_source_path = f"/tmp/{subagent_meta['parent_session_id']}/subagents/agent-{session_id}.jsonl"
+
+        for payload, line_offset in payloads:
+            payload.setdefault("WEB_TERMINAL_CLIENT_ID", str(client_id))
+            payload.setdefault("WEB_TERMINAL_WINDOW_ID", str(window_id))
+            payload.setdefault("WEB_TERMINAL_PROJECT_PATH", project_path or "")
+            payload.setdefault("session_id", resolved_session_id)
+            payload.setdefault("source_path", subagent_source_path if is_subagent else str(path))
+            payload.setdefault("offset", line_offset)
+            payload["project_path"] = project_path
+
+            if is_subagent and subagent_meta:
+                payload.setdefault("subagent", {
+                    "toolUseId": subagent_meta["tool_use_id"],
+                    "tool_use_id": subagent_meta["tool_use_id"],
+                    "agentId": subagent_meta["agent_id"],
+                    "agent_id": subagent_meta["agent_id"],
+                })
+                payload.setdefault("agentId", subagent_meta["agent_id"])
+                payload.setdefault("sessionId", subagent_meta["parent_session_id"])
+                payload.setdefault("isSidechain", True)
+            else:
+                # If not a subagent, check if it's the invoke_subagent tool call to attach matches
+                tool_calls = payload.get("tool_calls")
+                step_index = payload.get("step_index")
+                if isinstance(tool_calls, list) and isinstance(step_index, int):
+                    has_invoke = any(
+                        isinstance(call, dict) and call.get("name") == "invoke_subagent"
+                        for call in tool_calls
+                    )
+                    if has_invoke:
+                        tool_use_id = f"step-{step_index}"
+                        # Look for target mapped to this tool call
+                        matches = []
+                        for sub_id, meta in state.antigravity_subagent_targets.items():
+                            if meta.get("tool_use_id") == tool_use_id and meta.get("parent_session_id") == session_id:
+                                matches.append({
+                                    "tool_use_id": tool_use_id,
+                                    "agent_id": sub_id,
+                                })
+                        if matches:
+                            payload.setdefault("subagent_tool_use_results", matches)
+                
+                # Check if it's the tool result INVOKE_SUBAGENT
+                raw_type = payload.get("type")
+                if raw_type == "INVOKE_SUBAGENT" and isinstance(step_index, int):
+                    tool_use_id = f"step-{step_index - 1}"
+                    # Find mapped subagent ID
+                    subagent_id = None
+                    for sub_id, meta in state.antigravity_subagent_targets.items():
+                        if meta.get("tool_use_id") == tool_use_id and meta.get("parent_session_id") == session_id:
+                            subagent_id = sub_id
+                            break
+                    if subagent_id:
+                        payload.setdefault("toolUseResult", {
+                            "agentId": subagent_id,
+                            "toolUseId": tool_use_id,
+                        })
+                elif raw_type == "SYSTEM_MESSAGE":
+                    subagent_id = _extract_antigravity_parent_message_sender(payload.get("content"))
+                    meta = state.antigravity_subagent_targets.get(subagent_id or "")
+                    if meta and meta.get("parent_session_id") == session_id:
+                        payload.setdefault("toolUseResult", {
+                            "agentId": subagent_id,
+                            "toolUseId": meta["tool_use_id"],
+                        })
+
+            events.append(
+                ManagedAiEvent(
+                    provider="antigravity_cli",
+                    client_id=client_id,
+                    window_id=window_id,
+                    source_path=subagent_source_path if is_subagent else str(path),
+                    offset=line_offset,
+                    cursor=line_offset,
+                    project_path=project_path,
+                    payload=payload,
+                )
+            )
+            
+    return events
+
+
+AGENT_TOOL_COLLECTORS: tuple[tuple[str, str], ...] = _agent_tool_collectors()
+
+
 async def watch_agent_tool_events(
     send_event: ManagedEventSender,
     client_id: UUID,
@@ -737,8 +1100,10 @@ async def watch_agent_tool_events(
     terminal: ClientTerminalMultiplexer | None = None,
     runtime: ClientTmuxRuntime | None = None,
     idle_supervisor: AgentIdleSupervisor | None = None,
+    providers: frozenset[str] | set[str] | None = None,
 ) -> None:
     state = AgentToolWatcherState()
+    provider_filter = _normalize_provider_filter(providers)
     sleep_seconds = AGENT_WATCH_IDLE_INTERVAL_SECONDS
     await _run_watcher_scan(initialize_agent_tool_watcher_state, state, window_id=window_id)
     process_scan_interval = max(PRESENCE_SEND_INTERVAL_SECONDS, AGENT_WATCH_PROCESS_SCAN_INTERVAL_SECONDS)
@@ -751,6 +1116,7 @@ async def watch_agent_tool_events(
             client_id=client_id,
             window_id=window_id,
             project_path=project_path,
+            providers=provider_filter,
         )
         sent_count = 0
         if idle_supervisor is not None and managed_events:
@@ -828,9 +1194,12 @@ def _collect_all_events(
     client_id: UUID,
     window_id: UUID,
     project_path: str | None,
+    providers: frozenset[str] | None = None,
 ) -> list[ManagedAiEvent]:
     events: list[ManagedAiEvent] = []
-    for _, collector_name in AGENT_TOOL_COLLECTORS:
+    for provider_id, collector_name in AGENT_TOOL_COLLECTORS:
+        if providers is not None and provider_id not in providers:
+            continue
         collector = globals()[collector_name]
         events.extend(
             collector(
@@ -841,6 +1210,16 @@ def _collect_all_events(
             )
         )
     return events
+
+
+def _normalize_provider_filter(providers: frozenset[str] | set[str] | None) -> frozenset[str] | None:
+    if providers is None:
+        return None
+    registry = get_agent_plugin_registry()
+    normalized: set[str] = set()
+    for provider in providers:
+        normalized.add(registry.by_provider(provider).provider_id)
+    return frozenset(normalized)
 
 
 async def enqueue_managed_ai_event(send_event: ManagedEventSender, event: ManagedAiEvent) -> bool:

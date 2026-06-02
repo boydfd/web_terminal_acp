@@ -8,7 +8,7 @@ WindowTitle = Annotated[str, StringConstraints(strip_whitespace=True, min_length
 WindowText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)]
 WindowTitleTag = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
 WindowStatusIn = Literal["ACTIVE", "ARCHIVED", "ERROR", "DISCONNECTED"]
-AgentKindIn = Literal["codex", "claude", "cursor"]
+AgentKindIn = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
 AgentConfigSectionKindIn = Literal["skills", "plugins", "hooks"]
 ClientName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 ClientStatusOut = Literal["ONLINE", "OFFLINE", "ERROR"]
@@ -145,6 +145,11 @@ class ClientWindowsActivityOut(BaseModel):
     windows: list[WindowActivityOut] = Field(default_factory=list)
 
 
+class TerminalProjectOut(BaseModel):
+    project_path: str
+    window_count: int
+
+
 class TerminalNotificationOut(BaseModel):
     id: str
     client_id: UUID
@@ -225,6 +230,7 @@ class AgentLaunchIn(BaseModel):
     command: WindowText | None = None
     config: AgentConfigSelectionIn | None = None
     template_id: str | None = None
+    profile_id: str | None = None
 
 
 class WindowCreateIn(BaseModel):
@@ -299,6 +305,11 @@ class AgentEventProjectionOut(BaseModel):
     body: str
     body_format: Literal["markdown", "json"] = "markdown"
     subtype: str | None = None
+    agent_message_type: Literal["agent", "subagent_call", "subagent_result"] | None = None
+    subagent_id: str | None = None
+    subagent_tool_use_id: str | None = None
+    target_session_id: UUID | None = None
+    target_session_source_id: str | None = None
 
 
 class AgentEventOut(BaseModel):
@@ -330,6 +341,11 @@ class AgentChatMessageOut(BaseModel):
     role: Literal["user", "agent"]
     body: str
     body_format: Literal["markdown", "json"] = "markdown"
+    agent_message_type: Literal["agent", "subagent_call", "subagent_result"] | None = None
+    subagent_id: str | None = None
+    subagent_tool_use_id: str | None = None
+    target_session_id: UUID | None = None
+    target_session_source_id: str | None = None
     created_at: datetime
 
 
@@ -337,6 +353,7 @@ class AgentChatRecordOut(BaseModel):
     window_id: UUID
     messages: list[AgentChatMessageOut]
     messages_total: int
+    messages_total_exact: bool = True
     messages_limit: int
     messages_offset: int
     messages_has_more: bool
@@ -362,6 +379,48 @@ class AgentConfigOut(BaseModel):
 
 class AgentConfigToggleIn(BaseModel):
     enabled: bool
+
+
+class AgentClientOut(BaseModel):
+    id: str
+    provider_id: str
+    label: str
+    aliases: list[str] = Field(default_factory=list)
+    default_command: str
+    command_names: list[str] = Field(default_factory=list)
+    capabilities: dict[str, bool] = Field(default_factory=dict)
+
+
+class AgentClientListOut(BaseModel):
+    agent_clients: list[AgentClientOut] = Field(default_factory=list)
+
+
+class AgentProfileOut(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    default_agent_client: AgentKindIn
+    agent_md: str = ""
+    created_at: str
+    updated_at: str
+
+
+class AgentProfileListOut(BaseModel):
+    profiles: list[AgentProfileOut] = Field(default_factory=list)
+
+
+class AgentProfileCreateIn(BaseModel):
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
+    description: Annotated[str, StringConstraints(max_length=500)] | None = None
+    default_agent_client: AgentKindIn = "codex"
+    source_agent_client: AgentKindIn | None = None
+
+
+class AgentProfileUpdateIn(BaseModel):
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)] | None = None
+    description: Annotated[str, StringConstraints(max_length=500)] | None = None
+    default_agent_client: AgentKindIn | None = None
+    agent_md: Annotated[str, StringConstraints(max_length=65536)] | None = None
 
 
 class CommandHistoryItemOut(BaseModel):

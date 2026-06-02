@@ -15,7 +15,9 @@ from app.auth import AuthMiddleware
 from app.db import SessionLocal
 from app.repositories.clients import ensure_local_client
 from app.routers import (
+    agent_profiles,
     auth,
+    aux_terminal,
     client_agent,
     clients,
     folders,
@@ -130,6 +132,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth.router)
+app.include_router(agent_profiles.router)
+app.include_router(aux_terminal.router)
 app.include_router(client_agent.router)
 app.include_router(clients.router)
 app.include_router(folders.router)

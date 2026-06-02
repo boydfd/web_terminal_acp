@@ -7,6 +7,7 @@ import pytest
 import app.client_agent.runner as client_agent_runner
 from app.client_agent.config import ClientAgentConfig
 from app.services.agent_config import AgentConfig, AgentConfigItem, AgentConfigSection
+from app.services.agent_profiles import AgentProfile
 from app.client_agent.runner import _handle_agent_message, _should_restore_agent_tool_watcher
 from app.client_agent.tmux_runtime import ClientRuntimeWindow
 from app.services.runtime.protocol import AgentMessage
@@ -36,6 +37,7 @@ async def handle_message_for_test(
         terminal,
         supervisor,
         watcher,
+        FakeAuxTerminal(),
         attach_snapshot_tasks,
         set(),
         asyncio.Semaphore(1),
@@ -69,6 +71,75 @@ def test_should_restore_agent_tool_watcher_requires_managed_marker() -> None:
             managed_agent_tools=True,
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_aux_terminal_attach_sends_aux_output_message() -> None:
+    writer = FakeWriter()
+    bulk_writer = FakeBulkWriter()
+    aux_terminal = FakeAuxTerminal()
+
+    await _handle_agent_message(
+        writer,
+        bulk_writer,
+        object(),
+        FakeRuntime(),
+        FakeTerminal([]),
+        FakeIdleSupervisor([]),
+        FakeAgentToolWatcher([]),
+        aux_terminal,
+        {},
+        set(),
+        asyncio.Semaphore(1),
+        {},
+        AgentMessage(
+            type="aux_terminal_attach",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            request_id="request-aux",
+            payload={
+                "aux_terminal_id": "aux-1",
+                "view_id": str(VIEW_ID),
+            },
+        ),
+    )
+
+    senders = [call for call in aux_terminal.calls if call[0] == "attach"]
+    assert senders == [("attach", "aux-1")]
+    attach_sender = aux_terminal.attach_sender
+    await attach_sender(b"aux output\n")
+
+    assert writer.messages[-1].type == "aux_terminal_attach_result"
+    assert bulk_writer.terminal_messages[-1].type == "aux_terminal_output"
+    assert bulk_writer.terminal_messages[-1].payload["view_id"] == str(VIEW_ID)
+
+
+@pytest.mark.asyncio
+async def test_aux_terminal_kill_removes_aux_target() -> None:
+    aux_terminal = FakeAuxTerminal()
+
+    await _handle_agent_message(
+        FakeWriter(),
+        FakeBulkWriter(),
+        object(),
+        FakeRuntime(),
+        FakeTerminal([]),
+        FakeIdleSupervisor([]),
+        FakeAgentToolWatcher([]),
+        aux_terminal,
+        {},
+        set(),
+        asyncio.Semaphore(1),
+        {},
+        AgentMessage(
+            type="aux_terminal_kill",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            payload={"aux_terminal_id": "aux-1"},
+        ),
+    )
+
+    assert aux_terminal.calls == [("kill", "aux-1")]
 
 
 @pytest.mark.asyncio
@@ -223,6 +294,32 @@ async def test_create_window_registers_existing_unified_agent_tool_watcher() -> 
 
 
 @pytest.mark.asyncio
+async def test_create_window_scopes_agent_tool_watcher_to_detected_provider() -> None:
+    watcher = FakeAgentToolWatcher([])
+
+    await handle_message_for_test(
+        FakeWriter(),
+        FakeBulkWriter(),
+        object(),
+        FakeRuntime([]),
+        FakeTerminal([]),
+        FakeIdleSupervisor([]),
+        watcher,
+        {},
+        {},
+        AgentMessage(
+            type="create_window",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            request_id="request-1",
+            payload={"cwd": "/workspace/project", "shell_command": "env FOO=1 cursor-agent"},
+        ),
+    )
+
+    assert watcher.watched == [(WINDOW_ID, "/workspace/project", frozenset({"cursor_cli"}))]
+
+
+@pytest.mark.asyncio
 async def test_create_window_can_run_in_background_without_blocking_control_messages() -> None:
     create_started = asyncio.Event()
     create_continue = asyncio.Event()
@@ -238,6 +335,7 @@ async def test_create_window_can_run_in_background_without_blocking_control_mess
         FakeTerminal(calls),
         FakeIdleSupervisor(calls),
         FakeAgentToolWatcher(calls),
+        FakeAuxTerminal(),
         {},
         set(),
         asyncio.Semaphore(1),
@@ -261,6 +359,7 @@ async def test_create_window_can_run_in_background_without_blocking_control_mess
         FakeTerminal(calls),
         FakeIdleSupervisor(calls),
         FakeAgentToolWatcher(calls),
+        FakeAuxTerminal(),
         {},
         set(),
         asyncio.Semaphore(1),
@@ -334,6 +433,49 @@ async def test_create_window_applies_agent_config_selection(monkeypatch: pytest.
 
     assert calls[:2] == ["apply_config", "create_window"]
     assert applied == [("codex", str(WINDOW_ID))]
+
+
+@pytest.mark.asyncio
+async def test_create_window_materializes_agent_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    materialized: list[tuple[str, str, str]] = []
+
+    def fake_materialize(profile_id, agent, *, window_id, home=None):
+        materialized.append((profile_id, agent, window_id))
+        calls.append("materialize_profile")
+        return AgentConfig(agent="codex", sections=[])
+
+    monkeypatch.setattr(
+        "app.client_agent.runner.agent_profile_service.materialize_agent_profile_for_window",
+        fake_materialize,
+    )
+
+    await handle_message_for_test(
+        FakeWriter(),
+        FakeBulkWriter(),
+        object(),
+        FakeRuntime(calls),
+        FakeTerminal(calls),
+        FakeIdleSupervisor(calls),
+        FakeAgentToolWatcher(calls),
+        {},
+        {},
+        AgentMessage(
+            type="create_window",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            request_id="request-1",
+            payload={
+                "cwd": "/workspace/project",
+                "shell_command": "codex",
+                "agent_profile_id": "builder",
+                "agent_profile_agent": "codex",
+            },
+        ),
+    )
+
+    assert calls[:2] == ["materialize_profile", "create_window"]
+    assert materialized == [("builder", "codex", str(WINDOW_ID))]
 
 
 @pytest.mark.asyncio
@@ -575,7 +717,6 @@ async def test_agent_config_get_returns_serialized_config(monkeypatch: pytest.Mo
         AgentMessage(
             type="agent_config_get",
             client_id=UUID("12345678-1234-5678-1234-567812345678"),
-            window_id=WINDOW_ID,
             request_id="request-1",
             payload={"agent": "codex"},
         ),
@@ -584,6 +725,200 @@ async def test_agent_config_get_returns_serialized_config(monkeypatch: pytest.Mo
     assert writer.messages[-1].type == "agent_config_result"
     assert writer.messages[-1].payload["agent"] == "codex"
     assert writer.messages[-1].payload["sections"][0]["items"][0]["id"] == "docker"
+
+
+@pytest.mark.asyncio
+async def test_agent_clients_list_returns_serialized_descriptors() -> None:
+    writer = FakeWriter()
+
+    await handle_message_for_test(
+        writer,
+        FakeBulkWriter(),
+        object(),
+        FakeRuntime(),
+        FakeTerminal([]),
+        FakeIdleSupervisor([]),
+        FakeAgentToolWatcher([]),
+        {},
+        {},
+        AgentMessage(
+            type="agent_clients_list",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            request_id="request-1",
+            payload={},
+        ),
+    )
+
+    assert writer.messages[-1].type == "agent_client_result"
+    clients = {client["id"]: client for client in writer.messages[-1].payload["agent_clients"]}
+    assert clients["codex"]["provider_id"] == "codex"
+    assert clients["codex"]["capabilities"]["agent_records"] is True
+    assert clients["cursor"]["command_names"] == ["agent", "cursor", "cursor-agent"]
+
+
+@pytest.mark.asyncio
+async def test_agent_profile_list_returns_serialized_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    writer = FakeWriter()
+
+    def fake_list_agent_profiles():
+        return [
+            AgentProfile(
+                id="builder",
+                name="Builder",
+                description=None,
+                default_agent_client="codex",
+                agent_md="Rules",
+                created_at="2026-01-01T00:00:00+00:00",
+                updated_at="2026-01-01T00:00:00+00:00",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "app.client_agent.runner.agent_profile_service.list_agent_profiles",
+        fake_list_agent_profiles,
+    )
+
+    await handle_message_for_test(
+        writer,
+        FakeBulkWriter(),
+        object(),
+        FakeRuntime(),
+        FakeTerminal([]),
+        FakeIdleSupervisor([]),
+        FakeAgentToolWatcher([]),
+        {},
+        {},
+        AgentMessage(
+            type="agent_profile_list",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            request_id="request-1",
+            payload={},
+        ),
+    )
+
+    assert writer.messages[-1].type == "agent_profile_result"
+    assert writer.messages[-1].payload["profiles"][0]["id"] == "builder"
+
+
+@pytest.mark.asyncio
+async def test_agent_config_get_uses_window_managed_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    writer = FakeWriter()
+    captured: list[tuple[str, str]] = []
+
+    def fail_list_agent_config(*args, **kwargs):
+        raise AssertionError("window config must not read the global agent home")
+
+    def fake_list_window_agent_config(agent: str, *, window_id: str, home=None):
+        captured.append((agent, window_id))
+        return AgentConfig(
+            agent="codex",
+            sections=[
+                AgentConfigSection(
+                    id="skills",
+                    name="Skills",
+                    items=[AgentConfigItem(id="docker", name="docker", enabled=False)],
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "app.client_agent.runner.agent_config_service.list_agent_config",
+        fail_list_agent_config,
+    )
+    monkeypatch.setattr(
+        "app.client_agent.runner.agent_config_service.list_window_agent_config",
+        fake_list_window_agent_config,
+        raising=False,
+    )
+
+    await handle_message_for_test(
+        writer,
+        FakeBulkWriter(),
+        object(),
+        FakeRuntime(),
+        FakeTerminal([]),
+        FakeIdleSupervisor([]),
+        FakeAgentToolWatcher([]),
+        {},
+        {},
+        AgentMessage(
+            type="agent_config_get",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            request_id="request-1",
+            payload={"agent": "codex"},
+        ),
+    )
+
+    assert captured == [("codex", str(WINDOW_ID))]
+    assert writer.messages[-1].payload["sections"][0]["items"][0]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_config_set_enabled_uses_window_managed_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    writer = FakeWriter()
+    captured: list[tuple[str, str, str, bool, str]] = []
+
+    def fail_set_agent_config_item_enabled(*args, **kwargs):
+        raise AssertionError("window config must not write the global agent home")
+
+    def fake_set_window_agent_config_item_enabled(
+        agent: str,
+        section_id: str,
+        item_id: str,
+        enabled: bool,
+        *,
+        window_id: str,
+        home=None,
+    ):
+        captured.append((agent, section_id, item_id, enabled, window_id))
+        return AgentConfig(
+            agent="codex",
+            sections=[
+                AgentConfigSection(
+                    id="skills",
+                    name="Skills",
+                    items=[AgentConfigItem(id=item_id, name=item_id, enabled=enabled)],
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "app.client_agent.runner.agent_config_service.set_agent_config_item_enabled",
+        fail_set_agent_config_item_enabled,
+    )
+    monkeypatch.setattr(
+        "app.client_agent.runner.agent_config_service.set_window_agent_config_item_enabled",
+        fake_set_window_agent_config_item_enabled,
+        raising=False,
+    )
+
+    await handle_message_for_test(
+        writer,
+        FakeBulkWriter(),
+        object(),
+        FakeRuntime(),
+        FakeTerminal([]),
+        FakeIdleSupervisor([]),
+        FakeAgentToolWatcher([]),
+        {},
+        {},
+        AgentMessage(
+            type="agent_config_set_enabled",
+            client_id=UUID("12345678-1234-5678-1234-567812345678"),
+            window_id=WINDOW_ID,
+            request_id="request-1",
+            payload={
+                "agent": "codex",
+                "section_id": "skills",
+                "item_id": "docker",
+                "enabled": False,
+            },
+        ),
+    )
+
+    assert captured == [("codex", "skills", "docker", False, str(WINDOW_ID))]
+    assert writer.messages[-1].payload["sections"][0]["items"][0]["enabled"] is False
 
 
 class FakeWriter:
@@ -595,7 +930,11 @@ class FakeWriter:
 
 
 class FakeBulkWriter:
+    def __init__(self) -> None:
+        self.terminal_messages: list[AgentMessage] = []
+
     async def send_terminal_output(self, message: AgentMessage) -> None:
+        self.terminal_messages.append(message)
         return None
 
     async def send_ai_event(self, message: AgentMessage) -> None:
@@ -720,13 +1059,56 @@ class FakeIdleSupervisor:
 class FakeAgentToolWatcher:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
-        self.watched: list[tuple[UUID, str | None]] = []
+        self.watched: list[tuple[UUID, str | None] | tuple[UUID, str | None, frozenset[str] | None]] = []
         self.removed: list[UUID] = []
 
-    def watch_window(self, window_id: UUID, project_path: str | None) -> None:
+    def watch_window(
+        self,
+        window_id: UUID,
+        project_path: str | None,
+        *,
+        providers: frozenset[str] | None = None,
+    ) -> None:
         self.calls.append("watch_window")
-        self.watched.append((window_id, project_path))
+        if providers is None:
+            self.watched.append((window_id, project_path))
+        else:
+            self.watched.append((window_id, project_path, providers))
 
     def remove_window(self, window_id: UUID) -> None:
         self.calls.append("unwatch_window")
         self.removed.append(window_id)
+
+
+class FakeAuxTerminal:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+        self.attach_sender = None
+
+    async def ensure_terminal(self, aux_terminal_id: str, *, cwd=None, shell_command=None):
+        self.calls.append(("ensure_terminal", aux_terminal_id))
+        return type(
+            "AuxTarget",
+            (),
+            {
+                "aux_terminal_id": aux_terminal_id,
+                "cwd": cwd,
+                "shell_command": shell_command,
+            },
+        )()
+
+    async def attach(self, aux_terminal_id: str, sender, *, view_id) -> None:
+        self.calls.append(("attach", aux_terminal_id))
+        self.attach_sender = sender
+
+    async def detach(self, aux_terminal_id: str, *, view_id) -> None:
+        self.calls.append(("detach", aux_terminal_id))
+
+    async def send_input(self, aux_terminal_id: str, data: bytes, *, view_id) -> None:
+        self.calls.append(("send_input", data))
+
+    async def resize(self, aux_terminal_id: str, *, cols: int, rows: int, view_id) -> None:
+        self.calls.append(("resize", (cols, rows)))
+
+    async def kill(self, aux_terminal_id: str) -> None:
+        self.calls.append(("kill", aux_terminal_id))

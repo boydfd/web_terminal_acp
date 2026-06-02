@@ -40,6 +40,8 @@ class RemoteRuntime:
         *,
         window_id: UUID | None = None,
         agent_config_selection: dict[str, object] | None = None,
+        agent_profile_id: str | None = None,
+        agent_profile_agent: str | None = None,
     ) -> RuntimeWindow:
         if window_id is None:
             raise ValueError("remote runtime create_window requires window_id")
@@ -48,6 +50,10 @@ class RemoteRuntime:
         payload: dict[str, object] = {"cwd": cwd, "shell_command": shell_command}
         if agent_config_selection is not None:
             payload["agent_config_selection"] = agent_config_selection
+        if agent_profile_id is not None:
+            payload["agent_profile_id"] = agent_profile_id
+        if agent_profile_agent is not None:
+            payload["agent_profile_agent"] = agent_profile_agent
         request = AgentMessage(
             type="create_window",
             client_id=self._client_id,
@@ -157,6 +163,96 @@ class RemoteRuntime:
         )
         return dict(response.payload)
 
+    async def get_agent_profile_config(self, *, profile_id: str, agent: str) -> dict[str, object]:
+        response = await self._request_agent_config(
+            AgentMessage(
+                type="agent_profile_config_get",
+                client_id=self._client_id,
+                request_id=str(uuid4()),
+                payload={"profile_id": profile_id, "agent": agent},
+            )
+        )
+        return dict(response.payload)
+
+    async def list_agent_profiles(self) -> dict[str, object]:
+        response = await self._request_agent_profile(
+            AgentMessage(
+                type="agent_profile_list",
+                client_id=self._client_id,
+                request_id=str(uuid4()),
+                payload={},
+            )
+        )
+        return dict(response.payload)
+
+    async def list_agent_clients(self) -> dict[str, object]:
+        response = await self._request_agent_client(
+            AgentMessage(
+                type="agent_clients_list",
+                client_id=self._client_id,
+                request_id=str(uuid4()),
+                payload={},
+            )
+        )
+        return dict(response.payload)
+
+    async def create_agent_profile(self, payload: dict[str, object]) -> dict[str, object]:
+        response = await self._request_agent_profile(
+            AgentMessage(
+                type="agent_profile_create",
+                client_id=self._client_id,
+                request_id=str(uuid4()),
+                payload=payload,
+            )
+        )
+        return dict(response.payload)
+
+    async def update_agent_profile(self, profile_id: str, payload: dict[str, object]) -> dict[str, object]:
+        response = await self._request_agent_profile(
+            AgentMessage(
+                type="agent_profile_update",
+                client_id=self._client_id,
+                request_id=str(uuid4()),
+                payload={"profile_id": profile_id, **payload},
+            )
+        )
+        return dict(response.payload)
+
+    async def delete_agent_profile(self, profile_id: str) -> None:
+        await self._request_agent_profile(
+            AgentMessage(
+                type="agent_profile_delete",
+                client_id=self._client_id,
+                request_id=str(uuid4()),
+                payload={"profile_id": profile_id},
+            )
+        )
+
+    async def set_agent_profile_config_enabled(
+        self,
+        *,
+        profile_id: str,
+        agent: str,
+        section_id: str,
+        item_id: str,
+        enabled: bool,
+    ) -> dict[str, object]:
+        response = await self._request_agent_profile(
+            AgentMessage(
+                type="agent_profile_config_set_enabled",
+                client_id=self._client_id,
+                request_id=str(uuid4()),
+                payload={
+                    "profile_id": profile_id,
+                    "agent": agent,
+                    "section_id": section_id,
+                    "item_id": item_id,
+                    "enabled": enabled,
+                },
+            )
+        )
+        return dict(response.payload)
+
     async def set_agent_config_enabled(
         self,
         *,
@@ -199,6 +295,44 @@ class RemoteRuntime:
             raise RemoteTerminalError(_message_from_error_response(response))
         if response.type != "agent_config_result":
             raise RemoteTerminalError(f"unexpected agent config response: {response.type}")
+        return response
+
+    async def _request_agent_profile(self, request: AgentMessage) -> AgentMessage:
+        try:
+            response = await self._connection().request(request, timeout=self._request_timeout)
+        except ClientConnectionClosed as exc:
+            raise RemoteClientUnavailable(
+                f"remote client unavailable: {self._client_id}",
+                reason="connection_closed",
+            ) from exc
+        except asyncio.TimeoutError as exc:
+            raise RemoteClientUnavailable(
+                f"remote client unavailable: {self._client_id}",
+                reason="request_timeout",
+            ) from exc
+        if response.type == "terminal_error":
+            raise RemoteTerminalError(_message_from_error_response(response))
+        if response.type not in {"agent_profile_result", "agent_config_result"}:
+            raise RemoteTerminalError(f"unexpected agent profile response: {response.type}")
+        return response
+
+    async def _request_agent_client(self, request: AgentMessage) -> AgentMessage:
+        try:
+            response = await self._connection().request(request, timeout=self._request_timeout)
+        except ClientConnectionClosed as exc:
+            raise RemoteClientUnavailable(
+                f"remote client unavailable: {self._client_id}",
+                reason="connection_closed",
+            ) from exc
+        except asyncio.TimeoutError as exc:
+            raise RemoteClientUnavailable(
+                f"remote client unavailable: {self._client_id}",
+                reason="request_timeout",
+            ) from exc
+        if response.type == "terminal_error":
+            raise RemoteTerminalError(_message_from_error_response(response))
+        if response.type != "agent_client_result":
+            raise RemoteTerminalError(f"unexpected agent client response: {response.type}")
         return response
 
     async def detach(

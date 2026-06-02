@@ -1,6 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Ref } from "react";
+import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
+import remarkBreaks from "remark-breaks";
+import remarkGfm from "remark-gfm";
 
 import type {
+  AgentChatMessage,
   AgentChatRecord,
   AgentChatRoleFilter,
   AgentEventProjection,
@@ -23,12 +27,23 @@ type EventTone =
   | "reasoning"
   | "tool-call"
   | "tool-result"
-  | "subagent"
+  | "subagent-call"
+  | "subagent-result"
+  | "subagent-context"
   | "lifecycle"
   | "event";
 type BodyFormat = "markdown" | "json";
-type EventView = { tone: EventTone; label: string; body: string; subtype: string | null; bodyFormat?: BodyFormat };
+type EventView = {
+  tone: EventTone;
+  label: string;
+  body: string;
+  subtype: string | null;
+  bodyFormat?: BodyFormat;
+  targetSessionId?: string | null;
+};
 type AgentNode = { id: string; label: string; meta: string; children: AgentNode[] };
+type AgentRecordJumpRequest = { sessionId: string; originMessageId?: string };
+type AgentRecordPageOffset = { chatOffset?: number; detailOffset?: number };
 type AgentRecordViewProps = {
   mode: AgentRecordDisplayMode;
   chatRoleFilter: AgentChatRoleFilter;
@@ -40,7 +55,9 @@ type AgentRecordViewProps = {
   isFetching?: boolean;
   onModeChange: (mode: AgentRecordDisplayMode) => void;
   onChatRoleFilterChange: (role: AgentChatRoleFilter) => void;
-  onSessionChange?: (sessionId: string) => void;
+  jumpRequest?: AgentRecordJumpRequest | null;
+  onOpenSubagent?: (sessionId: string, originMessageId?: string) => void;
+  onSessionChange?: (sessionId: string | null, pageOffset?: AgentRecordPageOffset) => void;
   onPreviousPage?: () => void;
   onNextPage?: () => void;
 };
@@ -64,6 +81,7 @@ type PageInfo = {
   offset: number;
   count: number;
   hasMore: boolean;
+  totalExact?: boolean;
   noun: string;
 };
 
@@ -78,7 +96,9 @@ const EVENT_LABELS: Record<EventTone, string> = {
   reasoning: "Agent reasoning",
   "tool-call": "Tool call",
   "tool-result": "Tool response",
-  subagent: "Subagent call",
+  "subagent-call": "Subagent call",
+  "subagent-result": "Subagent result",
+  "subagent-context": "Subagent context",
   lifecycle: "Lifecycle",
   event: "Event"
 };
@@ -86,7 +106,9 @@ const EVENT_LABELS: Record<EventTone, string> = {
 const CHAT_ROLE_FILTER_LABELS: Record<AgentChatRoleFilter, string> = {
   all: "All",
   user: "User",
-  agent: "Agent"
+  agent: "Agent",
+  subagent_call: "Subagent call",
+  subagent_result: "Subagent result"
 };
 
 function json(value: unknown): string {
@@ -107,7 +129,8 @@ function projectionView(projection: AgentEventProjection): EventView {
     label: projection.label,
     body: projection.body,
     subtype: projection.subtype,
-    bodyFormat: projection.body_format
+    bodyFormat: projection.body_format,
+    targetSessionId: projection.target_session_id
   };
 }
 
@@ -122,119 +145,39 @@ function eventView(event: AgentRecordEvent): EventView {
   };
 }
 
-function isBlockStart(line: string): boolean {
-  return /^(```|#{1,6}\s|[-*+]\s+|\d+[.)]\s+|>\s?)/.test(line);
-}
-
-function safeHref(value: string): string | null {
-  return /^(https?:|mailto:)/i.test(value) ? value : null;
-}
-
-function inlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
-  const nodes: ReactNode[] = [];
-  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
-  let cursor = 0;
-  for (const match of text.matchAll(pattern)) {
-    const value = match[0];
-    const index = match.index ?? 0;
-    if (index > cursor) nodes.push(text.slice(cursor, index));
-    const key = `${keyPrefix}-${index}`;
-    if (value.startsWith("`")) {
-      nodes.push(<code key={key}>{value.slice(1, -1)}</code>);
-    } else if (value.startsWith("**")) {
-      nodes.push(<strong key={key}>{inlineMarkdown(value.slice(2, -2), `${key}-strong`)}</strong>);
-    } else if (value.startsWith("*")) {
-      nodes.push(<em key={key}>{inlineMarkdown(value.slice(1, -1), `${key}-em`)}</em>);
-    } else {
-      const link = value.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-      const href = link ? safeHref(link[2]) : null;
-      nodes.push(href ? <a key={key} href={href} target="_blank" rel="noreferrer">{link?.[1]}</a> : value);
+const markdownComponents: Components = {
+  a({ node: _node, href, children, ...props }) {
+    if (!href) {
+      return <span className="agent-event-markdown-link-text">{children}</span>;
     }
-    cursor = index + value.length;
+    return <a {...props} href={href} target="_blank" rel="noreferrer">{children}</a>;
+  },
+  img({ node: _node, alt, ...props }) {
+    return <img {...props} alt={alt ?? ""} loading="lazy" decoding="async" />;
+  },
+  table({ node: _node, children, ...props }) {
+    return (
+      <div className="agent-event-markdown-table-wrap">
+        <table {...props}>{children}</table>
+      </div>
+    );
   }
-  if (cursor < text.length) nodes.push(text.slice(cursor));
-  return nodes;
-}
+};
 
-function inlineWithBreaks(text: string, keyPrefix: string): ReactNode[] {
-  return text.split("\n").flatMap((line, index) => {
-    const nodes = inlineMarkdown(line, `${keyPrefix}-${index}`);
-    return index === 0 ? nodes : [<br key={`${keyPrefix}-br-${index}`} />, ...nodes];
-  });
-}
+const markdownUrlTransform: UrlTransform = (url) => defaultUrlTransform(url) || undefined;
 
 function MarkdownText({ text }: { text: string }) {
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
-  const blocksOut: ReactNode[] = [];
-  let index = 0;
-  let key = 0;
-
-  while (index < lines.length) {
-    const line = lines[index];
-    if (!line.trim()) {
-      index += 1;
-      continue;
-    }
-
-    const fence = line.match(/^```(\w+)?\s*$/);
-    if (fence) {
-      const lang = fence[1];
-      const code: string[] = [];
-      index += 1;
-      while (index < lines.length && !lines[index].startsWith("```")) {
-        code.push(lines[index]);
-        index += 1;
-      }
-      if (index < lines.length) index += 1;
-      blocksOut.push(<pre key={key++}><code className={lang ? `language-${lang}` : undefined}>{code.join("\n")}</code></pre>);
-      continue;
-    }
-
-    const heading = line.match(/^(#{1,6})\s+(.+)$/);
-    if (heading) {
-      const level = heading[1].length;
-      const children = inlineMarkdown(heading[2], `h-${key}`);
-      const Tag = `h${level}` as keyof JSX.IntrinsicElements;
-      blocksOut.push(<Tag key={key++}>{children}</Tag>);
-      index += 1;
-      continue;
-    }
-
-    const list = line.match(/^([-*+]|\d+[.)])\s+(.+)$/);
-    if (list) {
-      const ordered = /^\d/.test(list[1]);
-      const items: string[] = [];
-      while (index < lines.length) {
-        const item = lines[index].match(/^([-*+]|\d+[.)])\s+(.+)$/);
-        if (!item || /^\d/.test(item[1]) !== ordered) break;
-        items.push(item[2]);
-        index += 1;
-      }
-      const children = items.map((item, itemIndex) => <li key={itemIndex}>{inlineWithBreaks(item, `li-${key}-${itemIndex}`)}</li>);
-      blocksOut.push(ordered ? <ol key={key++}>{children}</ol> : <ul key={key++}>{children}</ul>);
-      continue;
-    }
-
-    if (/^>\s?/.test(line)) {
-      const quote: string[] = [];
-      while (index < lines.length && /^>\s?/.test(lines[index])) {
-        quote.push(lines[index].replace(/^>\s?/, ""));
-        index += 1;
-      }
-      blocksOut.push(<blockquote key={key++}>{inlineWithBreaks(quote.join("\n"), `quote-${key}`)}</blockquote>);
-      continue;
-    }
-
-    const paragraph: string[] = [line];
-    index += 1;
-    while (index < lines.length && lines[index].trim() && !isBlockStart(lines[index])) {
-      paragraph.push(lines[index]);
-      index += 1;
-    }
-    blocksOut.push(<p key={key++}>{inlineWithBreaks(paragraph.join("\n"), `p-${key}`)}</p>);
-  }
-
-  return <div className="agent-event-markdown">{blocksOut}</div>;
+  return (
+    <div className="agent-event-markdown">
+      <ReactMarkdown
+        components={markdownComponents}
+        remarkPlugins={[remarkGfm, remarkBreaks]}
+        urlTransform={markdownUrlTransform}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
 }
 
 function formatDateTime(value: string): string {
@@ -252,57 +195,58 @@ function sessionLabel(session: AgentSession): string {
   return session.title ?? tail(session.source_path) ?? session.source_id;
 }
 
-function sessionTimestamp(session: AgentSession): number {
-  const updated = Date.parse(session.updated_at);
-  if (!Number.isNaN(updated)) {
-    return updated;
-  }
+function sessionCreatedTimestamp(session: AgentSession): number {
   const created = Date.parse(session.created_at);
   return Number.isNaN(created) ? 0 : created;
 }
 
-export function sortSessionsNewestFirst(sessions: AgentSession[]): AgentSession[] {
+export function sortSessionsByCreation(sessions: AgentSession[]): AgentSession[] {
   return [...sessions].sort((left, right) => {
-    const delta = sessionTimestamp(right) - sessionTimestamp(left);
+    const delta = sessionCreatedTimestamp(left) - sessionCreatedTimestamp(right);
     if (delta !== 0) {
       return delta;
     }
-    return right.id.localeCompare(left.id);
+    return left.id.localeCompare(right.id);
   });
 }
 
-export function pickLatestSessionId(sessions: AgentSession[]): string | null {
-  return sortSessionsNewestFirst(sessions)[0]?.id ?? null;
+export function pickInitialSessionId(sessions: AgentSession[]): string | null {
+  return sortSessionsByCreation(sessions)[0]?.id ?? null;
 }
 
-function filterDetailRecordBySession(record: AgentRecord, sessionId: string | null): AgentRecord {
-  if (sessionId === null) {
-    return record;
+function defaultAgentMessageType(message: AgentChatMessage): "user" | "agent" | "subagent_call" | "subagent_result" {
+  if (message.agent_message_type === "subagent_call" || message.agent_message_type === "subagent_result") {
+    return message.agent_message_type;
   }
-  return {
-    ...record,
-    sessions: record.sessions.filter((session) => session.id === sessionId),
-    events: record.events.filter((event) => event.ai_session_id === sessionId)
-  };
+  return message.role;
 }
 
-function filterChatRecordBySession(record: AgentChatRecord, sessionId: string | null): AgentChatRecord {
-  if (sessionId === null) {
-    return record;
+function chatSpeakerLabel(message: AgentChatMessage): string {
+  switch (defaultAgentMessageType(message)) {
+    case "subagent_call":
+      return "Main Agent -> Subagent";
+    case "subagent_result":
+      return "Subagent -> Agent";
+    case "agent":
+      return "Agent";
+    case "user":
+      return "User";
   }
-  const messages = record.messages.filter((message) => message.ai_session_id === sessionId);
-  return {
-    ...record,
-    messages,
-    messages_total: messages.length,
-    messages_offset: 0,
-    messages_has_more: false,
-    messages_limit: Math.max(record.messages_limit, messages.length)
-  };
+}
+
+function chatMessageClass(message: AgentChatMessage): string {
+  return `agent-chat-message-${defaultAgentMessageType(message).replace("_", "-")}`;
 }
 
 function parentSourceFromPath(sourcePath: string | null): string | null {
-  return sourcePath?.match(/\/([^/]+)\/subagents\/[^/]+\.jsonl$/)?.[1] ?? null;
+  return sourcePath?.match(/\/([^/]+)\/subagents\/agent-[^/]+\.jsonl$/)?.[1] ?? null;
+}
+
+function parentSourceFromSession(session: AgentSession): string | null {
+  if (session.source_path) {
+    return parentSourceFromPath(session.source_path);
+  }
+  return null;
 }
 
 function buildAgentTree(record: AgentRecord): AgentNode[] {
@@ -316,7 +260,7 @@ function buildAgentTree(record: AgentRecord): AgentNode[] {
   }
   for (const session of record.sessions) {
     const node = nodes.get(session.id);
-    const parent = sourceToNode.get(parentSourceFromPath(session.source_path) ?? "");
+    const parent = sourceToNode.get(parentSourceFromSession(session) ?? "");
     if (!node) continue;
     if (parent && parent.id !== node.id) parent.children.push(node);
     else roots.push(node);
@@ -343,7 +287,136 @@ function AgentTree({ nodes }: { nodes: AgentNode[] }) {
   );
 }
 
-function AgentChatContent({ record }: { record: AgentChatRecord }) {
+function AgentChatMessageCard({
+  message,
+  fullscreen = false,
+  onExpand,
+  onCollapse,
+  onOpenSubagent,
+  articleRef
+}: {
+  message: AgentChatMessage;
+  fullscreen?: boolean;
+  onExpand?: () => void;
+  onCollapse?: () => void;
+  onOpenSubagent?: (message: AgentChatMessage) => void;
+  articleRef?: Ref<HTMLElement>;
+}) {
+  const speakerLabel = chatSpeakerLabel(message);
+  const actionLabel = fullscreen ? "Collapse" : "Expand";
+  const canOpenSubagent = message.target_session_id !== null && onOpenSubagent !== undefined && !fullscreen;
+  const titleLabel = speakerLabel.toLowerCase();
+
+  return (
+    <article
+      ref={articleRef}
+      className={[
+        "agent-chat-message",
+        chatMessageClass(message),
+        fullscreen ? "agent-chat-message-fullscreen" : ""
+      ].filter(Boolean).join(" ")}
+    >
+      <header>
+        <div className="agent-chat-message-title">
+          <span>{speakerLabel}</span>
+          <time dateTime={message.created_at}>{formatDateTime(message.created_at)}</time>
+        </div>
+        <button
+          type="button"
+          className="agent-chat-message-zoom-button"
+          aria-label={`${actionLabel} ${titleLabel} message`}
+          title={actionLabel}
+          onClick={fullscreen ? onCollapse : onExpand}
+        >
+          {actionLabel}
+        </button>
+      </header>
+      <small>{message.source_type} · {message.source_id}</small>
+      {message.subagent_id && (
+        <small>Subagent {message.subagent_id}</small>
+      )}
+      <div className="agent-chat-message-body">
+        {message.body_format === "json"
+          ? <pre className="agent-event-json">{message.body}</pre>
+          : <MarkdownText text={message.body} />}
+      </div>
+      {canOpenSubagent && (
+        <button
+          type="button"
+          className="agent-chat-message-subagent-button"
+          onClick={() => onOpenSubagent?.(message)}
+        >
+          Open subagent
+        </button>
+      )}
+    </article>
+  );
+}
+
+function AgentChatMessageOverlay({
+  message,
+  onClose
+}: {
+  message: AgentChatMessage;
+  onClose: () => void;
+}) {
+  const panelRef = useRef<HTMLElement | null>(null);
+  const speakerLabel = chatSpeakerLabel(message).toLowerCase();
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      panelRef.current?.querySelector<HTMLButtonElement>(".agent-chat-message-zoom-button")?.focus({ preventScroll: true });
+    });
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+    };
+
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", handleKeyDown, { capture: true });
+    };
+  }, [onClose]);
+
+  return (
+    <div className="agent-chat-message-overlay" role="dialog" aria-modal="true" aria-label={`Expanded ${speakerLabel} message`}>
+      <button type="button" className="agent-chat-message-overlay-backdrop" aria-label="Collapse message" onClick={onClose} />
+      <AgentChatMessageCard
+        message={message}
+        fullscreen
+        onCollapse={onClose}
+        articleRef={panelRef}
+      />
+    </div>
+  );
+}
+
+function AgentChatContent({
+  record,
+  highlightedMessageId,
+  onOpenSubagent
+}: {
+  record: AgentChatRecord;
+  highlightedMessageId?: string | null;
+  onOpenSubagent?: (message: AgentChatMessage) => void;
+}) {
+  const [expandedMessageId, setExpandedMessageId] = useState<string | null>(null);
+  const expandedMessage = expandedMessageId === null
+    ? null
+    : record.messages.find((message) => message.id === expandedMessageId) ?? null;
+
+  useEffect(() => {
+    if (expandedMessageId !== null && expandedMessage === null) {
+      setExpandedMessageId(null);
+    }
+  }, [expandedMessage, expandedMessageId]);
+
   if (record.messages_total === 0) {
     return <p className="muted">No agent record captured yet.</p>;
   }
@@ -352,27 +425,35 @@ function AgentChatContent({ record }: { record: AgentChatRecord }) {
   }
 
   return (
-    <div className="agent-chat-events">
-      {record.messages.map((message) => {
-        const speaker = message.role;
-        return (
-          <article key={message.id} className={`agent-chat-message agent-chat-message-${speaker}`}>
-            <header>
-              <span>{speaker === "agent" ? "Agent" : "User"}</span>
-              <time dateTime={message.created_at}>{formatDateTime(message.created_at)}</time>
-            </header>
-            <small>{message.source_type} · {message.source_id}</small>
-            {message.body_format === "json"
-              ? <pre className="agent-event-json">{message.body}</pre>
-              : <MarkdownText text={message.body} />}
-          </article>
-        );
-      })}
-    </div>
+    <>
+      <div className="agent-chat-events">
+        {record.messages.map((message) => (
+          <AgentChatMessageCard
+            key={message.id}
+            message={message}
+            articleRef={highlightedMessageId === message.id ? (element) => element?.scrollIntoView({ block: "center" }) : undefined}
+            onOpenSubagent={onOpenSubagent}
+            onExpand={() => setExpandedMessageId(message.id)}
+          />
+        ))}
+      </div>
+      {expandedMessage && (
+        <AgentChatMessageOverlay
+          message={expandedMessage}
+          onClose={() => setExpandedMessageId(null)}
+        />
+      )}
+    </>
   );
 }
 
-function AgentRecordContent({ record }: { record: AgentRecord }) {
+function AgentRecordContent({
+  record,
+  onOpenSubagent
+}: {
+  record: AgentRecord;
+  onOpenSubagent?: (sessionId: string) => void;
+}) {
   if (record.sessions.length === 0 && record.events.length === 0) {
     return <p className="muted">No agent record captured yet.</p>;
   }
@@ -400,6 +481,15 @@ function AgentRecordContent({ record }: { record: AgentRecord }) {
               {view.bodyFormat === "json"
                 ? <pre className="agent-event-json">{view.body}</pre>
                 : <MarkdownText text={view.body} />}
+              {view.targetSessionId && onOpenSubagent && (
+                <button
+                  type="button"
+                  className="agent-event-subagent-button"
+                  onClick={() => onOpenSubagent(view.targetSessionId as string)}
+                >
+                  Open subagent
+                </button>
+              )}
               <details className="agent-event-raw"><summary>Raw event</summary><pre>{json(event)}</pre></details>
             </article>
           );
@@ -482,7 +572,7 @@ function recordMeta(
   if (mode === "chat") {
     if (chatRecord === null) return "No data";
     const scope = chatRoleFilter === "all" ? "chat messages" : `${CHAT_ROLE_FILTER_LABELS[chatRoleFilter].toLocaleLowerCase()} messages`;
-    return `${chatRecord.messages_total} ${scope}`;
+    return `${chatRecord.messages_total}${chatRecord.messages_total_exact === false ? "+" : ""} ${scope}`;
   }
   if (detailRecord === null) return "No data";
   return `${detailRecord.sessions.length} agents · ${detailRecord.events_total} events`;
@@ -497,6 +587,7 @@ function pageInfo(mode: AgentRecordDisplayMode, chatRecord: AgentChatRecord | nu
       offset: chatRecord.messages_offset,
       count: chatRecord.messages.length,
       hasMore: chatRecord.messages_has_more,
+      totalExact: chatRecord.messages_total_exact,
       noun: "messages"
     };
   }
@@ -515,7 +606,7 @@ function pageRange(info: PageInfo): string {
   if (info.total === 0) return `0 of 0 ${info.noun}`;
   const start = info.offset + 1;
   const end = info.offset + info.count;
-  return `${start}-${end} of ${info.total} ${info.noun}`;
+  return `${start}-${end} of ${info.total}${info.totalExact === false ? "+" : ""} ${info.noun}`;
 }
 
 function AgentRecordSessionTabs({
@@ -527,22 +618,40 @@ function AgentRecordSessionTabs({
   selectedSessionId: string;
   onSelectSession: (sessionId: string) => void;
 }) {
-  const orderedSessions = sortSessionsNewestFirst(sessions);
+  const orderedSessions = sortSessionsByCreation(sessions);
   return (
     <div className="agent-record-session-tabs" role="tablist" aria-label="Agent sessions">
-      {orderedSessions.map((session) => (
+      {orderedSessions.map((session, index) => (
         <button
           key={session.id}
           type="button"
           role="tab"
           className={session.id === selectedSessionId ? "selected" : undefined}
           aria-selected={session.id === selectedSessionId}
+          title={sessionLabel(session)}
           onClick={() => onSelectSession(session.id)}
         >
-          {sessionLabel(session)}
+          {index === 0 ? "Main" : `Sub ${index}`}
         </button>
       ))}
     </div>
+  );
+}
+
+function AgentRecordReturnButton({
+  originMessageId,
+  onReturn
+}: {
+  originMessageId: string | null;
+  onReturn: () => void;
+}) {
+  if (originMessageId === null) {
+    return null;
+  }
+  return (
+    <button type="button" className="agent-record-return-button" onClick={onReturn}>
+      Return to call
+    </button>
   );
 }
 
@@ -582,6 +691,7 @@ export function AgentRecordViewer({
   isFetching = false,
   onModeChange,
   onChatRoleFilterChange,
+  onOpenSubagent,
   onSessionChange,
   onPreviousPage,
   onNextPage,
@@ -596,8 +706,24 @@ export function AgentRecordViewer({
     : isError || activeRecord === null
       ? <p className="error" role="alert">Failed to load agent record.</p>
       : mode === "chat"
-        ? <AgentChatContent record={activeRecord as AgentChatRecord} />
-        : <AgentRecordContent record={activeRecord as AgentRecord} />;
+        ? (
+          <AgentChatContent
+            record={activeRecord as AgentChatRecord}
+            onOpenSubagent={(message) => {
+              if (message.target_session_id) {
+                onOpenSubagent?.(message.target_session_id, message.id);
+              }
+            }}
+          />
+        )
+        : (
+          <AgentRecordContent
+            record={activeRecord as AgentRecord}
+            onOpenSubagent={(sessionId) => {
+              onOpenSubagent?.(sessionId);
+            }}
+          />
+        );
   const meta = recordMeta(mode, chatRoleFilter, chatRecord, detailRecord, isLoading, isError);
 
   const openExpanded = () => {
@@ -647,48 +773,137 @@ export function AgentRecordModal({
   onQuickInputSubmit,
   onModeChange,
   onChatRoleFilterChange,
+  jumpRequest = null,
   onSessionChange,
   onPreviousPage,
   onNextPage,
   onClose
 }: AgentRecordModalProps) {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [returnTarget, setReturnTarget] = useState<{
+    sessionId: string | null;
+    messageId: string;
+    pageOffset: AgentRecordPageOffset;
+  } | null>(null);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
-  const sortedSessions = useMemo(() => sortSessionsNewestFirst(sessions), [sessions]);
+  const lastJumpKeyRef = useRef<string | null>(null);
+  const sortedSessions = useMemo(() => sortSessionsByCreation(sessions), [sessions]);
   const hasMultipleSessions = sortedSessions.length > 1;
-  const activeSessionId = selectedSessionId ?? pickLatestSessionId(sortedSessions);
+  const activeSessionId = selectedSessionId ?? pickInitialSessionId(sortedSessions);
   const activeRecord = mode === "chat" ? chatRecord : detailRecord;
   const canRenderContent = activeRecord !== null && !isLoading && !isError;
-  const expandedChatRecord = chatRecord && activeSessionId
-    ? filterChatRecordBySession(chatRecord, activeSessionId)
-    : chatRecord;
-  const expandedDetailRecord = detailRecord && activeSessionId
-    ? filterDetailRecordBySession(detailRecord, activeSessionId)
-    : detailRecord;
-  const expandedDisplayRecord = mode === "chat" ? expandedChatRecord : expandedDetailRecord;
+  const expandedDisplayRecord = mode === "chat" ? chatRecord : detailRecord;
   const activePageInfo = pageInfo(mode, chatRecord, detailRecord);
   const canUseQuickInput = onQuickInputDraftChange !== undefined && onQuickInputSubmit !== undefined;
+  const currentPageOffset = (): AgentRecordPageOffset => {
+    if (mode === "chat") {
+      return { chatOffset: chatRecord?.messages_offset ?? 0 };
+    }
+    return { detailOffset: detailRecord?.events_offset ?? 0 };
+  };
 
   const selectSession = (sessionId: string) => {
+    setReturnTarget(null);
     setSelectedSessionId(sessionId);
     onSessionChange?.(sessionId);
   };
+
+  const openSubagentFromMessage = (message: AgentChatMessage) => {
+    if (!message.target_session_id) {
+      return;
+    }
+    setReturnTarget({ sessionId: activeSessionId, messageId: message.id, pageOffset: currentPageOffset() });
+    setSelectedSessionId(message.target_session_id);
+    onSessionChange?.(message.target_session_id);
+  };
+
+  const openSubagentSession = (sessionId: string) => {
+    setReturnTarget(null);
+    setSelectedSessionId(sessionId);
+    onSessionChange?.(sessionId);
+  };
+
+  const returnToCall = () => {
+    if (returnTarget === null) {
+      return;
+    }
+    setSelectedSessionId(returnTarget.sessionId);
+    setHighlightedMessageId(returnTarget.messageId);
+    onSessionChange?.(returnTarget.sessionId, returnTarget.pageOffset);
+    setReturnTarget(null);
+  };
+
+  useEffect(() => {
+    if (highlightedMessageId === null) {
+      return;
+    }
+    const timeout = window.setTimeout(() => setHighlightedMessageId(null), 1600);
+    return () => window.clearTimeout(timeout);
+  }, [highlightedMessageId]);
+
+  useEffect(() => {
+    if (!open || jumpRequest === null) {
+      return;
+    }
+    const jumpKey = `${jumpRequest.sessionId}:${jumpRequest.originMessageId ?? ""}`;
+    if (lastJumpKeyRef.current === jumpKey) {
+      return;
+    }
+    lastJumpKeyRef.current = jumpKey;
+    const previousSessionId = selectedSessionId ?? pickInitialSessionId(sortedSessions);
+    setReturnTarget(jumpRequest.originMessageId
+      ? { sessionId: previousSessionId, messageId: jumpRequest.originMessageId, pageOffset: currentPageOffset() }
+      : null);
+    setSelectedSessionId(jumpRequest.sessionId);
+    onSessionChange?.(jumpRequest.sessionId);
+  }, [
+    chatRecord?.messages_offset,
+    detailRecord?.events_offset,
+    jumpRequest,
+    mode,
+    onSessionChange,
+    open,
+    selectedSessionId,
+    sortedSessions
+  ]);
+
+  useEffect(() => {
+    if (!open) {
+      setSelectedSessionId(null);
+      setReturnTarget(null);
+      setHighlightedMessageId(null);
+      lastJumpKeyRef.current = null;
+      return;
+    }
+  }, [open]);
 
   useEffect(() => {
     if (!open) {
       return;
     }
+    if (
+      selectedSessionId !== null
+      && (
+        sortedSessions.some((session) => session.id === selectedSessionId)
+        || (jumpRequest !== null && selectedSessionId === jumpRequest.sessionId)
+      )
+    ) {
+      return;
+    }
     if (sortedSessions.length === 0) {
-      setSelectedSessionId(null);
+      if (jumpRequest === null) {
+        setSelectedSessionId(null);
+      }
       return;
     }
-    if (selectedSessionId !== null && sortedSessions.some((session) => session.id === selectedSessionId)) {
-      return;
-    }
-    setSelectedSessionId(pickLatestSessionId(sortedSessions));
-  }, [open, selectedSessionId, sortedSessions]);
+    setSelectedSessionId(pickInitialSessionId(sortedSessions));
+  }, [jumpRequest, open, selectedSessionId, sortedSessions]);
 
   const handleEscape = useCallback(() => {
+    if (panelRef.current?.querySelector(".agent-chat-message-overlay")) {
+      return;
+    }
     onClose();
   }, [onClose]);
 
@@ -712,6 +927,8 @@ export function AgentRecordModal({
   if (!open) {
     return null;
   }
+
+  const pendingJumpTarget = jumpRequest !== null && !sortedSessions.some((session) => session.id === jumpRequest.sessionId);
 
   const submitQuickInput = (draft: string) => {
     if (!canUseQuickInput) {
@@ -746,15 +963,24 @@ export function AgentRecordModal({
         </div>
         <div className="agent-record-modal-scroll">
           {sessionTabs}
+          <AgentRecordReturnButton originMessageId={returnTarget?.messageId ?? null} onReturn={returnToCall} />
           <AgentRecordPagination info={activePageInfo} isFetching={isFetching} onPreviousPage={onPreviousPage} onNextPage={onNextPage} />
           {isLoading
             ? <p className="muted">Loading agent record...</p>
+            : pendingJumpTarget
+              ? <p className="muted">Loading subagent record...</p>
             : isError
               ? <p className="error" role="alert">Failed to load agent record.</p>
               : canRenderContent && expandedDisplayRecord
                 ? mode === "chat"
-                  ? <AgentChatContent record={expandedDisplayRecord as AgentChatRecord} />
-                  : <AgentRecordContent record={expandedDisplayRecord as AgentRecord} />
+                  ? (
+                    <AgentChatContent
+                      record={expandedDisplayRecord as AgentChatRecord}
+                      highlightedMessageId={highlightedMessageId}
+                      onOpenSubagent={openSubagentFromMessage}
+                    />
+                  )
+                  : <AgentRecordContent record={expandedDisplayRecord as AgentRecord} onOpenSubagent={openSubagentSession} />
                 : <p className="muted">No agent record captured yet.</p>}
         </div>
         {canUseQuickInput && (

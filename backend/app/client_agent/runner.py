@@ -11,11 +11,15 @@ from uuid import UUID
 
 import websockets
 
+from app.agent_plugins import list_agent_client_descriptors
+from app.client_agent.agent_commands import agent_provider_from_command
 from app.client_agent.agent_tool_watchers import UnifiedAgentToolWatcher
 from app.client_agent.agent_idle import AgentIdleSupervisor
 from app.services import agent_config as agent_config_service
+from app.services import agent_profiles as agent_profile_service
 from app.client_agent.git_worktree import handle_git_worktree_request
 from app.client_agent.config import ClientAgentConfig
+from app.client_agent.aux_terminal import ClientAuxTerminalManager
 from app.client_agent.outbound import BulkUploadWriter, ControlMessageWriter
 from app.client_agent.terminal import ClientTerminalMultiplexer
 from app.client_agent.tmux_runtime import ClientRuntimeWindow, ClientTmuxRuntime
@@ -32,6 +36,28 @@ HEARTBEAT_INTERVAL_SECONDS = 10
 ATTACH_SNAPSHOT_GRACE_SECONDS = 0.25
 GIT_WORKTREE_REQUEST_CONCURRENCY = 1
 logger = logging.getLogger(__name__)
+
+
+def _agent_clients_payload() -> dict[str, object]:
+    return {
+        "agent_clients": [
+            {
+                "id": descriptor.id,
+                "provider_id": descriptor.provider_id,
+                "label": descriptor.label,
+                "aliases": list(descriptor.aliases),
+                "default_command": descriptor.default_command,
+                "command_names": list(descriptor.command_names),
+                "capabilities": asdict(descriptor.capabilities),
+            }
+            for descriptor in list_agent_client_descriptors()
+        ]
+    }
+
+
+def _providers_for_shell_command(command: str | None) -> frozenset[str] | None:
+    provider = agent_provider_from_command(command)
+    return frozenset({provider}) if provider is not None else None
 
 
 def _view_id_for_message(message: AgentMessage) -> UUID:
@@ -139,6 +165,7 @@ async def _run_client_agent_once(config: ClientAgentConfig) -> bool:
                 default_shell=config.default_shell,
             )
             terminal = ClientTerminalMultiplexer()
+            aux_terminal = ClientAuxTerminalManager(default_shell=config.default_shell)
             idle_supervisor = AgentIdleSupervisor(terminal=terminal, runtime=runtime)
             agent_tool_watcher = UnifiedAgentToolWatcher(
                 bulk_writer.send_ai_event,
@@ -184,6 +211,7 @@ async def _run_client_agent_once(config: ClientAgentConfig) -> bool:
                             terminal,
                             idle_supervisor,
                             agent_tool_watcher,
+                            aux_terminal,
                             attach_snapshot_tasks,
                             git_worktree_tasks,
                             git_worktree_semaphore,
@@ -226,6 +254,7 @@ async def _run_client_agent_once(config: ClientAgentConfig) -> bool:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await agent_tool_watcher.close()
                 await terminal.close()
+                await aux_terminal.close()
                 await control_writer.close()
                 await bulk_writer.close()
 
@@ -381,6 +410,7 @@ async def _handle_agent_message(
     terminal: ClientTerminalMultiplexer,
     idle_supervisor: AgentIdleSupervisor,
     agent_tool_watcher: UnifiedAgentToolWatcher,
+    aux_terminal: ClientAuxTerminalManager,
     attach_snapshot_tasks: dict[UUID, asyncio.Task[None]],
     git_worktree_tasks: set[asyncio.Task[None]],
     git_worktree_semaphore: asyncio.Semaphore,
@@ -400,6 +430,17 @@ async def _handle_agent_message(
                 client_id=message.client_id,
                 request_id=message.request_id,
                 payload=result,
+            )
+        )
+        return False
+
+    if message.type == "agent_clients_list":
+        await control_writer.send(
+            AgentMessage(
+                type="agent_client_result",
+                client_id=message.client_id,
+                request_id=message.request_id,
+                payload=_agent_clients_payload(),
             )
         )
         return False
@@ -530,6 +571,86 @@ async def _handle_agent_message(
         )
         return False
 
+    if message.type == "aux_terminal_ensure":
+        aux_terminal_id = _required_payload_string(message, "aux_terminal_id")
+        target = await aux_terminal.ensure_terminal(
+            aux_terminal_id,
+            cwd=_optional_payload_string(message, "cwd"),
+            shell_command=_optional_payload_string(message, "shell_command"),
+        )
+        await control_writer.send(
+            AgentMessage(
+                type="aux_terminal_ensure_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload={
+                    "aux_terminal_id": target.aux_terminal_id,
+                    "cwd": target.cwd,
+                    "shell_command": target.shell_command,
+                },
+            )
+        )
+        return False
+
+    if message.type == "aux_terminal_attach":
+        aux_terminal_id = _required_payload_string(message, "aux_terminal_id")
+        view_id = _view_id_for_message(message)
+
+        async def send_aux_output(data: bytes) -> None:
+            payload = TerminalPayload.from_bytes(_message_window_id(message), data).model_dump(mode="json")
+            payload["view_id"] = str(view_id)
+            payload["aux_terminal_id"] = aux_terminal_id
+            await bulk_writer.send_terminal_output(
+                AgentMessage(
+                    type="aux_terminal_output",
+                    client_id=message.client_id,
+                    window_id=message.window_id,
+                    payload=payload,
+                )
+            )
+
+        await aux_terminal.attach(aux_terminal_id, send_aux_output, view_id=view_id)
+        await control_writer.send(
+            AgentMessage(
+                type="aux_terminal_attach_result",
+                client_id=message.client_id,
+                window_id=message.window_id,
+                request_id=message.request_id,
+                payload={"ok": True, "aux_terminal_id": aux_terminal_id, "view_id": str(view_id)},
+            )
+        )
+        return False
+
+    if message.type == "aux_terminal_detach":
+        await aux_terminal.detach(
+            _required_payload_string(message, "aux_terminal_id"),
+            view_id=_view_id_for_message(message),
+        )
+        return False
+
+    if message.type == "aux_terminal_kill":
+        await aux_terminal.kill(_required_payload_string(message, "aux_terminal_id"))
+        return False
+
+    if message.type == "aux_terminal_input":
+        raw_data = _required_payload_string(message, "data")
+        await aux_terminal.send_input(
+            _required_payload_string(message, "aux_terminal_id"),
+            bytes.fromhex(raw_data),
+            view_id=_view_id_for_message(message),
+        )
+        return False
+
+    if message.type == "aux_terminal_resize":
+        await aux_terminal.resize(
+            _required_payload_string(message, "aux_terminal_id"),
+            cols=int(message.payload["cols"]),
+            rows=int(message.payload["rows"]),
+            view_id=_view_id_for_message(message),
+        )
+        return False
+
     if message.type == "terminal_detach":
         window_id = _message_window_id(message)
         view_id = _view_id_for_message(message)
@@ -605,18 +726,126 @@ async def _handle_agent_message(
 
     if message.type == "agent_config_get":
         agent = _required_payload_string(message, "agent")
+        config = (
+            agent_config_service.list_window_agent_config(
+                agent,
+                window_id=str(_message_window_id(message)),
+            )
+            if message.window_id is not None or message.payload.get("window_id") is not None
+            else agent_config_service.list_agent_config(agent)
+        )
         await control_writer.send(
             AgentMessage(
                 type="agent_config_result",
                 client_id=message.client_id,
                 window_id=message.window_id,
                 request_id=message.request_id,
-                payload=_agent_config_payload(agent_config_service.list_agent_config(agent)),
+                payload=_agent_config_payload(config),
+            )
+        )
+        return False
+
+    if message.type == "agent_profile_config_get":
+        agent = _required_payload_string(message, "agent")
+        profile_id = _required_payload_string(message, "profile_id")
+        config = agent_profile_service.list_agent_profile_config(profile_id, agent)
+        await control_writer.send(
+            AgentMessage(
+                type="agent_config_result",
+                client_id=message.client_id,
+                request_id=message.request_id,
+                payload=_agent_config_payload(config),
+            )
+        )
+        return False
+
+    if message.type == "agent_profile_list":
+        profiles = agent_profile_service.list_agent_profiles()
+        await control_writer.send(
+            AgentMessage(
+                type="agent_profile_result",
+                client_id=message.client_id,
+                request_id=message.request_id,
+                payload={"profiles": [_agent_profile_payload(profile) for profile in profiles]},
+            )
+        )
+        return False
+
+    if message.type == "agent_profile_create":
+        profile = agent_profile_service.create_agent_profile(
+            name=_required_payload_string(message, "name"),
+            description=_optional_payload_string(message, "description"),
+            default_agent_client=_optional_payload_string(message, "default_agent_client") or "codex",
+            source_agent_client=_optional_payload_string(message, "source_agent_client"),
+        )
+        await control_writer.send(
+            AgentMessage(
+                type="agent_profile_result",
+                client_id=message.client_id,
+                request_id=message.request_id,
+                payload=_agent_profile_payload(profile),
+            )
+        )
+        return False
+
+    if message.type == "agent_profile_update":
+        update_kwargs: dict[str, object] = {}
+        for key in ("name", "description", "default_agent_client", "agent_md"):
+            if key in message.payload:
+                update_kwargs[key] = message.payload.get(key)
+        profile = agent_profile_service.update_agent_profile(
+            _required_payload_string(message, "profile_id"),
+            **update_kwargs,
+        )
+        await control_writer.send(
+            AgentMessage(
+                type="agent_profile_result",
+                client_id=message.client_id,
+                request_id=message.request_id,
+                payload=_agent_profile_payload(profile),
+            )
+        )
+        return False
+
+    if message.type == "agent_profile_delete":
+        agent_profile_service.delete_agent_profile(_required_payload_string(message, "profile_id"))
+        await control_writer.send(
+            AgentMessage(
+                type="agent_profile_result",
+                client_id=message.client_id,
+                request_id=message.request_id,
+                payload={},
+            )
+        )
+        return False
+
+    if message.type == "agent_profile_config_set_enabled":
+        agent = _required_payload_string(message, "agent")
+        profile_id = _required_payload_string(message, "profile_id")
+        section_id = _required_payload_string(message, "section_id")
+        item_id = _required_payload_string(message, "item_id")
+        enabled = message.payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("agent profile config enabled must be a boolean")
+        config = agent_profile_service.set_agent_profile_config_item_enabled(
+            profile_id,
+            agent,
+            section_id,
+            item_id,
+            enabled,
+        )
+        await control_writer.send(
+            AgentMessage(
+                type="agent_config_result",
+                client_id=message.client_id,
+                request_id=message.request_id,
+                payload=_agent_config_payload(config),
             )
         )
         return False
 
     if message.type == "agent_config_set_enabled":
+        window_id = _message_window_id(message)
         agent = _required_payload_string(message, "agent")
         section_id = _required_payload_string(message, "section_id")
         item_id = _required_payload_string(message, "item_id")
@@ -630,11 +859,12 @@ async def _handle_agent_message(
                 window_id=message.window_id,
                 request_id=message.request_id,
                 payload=_agent_config_payload(
-                    agent_config_service.set_agent_config_item_enabled(
+                    agent_config_service.set_window_agent_config_item_enabled(
                         agent,
                         section_id,
                         item_id,
                         enabled,
+                        window_id=str(window_id),
                     )
                 ),
             )
@@ -666,6 +896,18 @@ def _agent_config_payload(config: agent_config_service.AgentConfig) -> dict[str,
     }
 
 
+def _agent_profile_payload(profile: agent_profile_service.AgentProfile) -> dict[str, object]:
+    return {
+        "id": profile.id,
+        "name": profile.name,
+        "description": profile.description,
+        "default_agent_client": profile.default_agent_client,
+        "agent_md": profile.agent_md,
+        "created_at": profile.created_at,
+        "updated_at": profile.updated_at,
+    }
+
+
 async def _handle_create_window_job(
     control_writer: ControlMessageWriter,
     runtime: ClientTmuxRuntime,
@@ -683,16 +925,26 @@ async def _handle_create_window_job(
         agent_config_selection = _agent_config_selection_from_payload(
             message.payload.get("agent_config_selection")
         )
-        if agent_config_selection is not None:
+        agent_profile_id = message.payload.get("agent_profile_id")
+        if isinstance(agent_profile_id, str) and agent_profile_id.strip():
+            agent_profile_agent = message.payload.get("agent_profile_agent")
+            if isinstance(agent_profile_agent, str) and agent_profile_agent.strip():
+                agent_profile_service.materialize_agent_profile_for_window(
+                    agent_profile_id.strip(),
+                    agent_profile_agent.strip(),
+                    window_id=str(window_id),
+                )
+        elif agent_config_selection is not None:
             agent_config_service.apply_agent_config_selection(
                 agent_config_selection,
                 window_id=str(window_id),
             )
         project_path = _optional_payload_string(message, "cwd")
+        shell_command = _optional_payload_string(message, "shell_command")
         runtime_window = await runtime.create_window(
             window_id,
             cwd=project_path,
-            shell_command=_optional_payload_string(message, "shell_command"),
+            shell_command=shell_command,
         )
         terminal.register_window(
             window_id,
@@ -703,6 +955,7 @@ async def _handle_create_window_job(
         agent_tool_watcher.watch_window(
             window_id,
             project_path,
+            providers=_providers_for_shell_command(shell_command),
         )
         await control_writer.send(
             AgentMessage(

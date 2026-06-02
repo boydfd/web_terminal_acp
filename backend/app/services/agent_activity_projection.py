@@ -17,6 +17,16 @@ _CLAUDE_LOCAL_COMMAND_PREFIXES = (
     "<bash-stdout>",
     "<bash-stderr>",
 )
+_CLAUDE_METADATA_TYPES = {
+    "ai-title",
+    "last-prompt",
+    "permission-mode",
+}
+_ANTIGRAVITY_CONTEXT_TYPES = {
+    "CHECKPOINT",
+    "CONVERSATION_HISTORY",
+    "SYSTEM_MESSAGE",
+}
 
 
 def event_activity_time(event: Event) -> datetime:
@@ -29,6 +39,10 @@ def event_activity_time(event: Event) -> datetime:
 
 
 def event_is_agent_completion(event: Event) -> bool:
+    adapter = _adapter_for_event(event)
+    if adapter is not None:
+        return adapter.is_completion(event)
+
     payload = event.payload_json
     if payload_text(payload.get("provider")) == "codex" and codex_completion_payload(payload):
         return True
@@ -49,11 +63,15 @@ def event_is_agent_activity(event: Event) -> bool:
         return claude_work_activity_payload(payload)
     if canonical_provider == "cursor_cli":
         return cursor_work_activity_payload(payload)
+    if canonical_provider == "antigravity_cli":
+        return antigravity_work_activity_payload(payload)
     return True
 
 
 def event_is_agent_user_input(event: Event) -> bool:
     payload = event.payload_json
+    if payload.get("isSidechain") is True and payload_text(payload.get("agentId")) is not None:
+        return False
     provider = _canonical_provider(payload_text(payload.get("provider")))
     try:
         adapter = get_agent_tool_registry().by_source_type(event.source_type, provider)
@@ -105,6 +123,8 @@ def claude_work_activity_payload(payload: dict) -> bool:
     if claude_local_command_payload(payload):
         return False
     payload_type = payload_text(payload.get("type"))
+    if payload_type in _CLAUDE_METADATA_TYPES:
+        return False
     if payload_type == "system":
         return claude_completion_payload(payload)
     if payload_type == "user":
@@ -118,6 +138,16 @@ def cursor_work_activity_payload(payload: dict) -> bool:
         return False
     if role == "user":
         return event_is_plain_user_payload(payload, provider="cursor_cli")
+    return True
+
+
+def antigravity_work_activity_payload(payload: dict) -> bool:
+    source = payload_text(payload.get("source"))
+    raw_type = payload_text(payload.get("type"))
+    if source == "SYSTEM" or raw_type in _ANTIGRAVITY_CONTEXT_TYPES:
+        return False
+    if source == "USER_EXPLICIT" or raw_type == "USER_INPUT":
+        return event_is_plain_user_payload(payload, provider="antigravity_cli")
     return True
 
 
@@ -222,6 +252,19 @@ def _canonical_provider(provider: str | None) -> str | None:
     if provider is None:
         return None
     return _PROVIDER_ALIASES.get(provider, provider)
+
+
+def _adapter_for_event(event: Event):
+    provider = _canonical_provider(payload_text(event.payload_json.get("provider")))
+    try:
+        return get_agent_tool_registry().by_source_type(event.source_type, provider)
+    except (KeyError, ValueError):
+        if provider is None:
+            return None
+    try:
+        return get_agent_tool_registry().by_provider(provider)
+    except ValueError:
+        return None
 
 
 def payload_text(value: object) -> str | None:

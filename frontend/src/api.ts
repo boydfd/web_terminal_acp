@@ -1,6 +1,9 @@
 import type {
   AgentConfig,
+  AgentClientList,
   AgentLaunchConfig,
+  AgentProfile,
+  AgentProfileList,
   AgentChatRecord,
   AgentChatRoleFilter,
   AgentRecord,
@@ -16,6 +19,7 @@ import type {
   SearchResponse,
   GlobalTerminalRecentPage,
   ProjectSummary,
+  TerminalProject,
   TerminalRecent,
   TerminalRecentPage,
   TerminalNotificationList,
@@ -28,6 +32,7 @@ import { customQuickKeyForStorage, type CustomQuickKey } from "./terminalQuickKe
 import type { SummaryOutputLanguage } from "./userPreferences";
 import { readApiBase } from "./apiBase";
 import { appendAuthToken, readAuthToken } from "./auth";
+import type { TerminalTimeRange } from "./terminalTimeRange";
 
 export type RetrySummaryPayload = {
   allow_title_folder_override: boolean;
@@ -94,6 +99,34 @@ export function login(secret: string): Promise<LoginResult> {
 
 export function terminalWebSocketUrl(clientId: string, windowId: string, viewId?: string): string {
   const url = new URL(apiUrl(`/api/clients/${pathSegment(clientId)}/terminal/${pathSegment(windowId)}`));
+  if (viewId !== undefined) {
+    url.searchParams.set("view_id", viewId);
+  }
+  appendAuthToken(url);
+  if (url.protocol === "http:") {
+    url.protocol = "ws:";
+  } else if (url.protocol === "https:") {
+    url.protocol = "wss:";
+  }
+  return url.toString();
+}
+
+export type AuxTerminalEnsureResult = {
+  status: string;
+  cwd: string | null;
+};
+
+export function ensureAuxTerminal(clientId: string, windowId: string): Promise<AuxTerminalEnsureResult> {
+  return request<AuxTerminalEnsureResult>(
+    `/api/clients/${pathSegment(clientId)}/windows/${pathSegment(windowId)}/aux-terminal/ensure`,
+    { method: "POST" }
+  );
+}
+
+export function auxTerminalWebSocketUrl(clientId: string, windowId: string, viewId?: string): string {
+  const url = new URL(
+    apiUrl(`/api/clients/${pathSegment(clientId)}/windows/${pathSegment(windowId)}/aux-terminal`)
+  );
   if (viewId !== undefined) {
     url.searchParams.set("view_id", viewId);
   }
@@ -187,17 +220,51 @@ export async function deleteClient(clientId: string): Promise<void> {
   }
 }
 
-export function fetchTree(clientId: string): Promise<TreeFolderCore[]> {
-  return request<TreeFolderCore[]>(`/api/clients/${pathSegment(clientId)}/tree`);
+export function fetchTree(
+  clientId: string,
+  range?: TerminalTimeRange,
+  projectPath?: string | null
+): Promise<TreeFolderCore[]> {
+  const params = new URLSearchParams();
+  if (range !== undefined) {
+    params.set("range", range);
+  }
+  if (projectPath) {
+    params.set("project_path", projectPath);
+  }
+  const query = params.toString();
+  const suffix = query ? `?${query}` : "";
+  return request<TreeFolderCore[]>(`/api/clients/${pathSegment(clientId)}/tree${suffix}`);
+}
+
+export function fetchTerminalProjects(
+  clientId: string,
+  range?: TerminalTimeRange
+): Promise<TerminalProject[]> {
+  const params = new URLSearchParams();
+  if (range !== undefined) {
+    params.set("range", range);
+  }
+  const query = params.toString();
+  const suffix = query ? `?${query}` : "";
+  return request<TerminalProject[]>(
+    `/api/clients/${pathSegment(clientId)}/terminal-projects${suffix}`
+  );
 }
 
 export function fetchWindowActivity(
   clientId: string,
-  options?: { includeRuntimeTags?: boolean }
+  options?: { includeRuntimeTags?: boolean; range?: TerminalTimeRange; projectPath?: string | null }
 ): Promise<ClientWindowsActivity> {
   const params = new URLSearchParams();
   if (options?.includeRuntimeTags) {
     params.set("include_runtime_tags", "true");
+  }
+  if (options?.range !== undefined) {
+    params.set("range", options.range);
+  }
+  if (options?.projectPath) {
+    params.set("project_path", options.projectPath);
   }
   const query = params.toString();
   const suffix = query ? `?${query}` : "";
@@ -324,7 +391,8 @@ export function fetchAgentRecordChat(
   windowId: string,
   limit = 30,
   offset = 0,
-  role: AgentChatRoleFilter = "all"
+  role: AgentChatRoleFilter = "all",
+  sessionId: string | null = null
 ): Promise<AgentChatRecord> {
   const params = new URLSearchParams({
     messages_limit: String(limit),
@@ -333,16 +401,28 @@ export function fetchAgentRecordChat(
   if (role !== "all") {
     params.set("role", role);
   }
+  if (sessionId !== null) {
+    params.set("session_id", sessionId);
+  }
   return request<AgentChatRecord>(
     `/api/clients/${pathSegment(clientId)}/windows/${pathSegment(windowId)}/agent-record/chat?${params.toString()}`
   );
 }
 
-export function fetchAgentRecordDetail(clientId: string, windowId: string, limit = 100, offset = 0): Promise<AgentRecord> {
+export function fetchAgentRecordDetail(
+  clientId: string,
+  windowId: string,
+  limit = 100,
+  offset = 0,
+  sessionId: string | null = null
+): Promise<AgentRecord> {
   const params = new URLSearchParams({
     events_limit: String(limit),
     events_offset: String(offset)
   });
+  if (sessionId !== null) {
+    params.set("session_id", sessionId);
+  }
   return request<AgentRecord>(
     `/api/clients/${pathSegment(clientId)}/windows/${pathSegment(windowId)}/agent-record/detail?${params.toString()}`
   );
@@ -354,9 +434,88 @@ export function fetchAgentConfig(clientId: string, windowId: string): Promise<Ag
   );
 }
 
+export function fetchAgentClients(clientId: string): Promise<AgentClientList> {
+  return request<AgentClientList>(`/api/clients/${pathSegment(clientId)}/agent-clients`);
+}
+
 export function fetchClientAgentConfig(clientId: string, agent: AgentConfig["agent"]): Promise<AgentConfig> {
   return request<AgentConfig>(
     `/api/clients/${pathSegment(clientId)}/agent-config/${pathSegment(agent)}`
+  );
+}
+
+export function fetchAgentProfiles(clientId: string): Promise<AgentProfileList> {
+  return request<AgentProfileList>(`/api/clients/${pathSegment(clientId)}/agent-profiles`);
+}
+
+export function createAgentProfile(
+  clientId: string,
+  input: {
+    name: string;
+    description?: string | null;
+    default_agent_client: AgentConfig["agent"];
+    source_agent_client?: AgentConfig["agent"] | null;
+  }
+): Promise<AgentProfile> {
+  return request<AgentProfile>(`/api/clients/${pathSegment(clientId)}/agent-profiles`, {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
+export function updateAgentProfile(
+  clientId: string,
+  profileId: string,
+  input: Partial<Pick<AgentProfile, "name" | "description" | "default_agent_client" | "agent_md">>
+): Promise<AgentProfile> {
+  return request<AgentProfile>(
+    `/api/clients/${pathSegment(clientId)}/agent-profiles/${pathSegment(profileId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(input)
+    }
+  );
+}
+
+export async function deleteAgentProfile(clientId: string, profileId: string): Promise<void> {
+  const headers = new Headers();
+  const authToken = readAuthToken();
+  if (authToken !== null) {
+    headers.set("Authorization", `Bearer ${authToken}`);
+  }
+  const response = await fetch(apiUrl(`/api/clients/${pathSegment(clientId)}/agent-profiles/${pathSegment(profileId)}`), {
+    method: "DELETE",
+    headers
+  });
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+}
+
+export function fetchAgentProfileConfig(
+  clientId: string,
+  profileId: string,
+  agent: AgentConfig["agent"]
+): Promise<AgentConfig> {
+  return request<AgentConfig>(
+    `/api/clients/${pathSegment(clientId)}/agent-profiles/${pathSegment(profileId)}/agent-config/${pathSegment(agent)}`
+  );
+}
+
+export function updateAgentProfileConfigItem(
+  clientId: string,
+  profileId: string,
+  agent: AgentConfig["agent"],
+  sectionId: string,
+  itemId: string,
+  enabled: boolean
+): Promise<AgentConfig> {
+  return request<AgentConfig>(
+    `/api/clients/${pathSegment(clientId)}/agent-profiles/${pathSegment(profileId)}/agent-config/${pathSegment(agent)}/${pathSegment(sectionId)}/${pathSegment(itemId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ enabled })
+    }
   );
 }
 

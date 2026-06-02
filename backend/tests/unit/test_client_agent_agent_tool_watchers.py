@@ -15,6 +15,7 @@ from app.client_agent.agent_tool_watchers import (
     AGENT_TOOL_COLLECTORS,
     AgentToolWatcherState,
     UnifiedAgentToolWatcher,
+    _collect_all_events,
     collect_claude_code_watch_events,
     collect_codex_watch_events,
     collect_cursor_watch_events,
@@ -35,7 +36,28 @@ def test_agent_tool_collectors_are_centralized_by_provider() -> None:
         ("codex", "collect_codex_watch_events"),
         ("claude_code", "collect_claude_code_watch_events"),
         ("cursor_cli", "collect_cursor_watch_events"),
+        ("antigravity_cli", "collect_antigravity_watch_events"),
     )
+
+
+def test_collect_all_events_can_filter_to_declared_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: list[str] = []
+
+    def collect(state, *, client_id, window_id, project_path):
+        called.append("cursor_cli")
+        return []
+
+    monkeypatch.setattr("app.client_agent.agent_tool_watchers.collect_cursor_watch_events", collect)
+
+    _collect_all_events(
+        AgentToolWatcherState(),
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+        providers=frozenset({"cursor_cli"}),
+    )
+
+    assert called == ["cursor_cli"]
 
 
 def write_cursor_store(path: Path) -> None:
@@ -350,6 +372,60 @@ def test_collect_codex_watch_events_resets_offset_after_truncation(
     assert state.codex_offsets[session_file] == session_file.stat().st_size
 
 
+def test_collect_codex_watch_events_hardlinks_session_to_global_resume_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    session_file = (
+        home
+        / ".web-terminal-acp"
+        / "codex-homes"
+        / str(WINDOW_ID)
+        / "sessions"
+        / "2026"
+        / "06"
+        / "01"
+        / "rollout-2026-06-01T00-00-00-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+    )
+    session_file.parent.mkdir(parents=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "global codex"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: home)
+    state = AgentToolWatcherState()
+
+    events = collect_codex_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+
+    global_session_file = (
+        home
+        / ".codex"
+        / "sessions"
+        / "2026"
+        / "06"
+        / "01"
+        / "rollout-2026-06-01T00-00-00-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+    )
+    assert len(events) == 1
+    assert global_session_file.samefile(session_file)
+
+
 def test_collect_claude_code_watch_events_reads_managed_home_and_tracks_offsets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -399,6 +475,129 @@ def test_collect_claude_code_watch_events_reads_managed_home_and_tracks_offsets(
     assert event.payload["type"] == "assistant"
     assert second == []
     assert state.claude_code_offsets[session_file] == session_file.stat().st_size
+
+
+def test_collect_claude_code_watch_events_hardlinks_transcript_to_global_resume_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    session_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    transcript_file = (
+        home
+        / ".web-terminal-acp"
+        / "claude-code-homes"
+        / str(WINDOW_ID)
+        / "projects"
+        / "-workspace-project"
+        / f"{session_id}.jsonl"
+    )
+    transcript_file.parent.mkdir(parents=True)
+    transcript_file.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": session_id,
+                "message": {"role": "assistant", "content": "global claude"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: home)
+    state = AgentToolWatcherState()
+
+    events = collect_claude_code_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+
+    global_transcript_file = home / ".claude" / "projects" / "-workspace-project" / f"{session_id}.jsonl"
+    assert len(events) == 1
+    assert global_transcript_file.samefile(transcript_file)
+
+
+def test_collect_claude_code_watch_events_enriches_subagent_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    session_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    transcript_dir = (
+        home
+        / ".web-terminal-acp"
+        / "claude-code-homes"
+        / str(WINDOW_ID)
+        / "projects"
+        / "-workspace-project"
+    )
+    main_file = transcript_dir / f"{session_id}.jsonl"
+    subagent_file = transcript_dir / "subagents" / "agent-subagent-1.jsonl"
+    subagent_meta = transcript_dir / "subagents" / "agent-subagent-1.meta.json"
+    subagent_file.parent.mkdir(parents=True)
+    main_file.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": session_id,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call-subagent-1",
+                            "name": "Agent",
+                            "input": {"description": "Return one", "prompt": "Return exactly: 1"},
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    subagent_file.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": session_id,
+                "agentId": "subagent-1",
+                "isSidechain": True,
+                "message": {"role": "user", "content": "Return exactly: 1"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    subagent_meta.write_text(
+        json.dumps({"agentType": "claude", "description": "Return one", "toolUseId": "call-subagent-1"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: home)
+    state = AgentToolWatcherState()
+
+    events = collect_claude_code_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+
+    assert len(events) == 2
+    main_event = next(event for event in events if event.source_path == str(main_file))
+    subagent_event = next(event for event in events if event.source_path == str(subagent_file))
+    assert main_event.payload["subagent_tool_use_results"] == [
+        {
+            "agent_id": "subagent-1",
+            "tool_use_id": "call-subagent-1",
+            "source_path": str(subagent_file),
+        }
+    ]
+    assert subagent_event.payload["subagent"]["toolUseId"] == "call-subagent-1"
+    assert subagent_event.payload["agentId"] == "subagent-1"
+    assert subagent_event.payload["isSidechain"] is True
 
 
 def test_read_claude_history_session_ids_extracts_sessions_and_tracks_offset(tmp_path: Path) -> None:
@@ -1147,6 +1346,87 @@ def test_collect_cursor_watch_events_discovers_additional_store_after_first_stor
     assert [event.payload["blob_id"] for event in third] == ["new-assistant-blob"]
 
 
+def test_collect_antigravity_watch_events_reads_managed_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    session_id = "antigravity-session-1"
+    transcript = (
+        home
+        / ".web-terminal-acp"
+        / "antigravity-cli-homes"
+        / str(WINDOW_ID)
+        / "brain"
+        / session_id
+        / ".system_generated"
+        / "logs"
+        / "transcript.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "done",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: home)
+    state = AgentToolWatcherState()
+
+    initialize_agent_tool_watcher_state(state, window_id=WINDOW_ID)
+    bootstrapped = watchers.collect_antigravity_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+
+    assert len(bootstrapped) == 1
+    assert bootstrapped[0].payload["content"] == "done"
+
+    offset = transcript.stat().st_size
+    transcript.write_text(
+        transcript.read_text(encoding="utf-8")
+        + json.dumps(
+            {
+                "step_index": 2,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "content": "fix tests",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    events = watchers.collect_antigravity_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.provider == "antigravity_cli"
+    assert event.source_path == str(transcript)
+    assert event.offset == offset
+    assert event.cursor == offset
+    assert event.project_path == "/workspace/project"
+    assert event.payload["session_id"] == session_id
+    assert event.payload["WEB_TERMINAL_CLIENT_ID"] == str(CLIENT_ID)
+    assert event.payload["WEB_TERMINAL_WINDOW_ID"] == str(WINDOW_ID)
+    assert event.payload["WEB_TERMINAL_PROJECT_PATH"] == "/workspace/project"
+
+
 @pytest.mark.asyncio
 async def test_enqueue_managed_ai_event_includes_cursor_and_project_path() -> None:
     from app.client_agent.ai_events import ManagedAiEvent
@@ -1190,4 +1470,150 @@ async def test_enqueue_managed_ai_event_includes_cursor_and_project_path() -> No
         "cursor": "root-1",
         "project_path": "/workspace/project",
         "payload": payload,
+    }
+
+
+def test_collect_antigravity_watch_events_with_subagent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    main_session_id = "main-session-1"
+    sub_session_id = "subagent-1"
+    
+    # 1. Create main session transcript
+    main_transcript = (
+        home
+        / ".web-terminal-acp"
+        / "antigravity-cli-homes"
+        / str(WINDOW_ID)
+        / "brain"
+        / main_session_id
+        / ".system_generated"
+        / "logs"
+        / "transcript.jsonl"
+    )
+    main_transcript.parent.mkdir(parents=True)
+    
+    # Tool call to invoke_subagent
+    step_2 = {
+        "step_index": 2,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "tool_calls": [
+            {
+                "name": "invoke_subagent",
+                "args": {
+                    "Subagents": '[{"Prompt": "Return exactly: 1", "Role": "Greeter Agent", "TypeName": "self"}]'
+                }
+            }
+        ]
+    }
+    
+    # Tool result INVOKE_SUBAGENT
+    step_3 = {
+        "step_index": 3,
+        "source": "MODEL",
+        "type": "INVOKE_SUBAGENT",
+        "status": "DONE",
+        "content": f'Created the following subagents:\n{{\n  "conversationId": "{sub_session_id}",\n  "workspaceUris": []\n}}',
+    }
+
+    step_4 = {
+        "step_index": 4,
+        "source": "SYSTEM",
+        "type": "SYSTEM_MESSAGE",
+        "status": "DONE",
+        "content": (
+            "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n"
+            "<SYSTEM_MESSAGE>\n"
+            f"[Message] timestamp=2026-06-02T05:52:12Z sender={sub_session_id} "
+            "priority=MESSAGE_PRIORITY_HIGH content=1\n"
+            "</SYSTEM_MESSAGE>"
+        ),
+    }
+    
+    main_transcript.write_text(
+        json.dumps(step_2) + "\n" + json.dumps(step_3) + "\n" + json.dumps(step_4) + "\n",
+        encoding="utf-8",
+    )
+    
+    # 2. Create subagent session transcript
+    sub_transcript = (
+        home
+        / ".web-terminal-acp"
+        / "antigravity-cli-homes"
+        / str(WINDOW_ID)
+        / "brain"
+        / sub_session_id
+        / ".system_generated"
+        / "logs"
+        / "transcript.jsonl"
+    )
+    sub_transcript.parent.mkdir(parents=True)
+    
+    sub_step_1 = {
+        "step_index": 1,
+        "source": "USER_EXPLICIT",
+        "type": "USER_INPUT",
+        "status": "DONE",
+        "content": "Return exactly: 1",
+    }
+    
+    sub_transcript.write_text(
+        json.dumps(sub_step_1) + "\n",
+        encoding="utf-8",
+    )
+    
+    monkeypatch.setattr(Path, "home", lambda: home)
+    state = AgentToolWatcherState()
+    
+    initialize_agent_tool_watcher_state(state, window_id=WINDOW_ID)
+    state.antigravity_offsets[main_transcript] = 0
+    state.antigravity_offsets[sub_transcript] = 0
+    bootstrapped = watchers.collect_antigravity_watch_events(
+        state,
+        client_id=CLIENT_ID,
+        window_id=WINDOW_ID,
+        project_path="/workspace/project",
+    )
+    
+    # Check that events from both main session and sub session were collected
+    assert len(bootstrapped) == 4
+    
+    # Group events by source_path/session_id
+    main_events = sorted([e for e in bootstrapped if "main-session-1" in e.source_path and "subagents" not in e.source_path], key=lambda x: x.payload["step_index"])
+    sub_events = [e for e in bootstrapped if "subagents" in e.source_path]
+    
+    assert len(main_events) == 3
+    assert len(sub_events) == 1
+    
+    # Check tool call matches got attached to main_events[0] (step 2)
+    assert main_events[0].payload["subagent_tool_use_results"] == [
+        {"tool_use_id": "step-2", "agent_id": sub_session_id}
+    ]
+    
+    # Check tool use result got attached to main_events[1] (step 3)
+    assert main_events[1].payload["toolUseResult"] == {
+        "agentId": sub_session_id,
+        "toolUseId": "step-2",
+    }
+    assert main_events[2].payload["toolUseResult"] == {
+        "agentId": sub_session_id,
+        "toolUseId": "step-2",
+    }
+    
+    # Check subagent metadata got attached to sub_events[0]
+    payload = sub_events[0].payload
+    assert sub_events[0].source_path == f"/tmp/{main_session_id}/subagents/agent-{sub_session_id}.jsonl"
+    assert payload["session_id"] == f"agent-{sub_session_id}"
+    assert payload["isSidechain"] is True
+    assert payload["agentId"] == sub_session_id
+    assert payload["sessionId"] == main_session_id
+    assert payload["subagent"] == {
+        "toolUseId": "step-2",
+        "tool_use_id": "step-2",
+        "agentId": sub_session_id,
+        "agent_id": sub_session_id,
     }

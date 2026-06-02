@@ -33,6 +33,7 @@ describe("queryKeysForUiInvalidation", () => {
   it("maps backend resources to the queries that drive terminal notifications", () => {
     expect(queryKeysForUiInvalidation(invalidateEvent)).toEqual([
       ["tree", "client-1"],
+      ["terminal-projects", "client-1"],
       ["terminal-notifications", "client-1"],
       ["window-activity", "client-1"],
       ["window", "client-1", "window-1"],
@@ -67,8 +68,11 @@ describe("applyUiInvalidation", () => {
       window_id: null
     });
 
-    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["clients"] });
-    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["window-activity", "client-1"] });
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["clients"], exact: true });
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["window-activity", "client-1"],
+      exact: false
+    });
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(2);
   });
 
@@ -84,7 +88,8 @@ describe("applyUiInvalidation", () => {
     });
 
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["window", "client-1", "window-1"]
+      queryKey: ["window", "client-1", "window-1"],
+      exact: true
     });
     expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(1);
   });
@@ -105,6 +110,7 @@ describe("scheduleWindowActivityRefresh", () => {
     vi.advanceTimersByTime(1200);
     expect(queryClient.refetchQueries).toHaveBeenCalledWith({
       queryKey: ["window-activity", "client-1"],
+      exact: false,
       type: "active"
     });
     expect(onComplete).toHaveBeenCalledWith(timer);

@@ -4,13 +4,14 @@
 
 Web Terminal ACP is a browser-based control plane for shell and AI coding agent work. It gives you tmux-backed terminals in the browser, a durable folder tree for long-running sessions, searchable terminal and agent history, and optional remote clients that connect back to the server over WebSocket.
 
-It is built for teams and solo operators who want a persistent record of agent work without replacing the local tools they already use: shells, tmux, Claude Code, Codex, Cursor CLI, and OpenAI-compatible model endpoints.
+It is built for teams and solo operators who want a persistent record of agent work without replacing the local tools they already use: shells, tmux, agent-clients such as Claude Code, Codex, and Cursor CLI, and OpenAI-compatible model endpoints.
 
 ## Highlights
 
 - **Browser terminal workspace**: xterm.js terminal panes backed by tmux, with reconnectable sessions.
 - **Multi-client runtime**: use the server host directly, or register other machines as remote clients.
 - **Agent-aware records**: ingest Claude Code JSONL, Codex traces, Cursor adapter events, terminal output, and summaries.
+- **Agent profiles**: configure reusable Web Terminal ACP agents under `~/.web-terminal-acp/agents`, with shared skills and `AGENT.md` plus agent-client-specific plugins and hooks.
 - **Search and summaries**: Elasticsearch indexes terminal output and agent events; an OpenAI-compatible API can generate titles, tags, summaries, and folder suggestions.
 - **Agent worktree tracking**: Web Terminal-managed shells expose `WEB_TERMINAL_WINDOW_ID` so coding agents can work in linked git worktrees and surface status in the UI.
 - **Direct remote-client registration**: generate a one-time token in Settings, then let the remote host pull its own install script and client bundle from the server.
@@ -36,7 +37,7 @@ For the Web Terminal server:
 - At least 4 GB RAM available for the app stack.
 - On Linux, Elasticsearch usually requires `vm.max_map_count >= 262144`.
 - Optional: an OpenAI-compatible API for generated summaries.
-- Optional: Claude Code, Codex, Cursor CLI, or other agent CLIs installed and authenticated on the machine where you want to run them.
+- Optional: Claude Code, Codex, Cursor CLI, or other agent-clients installed and authenticated on the machine where you want to run them.
 
 For a direct remote client:
 
@@ -45,7 +46,7 @@ For a direct remote client:
 - `python3`
 - Python venv/ensurepip support. On Debian/Ubuntu this is usually `python3-venv`.
 - Network access from the remote host to the Web Terminal backend URL.
-- Optional: Codex / Claude Code / Cursor CLI installed on that remote host if you want to launch those tools there.
+- Optional: Codex / Claude Code / Cursor CLI installed on that remote host if you want to launch those agent-clients there.
 
 The direct registration script checks these dependencies before installing. If a package is missing and the current user cannot install it, stop and ask the machine owner/admin to install it; do not bypass dependency checks with a partial install.
 
@@ -104,6 +105,16 @@ Important `.env` values:
 | `VITE_ENABLE_ONBOARDING` | Frontend build-time switch for the new-user guide; set `true` to enable | empty |
 
 Do not commit `.env`. Before exposing the app beyond localhost, set `WEB_TERMINAL_AUTH_SECRET`, use strong database passwords, and put a TLS reverse proxy in front of the UI/backend.
+
+## Agent Profiles
+
+Web Terminal ACP uses **agent-client** as the generic term for tools such as Claude Code, Codex, and Cursor CLI. An **agent profile** is a reusable launch preset for those agent-clients.
+
+Agent profiles live under `~/.web-terminal-acp/agents/<profile-id>` on the machine that runs the terminal. Each profile stores shared `skills/`, `skills.disabled/`, and `AGENT.md`; when launched through an agent-client, Web Terminal maps that common content into the client-specific home, for example `AGENT.md` to Claude Code's `CLAUDE.md` and Codex's `AGENTS.md`. Plugins and hooks remain agent-client-specific and are selected from that machine's global agent-client configuration.
+
+Use **Settings -> Agents** to create and edit profiles. When creating a terminal, choose either a configured agent profile or configure an agent-client directly.
+
+Developers adding another built-in agent-client should follow the plugin contract in [`docs/agent-client-plugins.md`](docs/agent-client-plugins.md).
 
 ## Desktop App Builds
 

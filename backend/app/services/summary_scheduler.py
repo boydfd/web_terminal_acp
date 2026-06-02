@@ -200,6 +200,8 @@ def _current_user_message_event(window: VirtualWindow, event: Event | None) -> E
 
 
 def _is_agent_user_message(event: Event) -> bool:
+    if event.payload_json.get("isSidechain") is True and isinstance(event.payload_json.get("agentId"), str):
+        return False
     provider = event.payload_json.get("provider")
     provider_name = provider.strip() if isinstance(provider, str) else None
     try:

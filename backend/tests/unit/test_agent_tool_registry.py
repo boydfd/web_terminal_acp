@@ -2,7 +2,18 @@ from inspect import Parameter, signature
 from typing import get_type_hints
 from uuid import uuid4
 
+import pytest
+from app.agent_plugins import get_agent_plugin_registry
+from app.agent_plugins.builtins import builtin_agent_plugins
+from app.agent_plugins.registry import AgentPluginRegistry
+from app.agent_plugins.types import (
+    AgentCommandSpec,
+    AgentManagedStorageSpec,
+    AgentNativeConfigSpec,
+    AgentPlugin,
+)
 from app.agent_tools import get_agent_tool_registry
+from app.agent_tools.adapters.antigravity_cli import AntigravityCliAdapter
 from app.agent_tools.adapters.claude_code import ClaudeCodeAdapter
 from app.agent_tools.adapters.codex import CodexAdapter
 from app.agent_tools.adapters.cursor_cli import CursorCliAdapter
@@ -27,6 +38,123 @@ def test_default_registry_contains_initial_providers():
     assert registry.by_provider("codex").provider_id == "codex"
     assert registry.by_provider("claude_code").provider_id == "claude_code"
     assert registry.by_provider("cursor_cli").provider_id == "cursor_cli"
+    assert registry.by_provider("antigravity_cli").provider_id == "antigravity_cli"
+
+
+def test_agent_plugin_registry_describes_builtin_agent_clients():
+    registry = get_agent_plugin_registry()
+
+    assert registry.normalize_agent_id("claude_code") == "claude"
+    assert registry.normalize_agent_id("agent") == "cursor"
+    assert registry.by_agent_id("claude").provider_id == "claude_code"
+    assert registry.by_provider("cursor").provider_id == "cursor_cli"
+
+    descriptors = {descriptor.id: descriptor for descriptor in registry.descriptors()}
+    assert descriptors["codex"].label == "Codex"
+    assert descriptors["codex"].capabilities.agent_records is True
+    assert descriptors["codex"].capabilities.runtime_tags is True
+    assert descriptors["codex"].capabilities.work_presence is True
+    codex_plugin = registry.by_agent_id("codex")
+    assert codex_plugin.tool_adapter_module == "codex"
+    assert codex_plugin.tool_adapter_class == "CodexAdapter"
+    assert descriptors["claude"].default_command == "claude"
+    assert descriptors["cursor"].command_names == ("agent", "cursor", "cursor-agent")
+    assert descriptors["antigravity"].label == "Antigravity CLI"
+    assert descriptors["antigravity"].provider_id == "antigravity_cli"
+    assert descriptors["antigravity"].default_command == "agy-p"
+    assert descriptors["antigravity"].command_names == ("agy-p", "agy")
+    assert descriptors["antigravity"].capabilities.launch is True
+    assert descriptors["antigravity"].capabilities.agent_records is True
+    antigravity_plugin = registry.by_agent_id("antigravity")
+    assert antigravity_plugin.tool_adapter_module == "antigravity_cli"
+    assert antigravity_plugin.tool_adapter_class == "AntigravityCliAdapter"
+    assert registry.normalize_agent_id("agy") == "antigravity"
+    assert registry.provider_for_command_name("agy-p") == "antigravity_cli"
+    assert registry.command_pattern().search("cursor-agent --resume session")
+    assert get_agent_tool_registry().command_pattern().search("cursor-agent --resume session")
+
+
+def _future_agent_plugin() -> AgentPlugin:
+    return AgentPlugin(
+        agent_client_id="future_agent",
+        provider_id="future_provider",
+        label="Future Agent",
+        aliases=("future",),
+        command=AgentCommandSpec(
+            default_command="/opt/future/bin/future-agent",
+            command_names=("/opt/future/bin/future-agent",),
+            permission_flag="--safe-mode",
+        ),
+        storage=AgentManagedStorageSpec(
+            user_root=".future-agent",
+            managed_root=".web-terminal-acp/future-agent-homes",
+            managed_home_alias=".future-agent",
+            skills_directory="skills",
+            config_item_names=("settings.json", "skills", "skills.disabled"),
+            history_item_names=("history.jsonl",),
+            env={"FUTURE_HOME": "{managed_root}"},
+            shell_env_aliases={"FUTURE_HOME": "FUTURE_HOME"},
+        ),
+        native_config=AgentNativeConfigSpec(
+            hooks_config_name="hooks.json",
+            profile_agent_md_targets=("AGENT.md",),
+            initial_agent_md_candidates=("AGENT.md",),
+            plugin_strategy="directory",
+        ),
+    )
+
+
+def test_agent_plugin_registry_accepts_non_builtin_plugin_contract():
+    registry = AgentPluginRegistry((_future_agent_plugin(),))
+
+    assert registry.normalize_agent_id("future") == "future_agent"
+    assert registry.by_provider("future_agent").provider_id == "future_provider"
+    assert registry.provider_for_command_name("/opt/future/bin/future-agent") == "future_provider"
+    assert registry.command_pattern().search("future-agent run")
+
+    descriptor = registry.descriptors()[0]
+    assert descriptor.id == "future_agent"
+    assert descriptor.provider_id == "future_provider"
+    assert descriptor.default_command == "/opt/future/bin/future-agent"
+    assert descriptor.command_names == ("/opt/future/bin/future-agent",)
+    assert descriptor.capabilities.launch is True
+    assert descriptor.capabilities.client_config is True
+    assert descriptor.capabilities.agent_records is False
+    assert descriptor.capabilities.runtime_tags is False
+    assert descriptor.capabilities.work_presence is False
+
+
+def test_builtin_plugins_declare_adapters_for_record_capable_clients():
+    plugins = {plugin.agent_client_id: plugin for plugin in get_agent_plugin_registry().all()}
+    registry = get_agent_tool_registry()
+
+    for plugin in plugins.values():
+        if not plugin.capabilities.agent_records:
+            continue
+        assert plugin.tool_adapter_module is not None
+        assert plugin.tool_adapter_class is not None
+        assert registry.by_provider(plugin.provider_id).provider_id == plugin.provider_id
+
+
+def test_agent_plugin_registry_rejects_duplicate_provider_ids():
+    codex, claude, *_ = builtin_agent_plugins()
+    duplicate = type(claude)(**{**claude.__dict__, "provider_id": codex.provider_id})
+
+    with pytest.raises(ValueError, match="duplicate agent plugin provider_id"):
+        AgentPluginRegistry((codex, duplicate))
+
+
+def test_agent_plugin_registry_rejects_duplicate_aliases_and_command_names():
+    codex, claude, *_ = builtin_agent_plugins()
+    duplicate_alias = type(claude)(**{**claude.__dict__, "aliases": ("codex",)})
+    duplicate_command = type(claude)(
+        **{**claude.__dict__, "command": type(claude.command)("claude", ("codex",))}
+    )
+
+    with pytest.raises(ValueError, match="duplicate agent plugin agent_client_id/alias"):
+        AgentPluginRegistry((codex, duplicate_alias))
+    with pytest.raises(ValueError, match="duplicate agent plugin command_name"):
+        AgentPluginRegistry((codex, duplicate_command))
 
 
 def test_registry_reports_unknown_provider_as_value_error():
@@ -69,6 +197,10 @@ def test_adapter_protocol_uses_orm_events_for_projection_methods():
     project_chat_hints = get_type_hints(AgentToolAdapter.project_chat, globalns=namespace)
     assert project_chat_hints["event"] is Event
     assert project_chat_hints["return"] == AgentChatProjection | None
+
+    is_completion_hints = get_type_hints(AgentToolAdapter.is_completion, globalns=namespace)
+    assert is_completion_hints["event"] is Event
+    assert is_completion_hints["return"] is bool
 
     summary_text_hints = get_type_hints(AgentToolAdapter.summary_text, globalns=namespace)
     assert summary_text_hints["event"] is Event
@@ -136,6 +268,18 @@ def test_cursor_cli_adapter_normalizes_generic_records_as_self_describing_agent_
     assert event.source_type is EventSourceType.agent_tool_record
     assert event.payload_json["provider"] == "cursor_cli"
     assert event.fingerprint.startswith("agent_tool_record:cursor_cli:")
+
+
+def test_antigravity_cli_adapter_normalizes_generic_records_as_self_describing_agent_tool_records():
+    event = AntigravityCliAdapter().normalize(
+        {"session_id": "antigravity-session-1", "type": "PLANNER_RESPONSE", "content": "hello"},
+        source_path=None,
+        cursor=12,
+    )
+
+    assert event.source_type is EventSourceType.agent_tool_record
+    assert event.payload_json["provider"] == "antigravity_cli"
+    assert event.fingerprint.startswith("agent_tool_record:antigravity_cli:")
 
 
 def test_cursor_cli_adapter_bounds_long_source_id_and_kind_deterministically():
